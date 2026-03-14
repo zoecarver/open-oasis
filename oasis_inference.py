@@ -1646,6 +1646,13 @@ def patch_embed_host(x_latent, conv_w, conv_b):
     x = x.reshape(1, N_PATCHES, D_MODEL)
     return x.squeeze(0).to(torch.bfloat16)  # (144, 1024)
 
+def patchify_to_output_space(x_img):
+    """Inverse of unpatchify: (1, C, H, W) -> (N_PATCHES, OUT_DIM).
+    Matches the pixel ordering that unpatchify_host expects."""
+    x = x_img.float().reshape(1, IN_CHANNELS, FRAME_H, PATCH_SIZE, FRAME_W, PATCH_SIZE)
+    x = torch.einsum("nchpwq->nhwpqc", x)
+    return x.reshape(N_PATCHES, OUT_DIM)
+
 def unpatchify_host(x, patch_size, out_channels, h, w):
     """x: (N_PATCHES, patch_size^2 * out_channels) -> (1, out_channels, H, W)"""
     x = x.float().reshape(1, h, w, patch_size, patch_size, out_channels)
@@ -1813,32 +1820,14 @@ def compute_cond_for_frame(t_scalar, action_vec, dev, scr, tt_device):
     cond_pad = cond_bf16.unsqueeze(0).expand(TILE, -1).contiguous()
     return to_tt(cond_pad, tt_device)
 
-def dit_forward(x_latent, timesteps, actions, dev, scr, tt_device, scaler, mean_scale):
-    """Full DiT forward pass.
-    x_latent: (B, T, C, H, W) = (1, T, 16, 18, 32)
-    timesteps: (B, T) = (1, T) long tensor
-    actions: (B, T, 25) float tensor
-    Returns: (B, T, C, H, W) velocity prediction
+def dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale):
+    """DiT forward pass, all on device. Returns final_out as device tensor.
+    z_cur: (SEQ, D_MODEL) device tensor
+    cond_list: list of T device tensors for conditioning
+    Returns: device tensor (SEQ, OUT_DIM)
     """
-    B = 1
-    T = x_latent.shape[1]
+    T = len(cond_list)
     SEQ = N_PATCH_PAD * T
-
-    # Patch embedding on host for each frame
-    x_pad = torch.zeros(SEQ, D_MODEL, dtype=torch.bfloat16)
-    for t_idx in range(T):
-        x_frame = x_latent[0, t_idx].unsqueeze(0)  # (1, C, H, W)
-        x_2d = patch_embed_host(x_frame, dev["x_emb_conv_w"], dev["x_emb_conv_b"])
-        start = t_idx * N_PATCH_PAD
-        x_pad[start:start + N_PATCHES] = x_2d
-    z_cur = to_tt(x_pad, tt_device)
-
-    # Per-frame conditioning
-    cond_list = []
-    for t_idx in range(T):
-        t_val = timesteps[0, t_idx].item()
-        act = actions[0, t_idx] if actions is not None else None
-        cond_list.append(compute_cond_for_frame(t_val, act, dev, scr, tt_device))
 
     # 16 blocks: each has spatial + temporal sub-block
     for block_idx in range(N_BLOCKS):
@@ -1850,7 +1839,6 @@ def dit_forward(x_latent, timesteps, actions, dev, scr, tt_device, scaler, mean_
             "blocks.%d.t" % block_idx, z_cur, cond_list,
             dev, scr, tt_device, scaler, mean_scale, attn_type="temporal"
         )
-        print("  Block %d done" % block_idx)
 
     # Final layer: per-frame adaLN (on device)
     N_REPEAT = N_PATCH_PAD // TILE  # 5
@@ -1872,17 +1860,7 @@ def dit_forward(x_latent, timesteps, actions, dev, scr, tt_device, scaler, mean_
     layernorm_d1024(z_cur, dev["ln_w_ones"], dev["ln_b_zeros"], scaler, mean_scale, scr["normed"])
     adaln_modulate_kernel(scr["normed"], shift_tt, scale_tt, scr["modulated"])
     linear_k32(scr["modulated"], dev["final_linear_w"], scr["final_out"])
-    scr["final_out"] = ttnn.add(scr["final_out"], dev["final_linear_b"])
-
-    # Read back all frames and unpatchify
-    out_host_full = ttnn.to_torch(scr["final_out"])
-    out_frames = []
-    for t_idx in range(T):
-        start = t_idx * N_PATCH_PAD
-        out_host = out_host_full[start:start + N_PATCHES].float()
-        out_img = unpatchify_host(out_host, PATCH_SIZE, IN_CHANNELS, FRAME_H, FRAME_W)
-        out_frames.append(out_img)
-    return torch.stack(out_frames, dim=1)  # (1, T, C, H, W)
+    return ttnn.add(scr["final_out"], dev["final_linear_b"])
 
 # ============================================================
 # VAE (CPU only)
@@ -1964,60 +1942,109 @@ if __name__ == "__main__":
 
     betas = sigmoid_beta_schedule(max_noise_level).float()
     alphas = 1.0 - betas
-    alphas_cumprod = torch.cumprod(alphas, dim=0)
-    alphas_cumprod = rearrange(alphas_cumprod, "T -> T 1 1 1")
-
-    # x = [prompt_latent, noisy_chunk] with T=2
-    chunk = torch.randn(1, 1, IN_CHANNELS, INPUT_H, INPUT_W)
-    chunk = torch.clamp(chunk, -noise_abs_max, noise_abs_max)
+    alphas_cumprod = torch.cumprod(alphas, dim=0)  # (1000,)
 
     # Actions: no-op for both frames
     actions = torch.zeros(1, N_FRAMES, EXT_COND_DIM)
 
-    print("\nRunning DDIM denoising (%d steps, T=%d)..." % (ddim_steps, N_FRAMES))
+    # === Pre-compute device-resident data for on-device DDIM loop ===
+
+    # 1. Prompt frame: patch embed once, keep on device permanently
+    prompt_z_pad = torch.zeros(N_PATCH_PAD, D_MODEL, dtype=torch.bfloat16)
+    prompt_z_pad[:N_PATCHES] = patch_embed_host(
+        prompt_latent[0, 0].unsqueeze(0), dev["x_emb_conv_w"], dev["x_emb_conv_b"])
+    prompt_z_dev = to_tt(prompt_z_pad, tt_device)
+
+    # 2. Prompt conditioning (constant across all DDIM steps)
+    prompt_cond_dev = compute_cond_for_frame(
+        stabilization_level - 1, actions[0, 0], dev, scr, tt_device)
+
+    # 3. Round-trip weight: output_space -> input_space (patch_embed composed with unpatchify)
+    # Conv weight (D_MODEL, C, ps, ps) reordered to match patchify pixel order (p, q, c)
+    conv_w = dev["x_emb_conv_w"].float()  # (1024, 16, 2, 2)
+    W_rt = conv_w.permute(0, 2, 3, 1).reshape(D_MODEL, OUT_DIM).T.contiguous()  # (64, 1024)
+    W_rt_dev = to_tt(W_rt.to(torch.bfloat16), tt_device)
+    # Bias: expand to (N_PATCH_PAD, D_MODEL) for broadcast add
+    b_rt = dev["x_emb_conv_b"].float().to(torch.bfloat16)  # (D_MODEL,)
+    b_rt_pad = b_rt.unsqueeze(0).expand(N_PATCH_PAD, -1).contiguous()
+    b_rt_dev = to_tt(b_rt_pad, tt_device)
+
+    # 4. Initial chunk: random noise in output space on device
+    chunk_img = torch.randn(1, IN_CHANNELS, INPUT_H, INPUT_W)
+    chunk_img = torch.clamp(chunk_img, -noise_abs_max, noise_abs_max)
+    chunk_patches = patchify_to_output_space(chunk_img)  # (144, 64)
+    chunk_pad = torch.zeros(N_PATCH_PAD, OUT_DIM, dtype=torch.bfloat16)
+    chunk_pad[:N_PATCHES] = chunk_patches.to(torch.bfloat16)
+    chunk_dev = to_tt(chunk_pad, tt_device)
+
+    print("\nRunning DDIM denoising (%d steps, T=%d, all on device)..." % (ddim_steps, N_FRAMES))
     t_total = time.time()
 
     for noise_idx in reversed(range(1, ddim_steps + 1)):
         t_step = time.time()
-
-        # Timesteps: [stabilization_level for prompt, noise_level for generated]
         noise_level = int(noise_range[noise_idx].item())
-        timesteps = torch.tensor([[stabilization_level - 1, noise_level]], dtype=torch.long)
-
         print("Step %d/%d (noise_level=%d)..." % (ddim_steps - noise_idx + 1, ddim_steps, noise_level))
 
-        # Concatenate prompt + noisy chunk: (1, 2, C, H, W)
-        x_input = torch.cat([prompt_latent, chunk], dim=1)
-        v_all = dit_forward(x_input, timesteps, actions, dev, scr, tt_device, scaler, mean_scale)
+        # Generated frame: output_space -> input_space via round-trip matmul
+        gen_z = ttnn.matmul(chunk_dev, W_rt_dev)  # (160, 64) @ (64, 1024) -> (160, 1024)
+        gen_z = ttnn.add(gen_z, b_rt_dev)
 
-        # Only use the velocity for the generated frame (index 1)
-        v = v_all[:, -1:]  # (1, 1, C, H, W)
+        # Concat prompt + generated frame -> z_cur (320, 1024)
+        z_cur = ttnn.concat([prompt_z_dev, gen_z], dim=0)
 
-        # DDIM update on generated frame only
+        # Conditioning for generated frame (host MLP, to_tt is non-blocking)
+        gen_cond_dev = compute_cond_for_frame(
+            noise_level, actions[0, 1], dev, scr, tt_device)
+        cond_list = [prompt_cond_dev, gen_cond_dev]
+
+        # DiT forward (all on device) -> final_out (320, 64)
+        final_out = dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale)
+
+        # Extract velocity for generated frame (rows N_PATCH_PAD to 2*N_PATCH_PAD)
+        v_dev = ttnn.slice(final_out, [N_PATCH_PAD, 0], [2 * N_PATCH_PAD, OUT_DIM])
+
+        # DDIM update (all elementwise on device, no sync)
         t_next_noise = int(noise_range[noise_idx - 1].item())
-        t_val_long = torch.full((1, 1), noise_level, dtype=torch.long)
-        t_next_long = torch.full((1, 1), max(t_next_noise, noise_level if t_next_noise < 0 else 0), dtype=torch.long)
-
-        alpha_t = alphas_cumprod[t_val_long]
-        alpha_next = alphas_cumprod[t_next_long]
+        at = float(alphas_cumprod[noise_level].item())
+        an = float(alphas_cumprod[max(t_next_noise, 0)].item())
         if noise_idx == 1:
-            alpha_next = torch.ones_like(alpha_next)
+            an = 1.0
 
-        x_start = alpha_t.sqrt() * chunk - (1 - alpha_t).sqrt() * v
-        x_noise = ((1 / alpha_t).sqrt() * chunk - x_start) / (1 / alpha_t - 1).sqrt()
-        chunk = alpha_next.sqrt() * x_start + x_noise * (1 - alpha_next).sqrt()
+        c_at_sqrt = float(at ** 0.5)
+        c_1mat_sqrt = float((1 - at) ** 0.5)
+        c_inv_at_sqrt = float((1.0 / at) ** 0.5)
+        c_inv_sigma = float(1.0 / ((1.0 / at - 1) ** 0.5))
+        c_an_sqrt = float(an ** 0.5)
+        c_1man_sqrt = float((1 - an) ** 0.5)
 
-        print("  Step time: %.1fs, v range: [%.2f, %.2f]" % (
-            time.time() - t_step, v.min().item(), v.max().item()))
+        # x_start = at_sqrt * chunk - (1-at)_sqrt * v
+        x_start = ttnn.subtract(
+            ttnn.multiply(chunk_dev, c_at_sqrt),
+            ttnn.multiply(v_dev, c_1mat_sqrt))
+        # x_noise = (inv_at_sqrt * chunk - x_start) / sigma
+        x_noise = ttnn.multiply(
+            ttnn.subtract(ttnn.multiply(chunk_dev, c_inv_at_sqrt), x_start),
+            c_inv_sigma)
+        # chunk = an_sqrt * x_start + (1-an)_sqrt * x_noise
+        chunk_dev = ttnn.add(
+            ttnn.multiply(x_start, c_an_sqrt),
+            ttnn.multiply(x_noise, c_1man_sqrt))
+
+        print("  Step time: %.1fs" % (time.time() - t_step))
 
     total_time = time.time() - t_total
     print("\nDDIM complete in %.1fs" % total_time)
-    print("Final latent range: [%.2f, %.2f]" % (chunk.min().item(), chunk.max().item()))
+
+    # Final readback: only now do we sync and transfer to host
+    chunk_host = ttnn.to_torch(chunk_dev)[:N_PATCHES].float()  # (144, 64)
+    chunk_img = unpatchify_host(chunk_host, PATCH_SIZE, IN_CHANNELS, FRAME_H, FRAME_W)
+    print("Final latent range: [%.2f, %.2f]" % (chunk_img.min().item(), chunk_img.max().item()))
 
     # VAE decode the generated frame
     print("\nRunning VAE decode...")
     t_vae = time.time()
-    frames = vae_decode_cpu(chunk, vae)  # (1, 1, 360, 640, 3) in [0, 1]
+    chunk_for_vae = chunk_img.unsqueeze(0)  # (1, 1, C, H, W)
+    frames = vae_decode_cpu(chunk_for_vae, vae)  # (1, 1, 360, 640, 3) in [0, 1]
     print("VAE decode: %.1fs" % (time.time() - t_vae))
 
     # Save as PNG
