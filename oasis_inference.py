@@ -652,26 +652,22 @@ def preload_dit_weights(tt_device, n_frames=2):
     dev = {}
 
     with safe_open(path, framework="pt") as st:
-        # Timestep embedder: Linear(256, 1024) -> SiLU -> Linear(1024, 1024)
-        dev["t_emb_w0"] = to_tt(st.get_tensor("t_embedder.mlp.0.weight").T.contiguous(), tt_device)
-        dev["t_emb_b0"] = to_tt(expand_bias(st.get_tensor("t_embedder.mlp.0.bias"), TILE), tt_device)
-        dev["t_emb_w2"] = to_tt(st.get_tensor("t_embedder.mlp.2.weight").T.contiguous(), tt_device)
-        dev["t_emb_b2"] = to_tt(expand_bias(st.get_tensor("t_embedder.mlp.2.bias"), TILE), tt_device)
+        # Timestep embedder + external cond: computed on HOST in fp32
+        dev["t_emb_w0_host"] = st.get_tensor("t_embedder.mlp.0.weight").T.contiguous().float()  # (256, 1024)
+        dev["t_emb_b0_host"] = st.get_tensor("t_embedder.mlp.0.bias").float()  # (1024,)
+        dev["t_emb_w2_host"] = st.get_tensor("t_embedder.mlp.2.weight").T.contiguous().float()  # (1024, 1024)
+        dev["t_emb_b2_host"] = st.get_tensor("t_embedder.mlp.2.bias").float()  # (1024,)
 
-        # External conditioning: Linear(25, 1024) - pad input from 25 to 32
-        ext_w = st.get_tensor("external_cond.weight").T.contiguous()  # (25, 1024)
-        ext_w_pad = torch.zeros(EXT_COND_PAD, D_MODEL, dtype=torch.float32)
-        ext_w_pad[:EXT_COND_DIM] = ext_w
-        dev["ext_cond_w"] = to_tt(ext_w_pad.to(torch.bfloat16), tt_device)
-        dev["ext_cond_b"] = to_tt(expand_bias(st.get_tensor("external_cond.bias"), TILE), tt_device)
+        dev["ext_cond_w_host"] = st.get_tensor("external_cond.weight").T.contiguous().float()  # (25, 1024)
+        dev["ext_cond_b_host"] = st.get_tensor("external_cond.bias").float()  # (1024,)
 
         # Patch embedder: Conv2d(16, 1024, 2, 2) - keep as host tensor for now
         dev["x_emb_conv_w"] = st.get_tensor("x_embedder.proj.weight")  # (1024, 16, 2, 2)
         dev["x_emb_conv_b"] = st.get_tensor("x_embedder.proj.bias")  # (1024,)
 
-        # Final layer
-        dev["final_adaln_w"] = to_tt(st.get_tensor("final_layer.adaLN_modulation.1.weight").T.contiguous().to(torch.bfloat16), tt_device)
-        dev["final_adaln_b"] = to_tt(expand_bias(st.get_tensor("final_layer.adaLN_modulation.1.bias").to(torch.bfloat16), TILE), tt_device)
+        # Final layer adaLN: computed on HOST in fp32
+        dev["final_adaln_w_host"] = st.get_tensor("final_layer.adaLN_modulation.1.weight").T.contiguous().float()  # (1024, 2048)
+        dev["final_adaln_b_host"] = st.get_tensor("final_layer.adaLN_modulation.1.bias").float()  # (2048,)
         dev["final_linear_w"] = to_tt(st.get_tensor("final_layer.linear.weight").T.contiguous().to(torch.bfloat16), tt_device)
         dev["final_linear_b"] = to_tt(expand_bias(st.get_tensor("final_layer.linear.bias").to(torch.bfloat16), N_PATCH_PAD * n_frames), tt_device)
 
@@ -680,11 +676,10 @@ def preload_dit_weights(tt_device, n_frames=2):
             for prefix in ["s", "t"]:
                 p = "blocks.%d.%s" % (i, prefix)
 
-                # adaLN modulation: Linear(1024, 6144) with bias
-                adaln_w = st.get_tensor("%s_adaLN_modulation.1.weight" % p).T.contiguous().to(torch.bfloat16)
-                dev["%s.adaln_w" % p] = to_tt(adaln_w, tt_device)
-                adaln_b = st.get_tensor("%s_adaLN_modulation.1.bias" % p).to(torch.bfloat16)
-                dev["%s.adaln_b" % p] = to_tt(expand_bias(adaln_b, TILE), tt_device)
+                # adaLN modulation: computed on HOST in fp32 for precision
+                # Store as host fp32 tensors (not on TT device)
+                dev["%s.adaln_w_host" % p] = st.get_tensor("%s_adaLN_modulation.1.weight" % p).T.contiguous().float()  # (1024, 6144)
+                dev["%s.adaln_b_host" % p] = st.get_tensor("%s_adaLN_modulation.1.bias" % p).float()  # (6144,)
 
                 # QKV: Linear(1024, 3072) NO bias
                 qkv_w = st.get_tensor("%s_attn.to_qkv.weight" % p).T.contiguous().to(torch.bfloat16)
@@ -776,29 +771,32 @@ def unpatchify_host(x, patch_size, out_channels, h, w):
     return x.reshape(1, out_channels, h * patch_size, w * patch_size)
 
 def build_per_frame_adaln(cond_list, prefix, dev, scr, tt_device):
-    """Compute adaLN params for each frame, return (SEQ, D_MODEL) tensors.
+    """Compute adaLN params on HOST in fp32 for precision.
     cond_list: list of T conditioning device tensors, each (TILE, D_MODEL).
-    Returns: shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
+    Returns: [shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp] as device tensors.
     """
     T = len(cond_list)
     SEQ = N_PATCH_PAD * T
     all_chunks = []
     for cond_tt in cond_list:
-        silu_kernel(cond_tt, scr["t_emb_a"])
-        linear_bias_k32(scr["t_emb_a"], dev["%s.adaln_w" % prefix], dev["%s.adaln_b" % prefix], scr["adaln_out"])
-        adaln_host = ttnn.to_torch(scr["adaln_out"])[0, :6 * D_MODEL].float()
-        all_chunks.append(adaln_host.reshape(6, D_MODEL))
+        # Read conditioning to host and compute adaLN in fp32
+        cond_host = ttnn.to_torch(cond_tt)[0, :D_MODEL].float()  # (D_MODEL,)
+        cond_silu = cond_host * torch.sigmoid(cond_host)  # SiLU in fp32
+        # Linear(1024, 6144) in fp32: w is stored transposed (1024, 6144), b is (6144,)
+        adaln_w_host = dev["%s.adaln_w_host" % prefix]  # (1024, 6144) fp32
+        adaln_b_host = dev["%s.adaln_b_host" % prefix]  # (6144,) fp32
+        adaln_out = cond_silu @ adaln_w_host + adaln_b_host  # (6144,) fp32
+        all_chunks.append(adaln_out.reshape(6, D_MODEL))
 
     results = []
     for param_idx in range(6):
-        # Build (SEQ, D_MODEL) with per-frame values
         param_2d = torch.zeros(SEQ, D_MODEL, dtype=torch.bfloat16)
         for t_idx in range(T):
             start = t_idx * N_PATCH_PAD
             param_2d[start:start + N_PATCH_PAD] = expand_bias(
                 all_chunks[t_idx][param_idx].to(torch.bfloat16), N_PATCH_PAD)
         results.append(to_tt(param_2d, tt_device))
-    return results  # [shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp]
+    return results
 
 def run_sub_block(prefix, x_tt, cond_list, dev, scr, tt_device, scaler, mean_scale, attn_type="spatial"):
     """Run one spatial or temporal sub-block.
@@ -922,38 +920,37 @@ def run_sub_block(prefix, x_tt, cond_list, dev, scr, tt_device, scaler, mean_sca
     adaln_modulate_kernel(scr["normed"], shift_mlp, scale_mlp, scr["modulated"])
     linear_bias_k32(scr["modulated"], dev["%s.fc1_w" % prefix], dev["%s.fc1_b" % prefix], scr["fc1"])
     gelu_approx_kernel(scr["fc1"], scr["gelu"])
-    linear_accum_k32_4(scr["gelu"], dev["%s.fc2_w" % prefix], scr["fc2"])
+    # TODO: investigate why tt-lang linear_accum kernel has much worse precision than
+    # ttnn.matmul for large-K accumulation (4096->1024, k_chunk=32, k_iters=4).
+    # Our kernel: max_err=11.7, ttnn.matmul: max_err=0.34 on same inputs.
+    scr["fc2"] = ttnn.matmul(scr["gelu"], dev["%s.fc2_w" % prefix])
     fc2_with_bias = ttnn.add(scr["fc2"], dev["%s.fc2_b" % prefix])
     gated_residual_kernel(x_tt, fc2_with_bias, gate_mlp, scr["z_a"])
 
     return scr["z_a"]
 
 def compute_cond_for_frame(t_scalar, action_vec, dev, scr, tt_device):
-    """Compute conditioning vector for a single frame.
+    """Compute conditioning vector on HOST in fp32 for precision.
     t_scalar: integer timestep
     action_vec: (25,) action tensor or None
     Returns: (TILE, D_MODEL) device tensor
     """
     t_freq = timestep_embedding(torch.tensor([t_scalar]), FREQ_DIM)  # (1, 256)
-    t_freq_pad = torch.zeros(TILE, FREQ_DIM, dtype=torch.bfloat16)
-    t_freq_pad[0] = t_freq[0].to(torch.bfloat16)
-    t_freq_tt = to_tt(t_freq_pad, tt_device)
 
-    linear_bias_k8(t_freq_tt, dev["t_emb_w0"], dev["t_emb_b0"], scr["t_emb_a"])
-    silu_kernel(scr["t_emb_a"], scr["t_emb_b"])
-    cond_out = zeros_tt((TILE, D_MODEL), tt_device)
-    linear_bias_k32(scr["t_emb_b"], dev["t_emb_w2"], dev["t_emb_b2"], cond_out)
+    # t_embedder MLP on host in fp32: Linear(256,1024) -> SiLU -> Linear(1024,1024)
+    h = (t_freq[0].float() @ dev["t_emb_w0_host"]) + dev["t_emb_b0_host"]
+    h = h * torch.sigmoid(h)  # SiLU
+    cond = (h @ dev["t_emb_w2_host"]) + dev["t_emb_b2_host"]
 
+    # External conditioning on host
     if action_vec is not None:
-        act_pad = torch.zeros(TILE, EXT_COND_PAD, dtype=torch.bfloat16)
-        act_pad[0, :EXT_COND_DIM] = action_vec.to(torch.bfloat16)
-        act_tt = to_tt(act_pad, tt_device)
-        ext_out = zeros_tt((TILE, D_MODEL), tt_device)
-        linear_k1(act_tt, dev["ext_cond_w"], ext_out)
-        ext_out = ttnn.add(ext_out, dev["ext_cond_b"])
-        cond_out = ttnn.add(cond_out, ext_out)
+        ext = (action_vec.float() @ dev["ext_cond_w_host"]) + dev["ext_cond_b_host"]
+        cond = cond + ext
 
-    return cond_out
+    # Package as (TILE, D_MODEL) device tensor
+    cond_pad = torch.zeros(TILE, D_MODEL, dtype=torch.bfloat16)
+    cond_pad[0] = cond.to(torch.bfloat16)
+    return to_tt(cond_pad, tt_device)
 
 def dit_forward(x_latent, timesteps, actions, dev, scr, tt_device, scaler, mean_scale):
     """Full DiT forward pass.
@@ -994,14 +991,13 @@ def dit_forward(x_latent, timesteps, actions, dev, scr, tt_device, scaler, mean_
         )
         print("  Block %d done" % block_idx)
 
-    # Final layer: per-frame adaLN
+    # Final layer: per-frame adaLN (computed on HOST in fp32)
     final_shift_all = torch.zeros(SEQ, D_MODEL, dtype=torch.bfloat16)
     final_scale_all = torch.zeros(SEQ, D_MODEL, dtype=torch.bfloat16)
     for t_idx in range(T):
-        cond_tt = cond_list[t_idx]
-        silu_kernel(cond_tt, scr["t_emb_a"])
-        linear_bias_k32(scr["t_emb_a"], dev["final_adaln_w"], dev["final_adaln_b"], scr["final_adaln"])
-        mod_host = ttnn.to_torch(scr["final_adaln"])[0, :2 * D_MODEL].float()
+        cond_host = ttnn.to_torch(cond_list[t_idx])[0, :D_MODEL].float()
+        cond_silu = cond_host * torch.sigmoid(cond_host)
+        mod_host = (cond_silu @ dev["final_adaln_w_host"] + dev["final_adaln_b_host"])
         start = t_idx * N_PATCH_PAD
         final_shift_all[start:start + N_PATCH_PAD] = expand_bias(
             mod_host[:D_MODEL].to(torch.bfloat16), N_PATCH_PAD)
