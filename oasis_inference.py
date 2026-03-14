@@ -618,8 +618,45 @@ def precompute_temporal_rope_freqs(freqs_param, max_t=32):
     return einops_repeat(freqs, "... n -> ... (n r)", r=2)  # (max_t, 64)
 
 # Global RoPE freq tables (set during weight loading)
-SPATIAL_ROPE_FREQS = None   # (144, 32) float
+SPATIAL_ROPE_FREQS = None   # (144, 64) float
 TEMPORAL_ROPE_FREQS = None  # (max_t, 64) float
+
+def swap_adjacent_columns(w):
+    """Swap adjacent column pairs: col 2k <-> col 2k+1.
+    Used to bake rotate_half permutation into weight matrices for device RoPE."""
+    w_swap = w.clone()
+    w_swap[:, 0::2] = w[:, 1::2]
+    w_swap[:, 1::2] = w[:, 0::2]
+    return w_swap
+
+def build_spatial_rope_device_tables(spatial_freqs, n_frames, tt_device):
+    """Build device-side cos/sin_perm tables for spatial RoPE.
+    spatial_freqs: (N_PATCHES, 64) float.
+    Returns cos_tt, sin_perm_tt each (SEQ, D_MODEL) on device.
+    sin_perm bakes in the rotate_half sign: sin_perm[2k] = -sin, sin_perm[2k+1] = +sin.
+    """
+    SEQ = N_PATCH_PAD * n_frames
+    cos_per_pos = spatial_freqs.cos()  # (N_PATCHES, 64)
+    sin_per_pos = spatial_freqs.sin()  # (N_PATCHES, 64)
+
+    # Bake rotate_half sign into sin: [-, +, -, +, ...] pattern
+    sign = torch.ones(SPATIAL_ROPE_DIM)
+    sign[0::2] = -1
+    sin_perm_per_pos = sin_per_pos * sign.unsqueeze(0)  # (N_PATCHES, 64)
+
+    # Repeat across all heads: (N_PATCHES, 64) -> (N_PATCHES, 1024)
+    cos_expanded = cos_per_pos.repeat(1, N_HEADS)
+    sin_expanded = sin_perm_per_pos.repeat(1, N_HEADS)
+
+    # Pad to N_PATCH_PAD rows, repeat for T frames
+    cos_full = torch.zeros(SEQ, D_MODEL, dtype=torch.bfloat16)
+    sin_full = torch.zeros(SEQ, D_MODEL, dtype=torch.bfloat16)
+    for t in range(n_frames):
+        start = t * N_PATCH_PAD
+        cos_full[start:start + N_PATCHES] = cos_expanded.to(torch.bfloat16)
+        sin_full[start:start + N_PATCHES] = sin_expanded.to(torch.bfloat16)
+
+    return to_tt(cos_full, tt_device), to_tt(sin_full, tt_device)
 
 # ============================================================
 # Weight loading
@@ -686,6 +723,13 @@ def preload_dit_weights(tt_device, n_frames=2):
                 qkv_w = st.get_tensor("%s_attn.to_qkv.weight" % p).T.contiguous().to(torch.bfloat16)
                 dev["%s.qkv_w" % p] = to_tt(qkv_w, tt_device)
 
+                # Pair-swapped Q/K weights for device-side RoPE (rotate_half baked in)
+                q_w = qkv_w[:, :D_MODEL]
+                k_w = qkv_w[:, D_MODEL:2*D_MODEL]
+                qk_swap_w = torch.cat([swap_adjacent_columns(q_w),
+                                       swap_adjacent_columns(k_w)], dim=1)
+                dev["%s.qk_swap_w" % p] = to_tt(qk_swap_w, tt_device)
+
                 # Output projection: Linear(1024, 1024) with bias
                 SEQ = N_PATCH_PAD * n_frames
                 out_w = st.get_tensor("%s_attn.to_out.weight" % p).T.contiguous().to(torch.bfloat16)
@@ -711,10 +755,14 @@ def preload_dit_weights(tt_device, n_frames=2):
         global SPATIAL_ROPE_FREQS, TEMPORAL_ROPE_FREQS
         s_freqs = st.get_tensor("blocks.0.s_attn.rotary_emb.freqs").float()  # (16,)
         t_freqs = st.get_tensor("blocks.0.t_attn.rotary_emb.freqs").float()  # (32,)
-        SPATIAL_ROPE_FREQS = precompute_spatial_rope_freqs(s_freqs)  # (144, 32)
+        SPATIAL_ROPE_FREQS = precompute_spatial_rope_freqs(s_freqs)  # (144, 64)
         TEMPORAL_ROPE_FREQS = precompute_temporal_rope_freqs(t_freqs)  # (max_t, 64)
         print("Precomputed RoPE freqs: spatial %s, temporal %s" % (
             tuple(SPATIAL_ROPE_FREQS.shape), tuple(TEMPORAL_ROPE_FREQS.shape)))
+
+        # Device-side spatial RoPE tables
+        dev["spatial_cos"], dev["spatial_sin_perm"] = \
+            build_spatial_rope_device_tables(SPATIAL_ROPE_FREQS, n_frames, tt_device)
 
     elapsed = time.time() - t0
     print("Preloaded %d tensors in %.1fs" % (len(dev), elapsed))
@@ -854,52 +902,41 @@ def run_sub_block(prefix, x_tt, cond_list, dev, scr, tt_device, scaler, mean_sca
     linear_k32(scr["modulated"], dev["%s.qkv_w" % prefix], scr["qkv"])
     _timer.mark("qkv")
 
-    # Read QKV to host for reshaping + RoPE + SDPA
-    qkv_host_full = ttnn.to_torch(scr["qkv"])  # (SEQ, 3*D_MODEL)
-    _timer.mark("qkv_read")
-
     if attn_type == "spatial":
-        # Spatial: each frame independently, (B*T, heads, H*W, d_head)
-        # Process T frames as batch dimension
-        q_all, k_all, v_all = [], [], []
-        for t_idx in range(T):
-            start = t_idx * N_PATCH_PAD
-            qkv_frame = qkv_host_full[start:start + N_PATCHES].to(torch.bfloat16).float()
-            q, k, v = qkv_frame.chunk(3, dim=-1)
+        # All-device spatial attention: RoPE + SDPA without host round-trip
+        # Slice Q, K, V from QKV on device
+        q = ttnn.slice(scr["qkv"], [0, 0], [SEQ, D_MODEL])
+        k = ttnn.slice(scr["qkv"], [0, D_MODEL], [SEQ, 2 * D_MODEL])
+        v = ttnn.slice(scr["qkv"], [0, 2 * D_MODEL], [SEQ, 3 * D_MODEL])
 
-            # Apply spatial RoPE
-            q_mh = q.view(N_PATCHES, N_HEADS, D_HEAD)
-            k_mh = k.view(N_PATCHES, N_HEADS, D_HEAD)
-            freqs = SPATIAL_ROPE_FREQS.unsqueeze(1)  # (144, 1, 64)
-            q_mh = apply_rotary_emb(freqs, q_mh)
-            k_mh = apply_rotary_emb(freqs, k_mh)
+        # Compute pair-swapped Q/K projections for rotate_half
+        qk_swap = ttnn.matmul(scr["modulated"], dev["%s.qk_swap_w" % prefix])
+        q_swap = ttnn.slice(qk_swap, [0, 0], [SEQ, D_MODEL])
+        k_swap = ttnn.slice(qk_swap, [0, D_MODEL], [SEQ, 2 * D_MODEL])
 
-            # Reshape to (1, heads, N_PATCHES, d_head), pad
-            q_4d = q_mh.permute(1, 0, 2).unsqueeze(0).to(torch.bfloat16)
-            k_4d = k_mh.permute(1, 0, 2).unsqueeze(0).to(torch.bfloat16)
-            v_4d = v.view(N_PATCHES, N_HEADS, D_HEAD).permute(1, 0, 2).unsqueeze(0).to(torch.bfloat16)
-            q_4d = F.pad(q_4d, [0, 0, 0, N_PATCH_PAD - N_PATCHES])
-            k_4d = F.pad(k_4d, [0, 0, 0, N_PATCH_PAD - N_PATCHES])
-            v_4d = F.pad(v_4d, [0, 0, 0, N_PATCH_PAD - N_PATCHES])
-            q_all.append(q_4d)
-            k_all.append(k_4d)
-            v_all.append(v_4d)
+        # Apply spatial RoPE: q_roped = q * cos + q_swap * sin_perm
+        q_roped = ttnn.add(ttnn.multiply(q, dev["spatial_cos"]),
+                           ttnn.multiply(q_swap, dev["spatial_sin_perm"]))
+        k_roped = ttnn.add(ttnn.multiply(k, dev["spatial_cos"]),
+                           ttnn.multiply(k_swap, dev["spatial_sin_perm"]))
 
-        # Batch all frames: (T, heads, N_PATCH_PAD, d_head)
-        q_batch = torch.cat(q_all, dim=0)
-        k_batch = torch.cat(k_all, dim=0)
-        v_batch = torch.cat(v_all, dim=0)
+        # Reshape for SDPA: (SEQ, D_MODEL) -> (T, N_HEADS, N_PATCH_PAD, D_HEAD)
+        q_4d = ttnn.reshape(q_roped, [T, N_PATCH_PAD, N_HEADS, D_HEAD])
+        q_4d = ttnn.permute(q_4d, [0, 2, 1, 3])
+        k_4d = ttnn.reshape(k_roped, [T, N_PATCH_PAD, N_HEADS, D_HEAD])
+        k_4d = ttnn.permute(k_4d, [0, 2, 1, 3])
+        v_4d = ttnn.reshape(v, [T, N_PATCH_PAD, N_HEADS, D_HEAD])
+        v_4d = ttnn.permute(v_4d, [0, 2, 1, 3])
 
-        q_tt = to_tt(q_batch, tt_device)
-        k_tt = to_tt(k_batch, tt_device)
-        v_tt = to_tt(v_batch, tt_device)
-
-        attn_out = ttnn.transformer.scaled_dot_product_attention(q_tt, k_tt, v_tt, is_causal=False)
+        attn_out = ttnn.transformer.scaled_dot_product_attention(q_4d, k_4d, v_4d, is_causal=False)
         attn_perm = ttnn.permute(attn_out, [0, 2, 1, 3])  # (T, N_PATCH_PAD, heads, d_head)
         attn_2d = ttnn.reshape(attn_perm, [SEQ, D_MODEL])
         _timer.mark("sdpa")
 
     else:
+        # Temporal: read QKV to host for CPU SDPA (T=2 too small for device)
+        qkv_host_full = ttnn.to_torch(scr["qkv"])  # (SEQ, 3*D_MODEL)
+        _timer.mark("qkv_read")
         # Temporal: (B*H*W, heads, T, d_head) with causal attention
         # Gather per-frame patches, reshape for temporal
         frames_qkv = []
