@@ -889,6 +889,8 @@ def preload_dit_weights(tt_device, n_frames=2):
                 dev["%s.fc2_w" % p] = to_tt(fc2_w, tt_device)
                 fc2_b = st.get_tensor("%s_mlp.fc2.bias" % p).to(torch.bfloat16)
                 dev["%s.fc2_b" % p] = to_tt(expand_bias(fc2_b, SEQ), tt_device)
+                # 1D bias for ttnn.linear
+                dev["%s.fc2_b_1d" % p] = to_tt(fc2_b.unsqueeze(0).contiguous(), tt_device)
 
         SEQ = N_PATCH_PAD * n_frames
         dev["ln_w_ones"] = to_tt(torch.ones(SEQ, D_MODEL, dtype=torch.bfloat16), tt_device)
@@ -1144,12 +1146,9 @@ def run_sub_block(prefix, x_tt, cond_list, dev, scr, tt_device, scaler, mean_sca
     linear_bias_k32(scr["modulated"], dev["%s.fc1_w" % prefix], dev["%s.fc1_b" % prefix], scr["fc1"])
     gelu_approx_kernel(scr["fc1"], scr["gelu"])
     _timer.mark("fc1+gelu")
-    # TODO: investigate why tt-lang linear_accum kernel has much worse precision than
-    # ttnn.matmul for large-K accumulation (4096->1024, k_chunk=32, k_iters=4).
-    # Our kernel: max_err=11.7, ttnn.matmul: max_err=0.34 on same inputs.
-    scr["fc2"] = ttnn.matmul(scr["gelu"], dev["%s.fc2_w" % prefix])
-    fc2_with_bias = ttnn.add(scr["fc2"], dev["%s.fc2_b" % prefix])
-    gated_residual_kernel(x_tt, fc2_with_bias, gate_mlp, scr["z_a"])
+    # FC2 uses ttnn.matmul for precision (4096->1024 accumulation).
+    scr["fc2"] = ttnn.linear(scr["gelu"], dev["%s.fc2_w" % prefix], bias=dev["%s.fc2_b_1d" % prefix])
+    gated_residual_kernel(x_tt, scr["fc2"], gate_mlp, scr["z_a"])
     _timer.mark("fc2+res")
 
     _timer.report(prefix, attn_type)
