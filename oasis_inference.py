@@ -194,6 +194,66 @@ def make_linear_bias_kernel(k_chunk, n_chunk=1):
                         tx = ttl.copy(blk, out[row, sc:sc + n_chunk]); tx.wait()
     return linear_bias_kernel
 
+def make_fused_linear_bias_gated_res_kernel(k_chunk):
+    """Fused: out = residual + (x @ w + bias) * gate.
+    Eliminates DRAM round-trips for intermediate matmul result and bias-add."""
+    @ttl.kernel(grid="auto")
+    def fused_lbgr_kernel(x, w, bias, gate, residual, out):
+        grid_cols, _ = ttl.grid_size(dims=2)
+        m_tiles = x.shape[0] // TILE
+        n_tiles = w.shape[1] // TILE
+        total_out = m_tiles * n_tiles
+        tiles_per_core = -(-total_out // grid_cols)
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, k_chunk), buffer_factor=2)
+        w_dfb = ttl.make_dataflow_buffer_like(w, shape=(k_chunk, 1), buffer_factor=2)
+        b_dfb = ttl.make_dataflow_buffer_like(bias, shape=(1, 1), buffer_factor=2)
+        g_dfb = ttl.make_dataflow_buffer_like(gate, shape=(1, 1), buffer_factor=2)
+        r_dfb = ttl.make_dataflow_buffer_like(residual, shape=(1, 1), buffer_factor=2)
+        mm_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
+        gb_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
+        @ttl.compute()
+        def compute():
+            core_x, _ = ttl.core(dims=2)
+            for local_t in range(tiles_per_core):
+                idx = core_x * tiles_per_core + local_t
+                if idx < total_out:
+                    with x_dfb.wait() as xv, w_dfb.wait() as wv, mm_dfb.reserve() as mm:
+                        mm.store(xv @ wv)
+                    with mm_dfb.wait() as mmv, b_dfb.wait() as bv, g_dfb.wait() as gv, gb_dfb.reserve() as gb:
+                        gb.store((mmv + bv) * gv)
+                    with gb_dfb.wait() as gbv, r_dfb.wait() as rv, out_dfb.reserve() as o:
+                        o.store(rv + gbv)
+        @ttl.datamovement()
+        def dm_read():
+            core_x, _ = ttl.core(dims=2)
+            for local_t in range(tiles_per_core):
+                idx = core_x * tiles_per_core + local_t
+                if idx < total_out:
+                    row = idx // n_tiles
+                    col = idx % n_tiles
+                    with x_dfb.reserve() as blk:
+                        tx = ttl.copy(x[row, 0:k_chunk], blk); tx.wait()
+                    with w_dfb.reserve() as blk:
+                        tx = ttl.copy(w[0:k_chunk, col], blk); tx.wait()
+                    with b_dfb.reserve() as blk:
+                        tx = ttl.copy(bias[row, col], blk); tx.wait()
+                    with g_dfb.reserve() as blk:
+                        tx = ttl.copy(gate[row, col], blk); tx.wait()
+                    with r_dfb.reserve() as blk:
+                        tx = ttl.copy(residual[row, col], blk); tx.wait()
+        @ttl.datamovement()
+        def dm_write():
+            core_x, _ = ttl.core(dims=2)
+            for local_t in range(tiles_per_core):
+                idx = core_x * tiles_per_core + local_t
+                if idx < total_out:
+                    row = idx // n_tiles
+                    col = idx % n_tiles
+                    with out_dfb.wait() as blk:
+                        tx = ttl.copy(blk, out[row, col]); tx.wait()
+    return fused_lbgr_kernel
+
 def make_linear_accum_kernel(k_chunk, k_iters):
     @ttl.kernel(grid="auto")
     def linear_accum_kernel(x, w, out):
@@ -583,6 +643,7 @@ linear_k1 = make_linear_kernel(1)  # for external_cond (32->1024)
 linear_bias_k32 = make_linear_bias_kernel(D_TILES, n_chunk=4)
 linear_bias_k8 = make_linear_bias_kernel(FREQ_DIM // TILE, n_chunk=4)
 linear_accum_k32_4 = make_linear_accum_kernel(D_TILES, 4)  # MLP down 4096->1024
+fused_lbgr_k32 = make_fused_linear_bias_gated_res_kernel(D_TILES)  # O proj + bias + gated residual
 layernorm_d1024 = make_layernorm_kernel(D_TILES)
 
 # ============================================================
@@ -1069,10 +1130,9 @@ def run_sub_block(prefix, x_tt, cond_list, dev, scr, tt_device, scaler, mean_sca
         attn_2d = ttnn.reshape(attn_out, [SEQ, D_MODEL])
         _timer.mark("sdpa")
 
-    # O projection + bias + gated residual
-    linear_k32(attn_2d, dev["%s.out_w" % prefix], scr["o_proj"])
-    o_with_bias = ttnn.add(scr["o_proj"], dev["%s.out_b" % prefix])
-    gated_residual_kernel(x_tt, o_with_bias, gate_msa, scr["z_b"])
+    # Fused: O projection + bias + gated residual (saves 2 DRAM round-trips)
+    fused_lbgr_k32(attn_2d, dev["%s.out_w" % prefix], dev["%s.out_b" % prefix],
+                    gate_msa, x_tt, scr["z_b"])
     _timer.mark("o_proj+res")
 
     x_tt = scr["z_b"]
