@@ -712,6 +712,196 @@ def make_rope_sdpa_kernel(seq_tiles, head_tiles, n_heads_val, scale_val):
 
 rope_sdpa_kernel = make_rope_sdpa_kernel(N_PATCH_PAD_TILES, D_HEAD_TILES, N_HEADS, 0.125)
 
+def make_qkv_rope_sdpa_kernel(dim_tiles, seq_tiles, head_tiles, n_heads_val, scale_val):
+    """Mega-fused QKV matmul + RoPE + SDPA kernel.
+    Reads pre-modulated input and QKV weights, does K-accumulation matmul per head,
+    applies RoPE, then SDPA. Q/K/V stay in L1 between matmul and attention."""
+    @ttl.kernel(grid="auto")
+    def qkv_rope_sdpa(modulated, qkv_w, cos_tab, sin_tab, scaler, out):
+        grid_cols, _ = ttl.grid_size(dims=2)
+        n_frames = modulated.shape[0] // TILE // seq_tiles
+        total_heads = n_frames * n_heads_val
+        heads_per_core = -(-total_heads // grid_cols)
+        d_tiles = n_heads_val * head_tiles
+
+        mod_dfb = ttl.make_dataflow_buffer_like(modulated, shape=(seq_tiles, 1), buffer_factor=2)
+        w_dfb = ttl.make_dataflow_buffer_like(qkv_w, shape=(1, head_tiles), buffer_factor=2)
+        acc_dfb = ttl.make_dataflow_buffer_like(modulated, shape=(seq_tiles, head_tiles), buffer_factor=2)
+        mm_dfb = ttl.make_dataflow_buffer_like(modulated, shape=(seq_tiles, head_tiles), buffer_factor=2)
+        q_dfb = ttl.make_dataflow_buffer_like(modulated, shape=(seq_tiles, head_tiles), buffer_factor=2)
+        k_dfb = ttl.make_dataflow_buffer_like(modulated, shape=(seq_tiles, head_tiles), buffer_factor=2)
+        v_dfb = ttl.make_dataflow_buffer_like(modulated, shape=(seq_tiles, head_tiles), buffer_factor=2)
+        cos_dfb = ttl.make_dataflow_buffer_like(cos_tab, shape=(seq_tiles, head_tiles), buffer_factor=2)
+        sin_dfb = ttl.make_dataflow_buffer_like(sin_tab, shape=(seq_tiles, head_tiles), buffer_factor=2)
+        qr_dfb = ttl.make_dataflow_buffer_like(modulated, shape=(seq_tiles, head_tiles), buffer_factor=2)
+        kr_dfb = ttl.make_dataflow_buffer_like(modulated, shape=(seq_tiles, head_tiles), buffer_factor=2)
+        kt_dfb = ttl.make_dataflow_buffer_like(modulated, shape=(head_tiles, seq_tiles), buffer_factor=2)
+        a_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(seq_tiles, seq_tiles), buffer_factor=2)
+        b_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(seq_tiles, seq_tiles), buffer_factor=2)
+        c_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(seq_tiles, seq_tiles), buffer_factor=2)
+        row_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(seq_tiles, 1), buffer_factor=2)
+        row_bc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(seq_tiles, seq_tiles), buffer_factor=2)
+        scaler_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(seq_tiles, head_tiles), buffer_factor=2)
+
+        @ttl.compute()
+        def compute():
+            core_x, _ = ttl.core(dims=2)
+            for local_h in range(heads_per_core):
+                head_idx = core_x * heads_per_core + local_h
+                if head_idx < total_heads:
+                    # Q matmul
+                    with mod_dfb.wait() as m0, w_dfb.wait() as w0, acc_dfb.reserve() as a:
+                        a.store(m0 @ w0)
+                    for k_idx in range(dim_tiles - 1):
+                        with mod_dfb.wait() as mk, w_dfb.wait() as wk, mm_dfb.reserve() as mm:
+                            mm.store(mk @ wk)
+                        with mm_dfb.wait() as mmv, acc_dfb.wait() as prev, acc_dfb.reserve() as a:
+                            a.store(prev + mmv)
+                    with acc_dfb.wait() as qr, q_dfb.reserve() as q:
+                        q.store(qr)
+                    # Qs matmul + RoPE Q
+                    with mod_dfb.wait() as m0, w_dfb.wait() as w0, acc_dfb.reserve() as a:
+                        a.store(m0 @ w0)
+                    for k_idx in range(dim_tiles - 1):
+                        with mod_dfb.wait() as mk, w_dfb.wait() as wk, mm_dfb.reserve() as mm:
+                            mm.store(mk @ wk)
+                        with mm_dfb.wait() as mmv, acc_dfb.wait() as prev, acc_dfb.reserve() as a:
+                            a.store(prev + mmv)
+                    with acc_dfb.wait() as qs, q_dfb.wait() as qv, cos_dfb.wait() as cv, sin_dfb.wait() as sv:
+                        with qr_dfb.reserve() as qr:
+                            qr.store(qv * cv + qs * sv)
+                    # K matmul
+                    with mod_dfb.wait() as m0, w_dfb.wait() as w0, acc_dfb.reserve() as a:
+                        a.store(m0 @ w0)
+                    for k_idx in range(dim_tiles - 1):
+                        with mod_dfb.wait() as mk, w_dfb.wait() as wk, mm_dfb.reserve() as mm:
+                            mm.store(mk @ wk)
+                        with mm_dfb.wait() as mmv, acc_dfb.wait() as prev, acc_dfb.reserve() as a:
+                            a.store(prev + mmv)
+                    with acc_dfb.wait() as kr, k_dfb.reserve() as k:
+                        k.store(kr)
+                    # Ks matmul + RoPE K
+                    with mod_dfb.wait() as m0, w_dfb.wait() as w0, acc_dfb.reserve() as a:
+                        a.store(m0 @ w0)
+                    for k_idx in range(dim_tiles - 1):
+                        with mod_dfb.wait() as mk, w_dfb.wait() as wk, mm_dfb.reserve() as mm:
+                            mm.store(mk @ wk)
+                        with mm_dfb.wait() as mmv, acc_dfb.wait() as prev, acc_dfb.reserve() as a:
+                            a.store(prev + mmv)
+                    with acc_dfb.wait() as ks, k_dfb.wait() as kv, cos_dfb.wait() as cv, sin_dfb.wait() as sv:
+                        with kr_dfb.reserve() as kr:
+                            kr.store(kv * cv + ks * sv)
+                    # V matmul
+                    with mod_dfb.wait() as m0, w_dfb.wait() as w0, acc_dfb.reserve() as a:
+                        a.store(m0 @ w0)
+                    for k_idx in range(dim_tiles - 1):
+                        with mod_dfb.wait() as mk, w_dfb.wait() as wk, mm_dfb.reserve() as mm:
+                            mm.store(mk @ wk)
+                        with mm_dfb.wait() as mmv, acc_dfb.wait() as prev, acc_dfb.reserve() as a:
+                            a.store(prev + mmv)
+                    with acc_dfb.wait() as vr, v_dfb.reserve() as v:
+                        v.store(vr)
+                    # SDPA
+                    with qr_dfb.wait() as qrv, kr_dfb.wait() as krv, v_dfb.wait() as vv, scaler_dfb.wait() as sc:
+                        with kt_dfb.reserve() as kt:
+                            kt.store(ttl.transpose(krv))
+                        with kt_dfb.wait() as ktv, a_dfb.reserve() as qk:
+                            qk.store(qrv @ ktv)
+                        with a_dfb.wait() as qkv, b_dfb.reserve() as scaled:
+                            scaled.store(qkv * ttl.math.fill(qkv, scale_val))
+                        with b_dfb.wait() as sdv:
+                            with row_dfb.reserve() as mx:
+                                mx.store(ttl.math.reduce_max(sdv, sc, dims=[1]))
+                            with row_dfb.wait() as mxv, row_bc_dfb.reserve() as mxb:
+                                mxb.store(ttl.math.broadcast(mxv, dims=[1]))
+                            with row_bc_dfb.wait() as mxbv:
+                                with a_dfb.reserve() as ex:
+                                    ex.store(ttl.math.exp(sdv - mxbv))
+                            with a_dfb.wait() as exv:
+                                with row_dfb.reserve() as sm:
+                                    sm.store(ttl.math.reduce_sum(exv, sc, dims=[1]))
+                                with row_dfb.wait() as smv, row_bc_dfb.reserve() as smb:
+                                    smb.store(ttl.math.broadcast(smv, dims=[1]))
+                                with row_bc_dfb.wait() as smbv, c_dfb.reserve() as attn:
+                                    attn.store(exv * ttl.math.recip(smbv))
+                        with c_dfb.wait() as av, out_dfb.reserve() as o:
+                            o.store(av @ vv)
+
+        @ttl.datamovement()
+        def dm_read():
+            core_x, _ = ttl.core(dims=2)
+            for local_h in range(heads_per_core):
+                head_idx = core_x * heads_per_core + local_h
+                if head_idx < total_heads:
+                    frame = head_idx // n_heads_val
+                    h = head_idx % n_heads_val
+                    row_start = frame * seq_tiles
+                    hc = h * head_tiles
+                    d_t = n_heads_val * head_tiles
+                    # Q matmul: weights at column hc
+                    for k in range(dim_tiles):
+                        with mod_dfb.reserve() as blk:
+                            tx = ttl.copy(modulated[row_start:row_start + seq_tiles, k], blk); tx.wait()
+                        with w_dfb.reserve() as blk:
+                            tx = ttl.copy(qkv_w[k, hc:hc + head_tiles], blk); tx.wait()
+                    # Qs matmul: weights at column 3*d_t+hc
+                    qs_col = 3 * d_t + hc
+                    for k in range(dim_tiles):
+                        with mod_dfb.reserve() as blk:
+                            tx = ttl.copy(modulated[row_start:row_start + seq_tiles, k], blk); tx.wait()
+                        with w_dfb.reserve() as blk:
+                            tx = ttl.copy(qkv_w[k, qs_col:qs_col + head_tiles], blk); tx.wait()
+                    with cos_dfb.reserve() as blk:
+                        tx = ttl.copy(cos_tab[row_start:row_start + seq_tiles, hc:hc + head_tiles], blk); tx.wait()
+                    with sin_dfb.reserve() as blk:
+                        tx = ttl.copy(sin_tab[row_start:row_start + seq_tiles, hc:hc + head_tiles], blk); tx.wait()
+                    # K matmul: weights at column d_t+hc
+                    k_col = d_t + hc
+                    for k in range(dim_tiles):
+                        with mod_dfb.reserve() as blk:
+                            tx = ttl.copy(modulated[row_start:row_start + seq_tiles, k], blk); tx.wait()
+                        with w_dfb.reserve() as blk:
+                            tx = ttl.copy(qkv_w[k, k_col:k_col + head_tiles], blk); tx.wait()
+                    # Ks matmul: weights at column 4*d_t+hc
+                    ks_col = 4 * d_t + hc
+                    for k in range(dim_tiles):
+                        with mod_dfb.reserve() as blk:
+                            tx = ttl.copy(modulated[row_start:row_start + seq_tiles, k], blk); tx.wait()
+                        with w_dfb.reserve() as blk:
+                            tx = ttl.copy(qkv_w[k, ks_col:ks_col + head_tiles], blk); tx.wait()
+                    with cos_dfb.reserve() as blk:
+                        tx = ttl.copy(cos_tab[row_start:row_start + seq_tiles, hc:hc + head_tiles], blk); tx.wait()
+                    with sin_dfb.reserve() as blk:
+                        tx = ttl.copy(sin_tab[row_start:row_start + seq_tiles, hc:hc + head_tiles], blk); tx.wait()
+                    # V matmul: weights at column 2*d_t+hc
+                    v_col = 2 * d_t + hc
+                    for k in range(dim_tiles):
+                        with mod_dfb.reserve() as blk:
+                            tx = ttl.copy(modulated[row_start:row_start + seq_tiles, k], blk); tx.wait()
+                        with w_dfb.reserve() as blk:
+                            tx = ttl.copy(qkv_w[k, v_col:v_col + head_tiles], blk); tx.wait()
+                    # Scaler for SDPA
+                    with scaler_dfb.reserve() as blk:
+                        tx = ttl.copy(scaler[0, 0], blk); tx.wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            core_x, _ = ttl.core(dims=2)
+            for local_h in range(heads_per_core):
+                head_idx = core_x * heads_per_core + local_h
+                if head_idx < total_heads:
+                    frame = head_idx // n_heads_val
+                    h = head_idx % n_heads_val
+                    row_start = frame * seq_tiles
+                    col_start = h * head_tiles
+                    with out_dfb.wait() as blk:
+                        tx = ttl.copy(blk, out[row_start:row_start + seq_tiles, col_start:col_start + head_tiles]); tx.wait()
+
+    return qkv_rope_sdpa
+
+mega_qkv_rope_sdpa = make_qkv_rope_sdpa_kernel(D_TILES, N_PATCH_PAD_TILES, D_HEAD_TILES, N_HEADS, 0.125)
+
 def make_fused_ln_adaln_kernel(dim_tiles):
     """Fused LayerNorm + adaLN modulate: out = layernorm(x) * (1 + scale) + shift.
     Eliminates DRAM round-trip for the intermediate normed tensor."""
@@ -1348,22 +1538,22 @@ def run_sub_block(prefix, x_tt, cond_list, dev, scr, tt_device, scaler, mean_sca
         build_per_frame_adaln(cond_list, prefix, dev, scr, tt_device)
     _timer.mark("adaln")
 
-    # Fused LayerNorm + adaLN modulate -> combined QKV + QK_swap via ttnn.matmul
+    # Fused LayerNorm + adaLN modulate
     fused_ln_adaln_d1024(x_tt, scaler, mean_scale, shift_msa, scale_msa, scr["modulated"])
     _timer.mark("norm+mod")
-    qkv_full = ttnn.matmul(scr["modulated"], dev["%s.qkv_full_w" % prefix])
-    _timer.mark("qkv")
 
     if attn_type == "spatial":
 
-        # Fused RoPE + SDPA: reads from qkv_full directly (no separate slicing)
-        rope_sdpa_kernel(qkv_full, dev["spatial_cos"], dev["spatial_sin_perm"],
-                         scaler, scr["sdpa_out"])
+        # Mega-fused: QKV matmul + RoPE + SDPA in one kernel
+        mega_qkv_rope_sdpa(scr["modulated"], dev["%s.qkv_full_w" % prefix],
+                           dev["spatial_cos"], dev["spatial_sin_perm"],
+                           scaler, scr["sdpa_out"])
         attn_2d = scr["sdpa_out"]
-        _timer.mark("sdpa")
+        _timer.mark("qkv+sdpa")
 
     else:
-        # Temporal needs separate slices for reshape/permute into temporal format
+        # Temporal still uses ttnn.matmul + separate RoPE + ttnn SDPA
+        qkv_full = ttnn.matmul(scr["modulated"], dev["%s.qkv_full_w" % prefix])
         q = ttnn.slice(qkv_full, [0, 0], [SEQ, D_MODEL])
         k = ttnn.slice(qkv_full, [0, D_MODEL], [SEQ, 2 * D_MODEL])
         v = ttnn.slice(qkv_full, [0, 2 * D_MODEL], [SEQ, 3 * D_MODEL])
