@@ -594,16 +594,18 @@ def gated_residual_kernel(residual, x, gate, out):
 N_PATCH_PAD_TILES = N_PATCH_PAD // TILE  # 5
 D_HEAD_TILES = D_HEAD // TILE  # 2
 
-def make_spatial_sdpa_kernel(seq_tiles, head_tiles, scale_val):
-    """TT-Lang spatial SDPA: softmax(Q @ K^T * scale) @ V, batched over heads.
-    Input Q, K, V: (N_HEADS * seq_tiles * TILE, head_tiles * TILE) packed by head.
-    Each head is a contiguous block of seq_tiles rows.
-    Eliminates all the ttnn reshape/permute ops around SDPA."""
+def make_spatial_sdpa_full_kernel(seq_tiles, head_tiles, n_heads_val, scale_val):
+    """TT-Lang spatial SDPA that reads/writes (SEQ, D_MODEL) layout directly.
+    Q, K, V: (T*N_PATCH_PAD, N_HEADS*D_HEAD) - standard activation format.
+    DM threads extract per-head slices and scatter results back.
+    Eliminates all ttnn reshape/permute around SDPA."""
+    d_tiles = n_heads_val * head_tiles  # total columns in tiles
     @ttl.kernel(grid="auto")
-    def spatial_sdpa(Q, K, V, scaler, out):
+    def spatial_sdpa_full(Q, K, V, scaler, out):
         grid_cols, _ = ttl.grid_size(dims=2)
-        n_heads = Q.shape[0] // TILE // seq_tiles
-        heads_per_core = -(-n_heads // grid_cols)
+        n_frames = Q.shape[0] // TILE // seq_tiles
+        total_heads = n_frames * n_heads_val
+        heads_per_core = -(-total_heads // grid_cols)
 
         q_dfb = ttl.make_dataflow_buffer_like(Q, shape=(seq_tiles, head_tiles), buffer_factor=2)
         k_dfb = ttl.make_dataflow_buffer_like(K, shape=(seq_tiles, head_tiles), buffer_factor=2)
@@ -623,7 +625,7 @@ def make_spatial_sdpa_kernel(seq_tiles, head_tiles, scale_val):
             core_x, _ = ttl.core(dims=2)
             for local_h in range(heads_per_core):
                 head_idx = core_x * heads_per_core + local_h
-                if head_idx < n_heads:
+                if head_idx < total_heads:
                     with q_dfb.wait() as qv, k_dfb.wait() as kv, v_dfb.wait() as vv, scaler_dfb.wait() as sc:
                         with kt_dfb.reserve() as kt:
                             kt.store(ttl.transpose(kv))
@@ -654,14 +656,17 @@ def make_spatial_sdpa_kernel(seq_tiles, head_tiles, scale_val):
             core_x, _ = ttl.core(dims=2)
             for local_h in range(heads_per_core):
                 head_idx = core_x * heads_per_core + local_h
-                if head_idx < n_heads:
-                    h_start = head_idx * seq_tiles
+                if head_idx < total_heads:
+                    frame = head_idx // n_heads_val
+                    h = head_idx % n_heads_val
+                    row_start = frame * seq_tiles
+                    col_start = h * head_tiles
                     with q_dfb.reserve() as blk:
-                        tx = ttl.copy(Q[h_start:h_start + seq_tiles, 0:head_tiles], blk); tx.wait()
+                        tx = ttl.copy(Q[row_start:row_start + seq_tiles, col_start:col_start + head_tiles], blk); tx.wait()
                     with k_dfb.reserve() as blk:
-                        tx = ttl.copy(K[h_start:h_start + seq_tiles, 0:head_tiles], blk); tx.wait()
+                        tx = ttl.copy(K[row_start:row_start + seq_tiles, col_start:col_start + head_tiles], blk); tx.wait()
                     with v_dfb.reserve() as blk:
-                        tx = ttl.copy(V[h_start:h_start + seq_tiles, 0:head_tiles], blk); tx.wait()
+                        tx = ttl.copy(V[row_start:row_start + seq_tiles, col_start:col_start + head_tiles], blk); tx.wait()
                     with scaler_dfb.reserve() as blk:
                         tx = ttl.copy(scaler[0, 0], blk); tx.wait()
 
@@ -670,15 +675,17 @@ def make_spatial_sdpa_kernel(seq_tiles, head_tiles, scale_val):
             core_x, _ = ttl.core(dims=2)
             for local_h in range(heads_per_core):
                 head_idx = core_x * heads_per_core + local_h
-                if head_idx < n_heads:
-                    h_start = head_idx * seq_tiles
+                if head_idx < total_heads:
+                    frame = head_idx // n_heads_val
+                    h = head_idx % n_heads_val
+                    row_start = frame * seq_tiles
+                    col_start = h * head_tiles
                     with out_dfb.wait() as blk:
-                        tx = ttl.copy(blk, out[h_start:h_start + seq_tiles, 0:head_tiles]); tx.wait()
+                        tx = ttl.copy(blk, out[row_start:row_start + seq_tiles, col_start:col_start + head_tiles]); tx.wait()
 
-    return spatial_sdpa
+    return spatial_sdpa_full
 
-# 1/sqrt(64) = 0.125
-spatial_sdpa_kernel = make_spatial_sdpa_kernel(N_PATCH_PAD_TILES, D_HEAD_TILES, 0.125)
+spatial_sdpa_kernel = make_spatial_sdpa_full_kernel(N_PATCH_PAD_TILES, D_HEAD_TILES, N_HEADS, 0.125)
 
 def make_fused_ln_adaln_kernel(dim_tiles):
     """Fused LayerNorm + adaLN modulate: out = layernorm(x) * (1 + scale) + shift.
@@ -1212,8 +1219,8 @@ def prealloc_scratch(tt_device, n_frames=2):
     # RoPE scratch (reused for spatial and temporal)
     s["q_roped"] = zeros_tt((SEQ, D_MODEL), tt_device)
     s["k_roped"] = zeros_tt((SEQ, D_MODEL), tt_device)
-    # SDPA scratch: (T * N_HEADS * N_PATCH_PAD, D_HEAD) for TT-Lang spatial SDPA
-    s["sdpa_out"] = zeros_tt((n_frames * N_HEADS * N_PATCH_PAD, D_HEAD), tt_device)
+    # SDPA scratch: (SEQ, D_MODEL) for TT-Lang spatial SDPA output
+    s["sdpa_out"] = zeros_tt((SEQ, D_MODEL), tt_device)
     # Final layer
     s["final_adaln"] = zeros_tt((TILE, 2 * D_MODEL), tt_device)
     s["final_out"] = zeros_tt((SEQ, OUT_DIM), tt_device)
@@ -1335,17 +1342,9 @@ def run_sub_block(prefix, x_tt, cond_list, dev, scr, tt_device, scaler, mean_sca
         fused_rope_kernel(q, q_swap, dev["spatial_cos"], dev["spatial_sin_perm"], scr["q_roped"])
         fused_rope_kernel(k, k_swap, dev["spatial_cos"], dev["spatial_sin_perm"], scr["k_roped"])
 
-        # Reshape for SDPA: (SEQ, D_MODEL) -> (T, N_HEADS, N_PATCH_PAD, D_HEAD)
-        q_4d = ttnn.reshape(scr["q_roped"], [T, N_PATCH_PAD, N_HEADS, D_HEAD])
-        q_4d = ttnn.permute(q_4d, [0, 2, 1, 3])
-        k_4d = ttnn.reshape(scr["k_roped"], [T, N_PATCH_PAD, N_HEADS, D_HEAD])
-        k_4d = ttnn.permute(k_4d, [0, 2, 1, 3])
-        v_4d = ttnn.reshape(v, [T, N_PATCH_PAD, N_HEADS, D_HEAD])
-        v_4d = ttnn.permute(v_4d, [0, 2, 1, 3])
-
-        attn_out = ttnn.transformer.scaled_dot_product_attention(q_4d, k_4d, v_4d, is_causal=False)
-        attn_perm = ttnn.permute(attn_out, [0, 2, 1, 3])
-        attn_2d = ttnn.reshape(attn_perm, [SEQ, D_MODEL])
+        # TT-Lang SDPA reads/writes (SEQ, D_MODEL) directly, no reshape needed
+        spatial_sdpa_kernel(scr["q_roped"], scr["k_roped"], v, scaler, scr["sdpa_out"])
+        attn_2d = scr["sdpa_out"]
         _timer.mark("sdpa")
 
     else:
