@@ -536,6 +536,115 @@ def gated_residual_kernel(residual, x, gate, out):
                 with out_dfb.wait() as blk:
                     tx = ttl.copy(blk, out[row, sc:sc + ELEM_GRAN]); tx.wait()
 
+def make_fused_ln_adaln_kernel(dim_tiles):
+    """Fused LayerNorm + adaLN modulate: out = layernorm(x) * (1 + scale) + shift.
+    Eliminates DRAM round-trip for the intermediate normed tensor."""
+    @ttl.kernel(grid="auto")
+    def fused_ln_adaln(x, scaler, mean_scale, shift, scale, out):
+        grid_cols, _ = ttl.grid_size(dims=2)
+        seq_tiles = x.shape[0] // TILE
+        tiles_per_core = -(-seq_tiles // grid_cols)
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), buffer_factor=2)
+        sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=1)
+        ms_dfb = ttl.make_dataflow_buffer_like(mean_scale, shape=(1, 1), buffer_factor=1)
+        sh_dfb = ttl.make_dataflow_buffer_like(shift, shape=(1, 1), buffer_factor=2)
+        scl_dfb = ttl.make_dataflow_buffer_like(scale, shape=(1, 1), buffer_factor=2)
+        red_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        acc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        bcast_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), buffer_factor=2)
+        sq_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), buffer_factor=2)
+        mean_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), buffer_factor=2)
+        istd_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), buffer_factor=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
+        @ttl.compute()
+        def compute():
+            core_x, _ = ttl.core(dims=2)
+            with sc_dfb.wait() as sc, ms_dfb.wait() as ms:
+                for local_t in range(tiles_per_core):
+                    tile_idx = core_x * tiles_per_core + local_t
+                    if tile_idx < seq_tiles:
+                        # Pass 1: compute mean
+                        with x_dfb.wait() as x0:
+                            with red_dfb.reserve() as r:
+                                r.store(ttl.math.reduce_sum(x0, sc, dims=[1]))
+                        with red_dfb.wait() as rv, acc_dfb.reserve() as acc:
+                            acc.store(rv)
+                        for j in range(dim_tiles - 1):
+                            with x_dfb.wait() as xj:
+                                with red_dfb.reserve() as r:
+                                    r.store(ttl.math.reduce_sum(xj, sc, dims=[1]))
+                            with red_dfb.wait() as rv, acc_dfb.wait() as av, acc_dfb.reserve() as acc:
+                                acc.store(av + rv)
+                        with acc_dfb.wait() as sum_x, bcast_dfb.reserve() as bc:
+                            bc.store(ttl.math.broadcast(sum_x, dims=[1]))
+                        with bcast_dfb.wait() as sum_x_bc, mean_dfb.reserve() as mean_out:
+                            mean_out.store(sum_x_bc * ms)
+                        # Pass 2: compute variance
+                        with mean_dfb.wait() as mean_val:
+                            with x_dfb.wait() as x0:
+                                diff = x0 - mean_val
+                                with sq_dfb.reserve() as sq:
+                                    sq.store(diff * diff)
+                            with sq_dfb.wait() as sqv, red_dfb.reserve() as r:
+                                r.store(ttl.math.reduce_sum(sqv, sc, dims=[1]))
+                            with red_dfb.wait() as rv, acc_dfb.reserve() as acc:
+                                acc.store(rv)
+                            for j in range(dim_tiles - 1):
+                                with x_dfb.wait() as xj:
+                                    diff = xj - mean_val
+                                    with sq_dfb.reserve() as sq:
+                                        sq.store(diff * diff)
+                                with sq_dfb.wait() as sqv, red_dfb.reserve() as r:
+                                    r.store(ttl.math.reduce_sum(sqv, sc, dims=[1]))
+                                with red_dfb.wait() as rv, acc_dfb.wait() as av, acc_dfb.reserve() as acc:
+                                    acc.store(av + rv)
+                            with acc_dfb.wait() as sum_sq, bcast_dfb.reserve() as bc:
+                                bc.store(ttl.math.broadcast(sum_sq, dims=[1]))
+                            with bcast_dfb.wait() as var_bc, istd_dfb.reserve() as istd:
+                                istd.store(ttl.math.rsqrt(var_bc * ms + ttl.math.fill(var_bc, 1e-6)))
+                            # Pass 3: normalize + adaLN modulate (fused)
+                            with istd_dfb.wait() as inv_std:
+                                for j in range(dim_tiles):
+                                    with x_dfb.wait() as xj, sh_dfb.wait() as shv, scl_dfb.wait() as sclv, out_dfb.reserve() as o:
+                                        normed = (xj - mean_val) * inv_std
+                                        o.store(normed * (sclv + ttl.math.fill(sclv, 1.0)) + shv)
+        @ttl.datamovement()
+        def dm_read():
+            core_x, _ = ttl.core(dims=2)
+            with sc_dfb.reserve() as blk:
+                tx = ttl.copy(scaler[0, 0], blk); tx.wait()
+            with ms_dfb.reserve() as blk:
+                tx = ttl.copy(mean_scale[0, 0], blk); tx.wait()
+            for local_t in range(tiles_per_core):
+                tile_idx = core_x * tiles_per_core + local_t
+                if tile_idx < seq_tiles:
+                    # Pass 1: mean
+                    for j in range(dim_tiles):
+                        with x_dfb.reserve() as blk:
+                            tx = ttl.copy(x[tile_idx, j], blk); tx.wait()
+                    # Pass 2: variance
+                    for j in range(dim_tiles):
+                        with x_dfb.reserve() as blk:
+                            tx = ttl.copy(x[tile_idx, j], blk); tx.wait()
+                    # Pass 3: normalize + modulate
+                    for j in range(dim_tiles):
+                        with x_dfb.reserve() as blk:
+                            tx = ttl.copy(x[tile_idx, j], blk); tx.wait()
+                        with sh_dfb.reserve() as blk:
+                            tx = ttl.copy(shift[tile_idx, j], blk); tx.wait()
+                        with scl_dfb.reserve() as blk:
+                            tx = ttl.copy(scale[tile_idx, j], blk); tx.wait()
+        @ttl.datamovement()
+        def dm_write():
+            core_x, _ = ttl.core(dims=2)
+            for local_t in range(tiles_per_core):
+                tile_idx = core_x * tiles_per_core + local_t
+                if tile_idx < seq_tiles:
+                    for j in range(dim_tiles):
+                        with out_dfb.wait() as blk:
+                            tx = ttl.copy(blk, out[tile_idx, j]); tx.wait()
+    return fused_ln_adaln
+
 def make_layernorm_kernel(dim_tiles):
     @ttl.kernel(grid="auto")
     def layernorm_kernel(x, weight, ln_bias, scaler, mean_scale, out):
@@ -644,6 +753,7 @@ linear_bias_k32 = make_linear_bias_kernel(D_TILES, n_chunk=4)
 linear_bias_k8 = make_linear_bias_kernel(FREQ_DIM // TILE, n_chunk=4)
 linear_accum_k32_4 = make_linear_accum_kernel(D_TILES, 4)  # MLP down 4096->1024
 fused_lbgr_k32 = make_fused_linear_bias_gated_res_kernel(D_TILES)  # O proj + bias + gated residual
+fused_ln_adaln_d1024 = make_fused_ln_adaln_kernel(D_TILES)  # LayerNorm + adaLN modulate
 layernorm_d1024 = make_layernorm_kernel(D_TILES)
 
 # ============================================================
@@ -1054,9 +1164,8 @@ def run_sub_block(prefix, x_tt, cond_list, dev, scr, tt_device, scaler, mean_sca
         build_per_frame_adaln(cond_list, prefix, dev, scr, tt_device)
     _timer.mark("adaln")
 
-    # Attention path: LayerNorm -> adaLN modulate -> QKV
-    layernorm_d1024(x_tt, dev["ln_w_ones"], dev["ln_b_zeros"], scaler, mean_scale, scr["normed"])
-    adaln_modulate_kernel(scr["normed"], shift_msa, scale_msa, scr["modulated"])
+    # Fused LayerNorm + adaLN modulate -> QKV
+    fused_ln_adaln_d1024(x_tt, scaler, mean_scale, shift_msa, scale_msa, scr["modulated"])
     _timer.mark("norm+mod")
     linear_k32(scr["modulated"], dev["%s.qkv_w" % prefix], scr["qkv"])
     _timer.mark("qkv")
@@ -1139,9 +1248,8 @@ def run_sub_block(prefix, x_tt, cond_list, dev, scr, tt_device, scaler, mean_sca
 
     x_tt = scr["z_b"]
 
-    # MLP path
-    layernorm_d1024(x_tt, dev["ln_w_ones"], dev["ln_b_zeros"], scaler, mean_scale, scr["normed"])
-    adaln_modulate_kernel(scr["normed"], shift_mlp, scale_mlp, scr["modulated"])
+    # Fused MLP LayerNorm + adaLN modulate
+    fused_ln_adaln_d1024(x_tt, scaler, mean_scale, shift_mlp, scale_mlp, scr["modulated"])
     _timer.mark("mlp_norm+mod")
     linear_bias_k32(scr["modulated"], dev["%s.fc1_w" % prefix], dev["%s.fc1_b" % prefix], scr["fc1"])
     gelu_approx_kernel(scr["fc1"], scr["gelu"])
