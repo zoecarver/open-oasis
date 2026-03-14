@@ -1777,25 +1777,15 @@ def run_sub_block(prefix, x_tt, cond_list, dev, scr, tt_device, scaler, mean_sca
         attn_2d = ttnn.reshape(attn_out, [SEQ, D_MODEL])
         _timer.mark("sdpa")
 
-    if attn_type == "spatial":
-        # Mega kernel B: O proj + residual + LN + modulate + FC1 + GELU + FC2 + residual
-        mega_post_attn_kernel(attn_2d, x_tt, gate_msa,
-                              dev["%s.out_w" % prefix], dev["%s.out_b" % prefix],
-                              shift_mlp, scale_mlp, gate_mlp,
-                              dev["%s.fc1_w" % prefix], dev["%s.fc1_b" % prefix],
-                              dev["%s.fc2_w" % prefix], dev["%s.fc2_b" % prefix],
-                              scaler, mean_scale,
-                              scr["z_scratch"], scr["gelu_scratch"], scr["z_a"])
-        _timer.mark("post_attn")
-    else:
-        fused_lbgr_k32(attn_2d, dev["%s.out_w" % prefix], dev["%s.out_b" % prefix],
-                        gate_msa, x_tt, scr["z_b"])
-        x_tt = scr["z_b"]
-        fused_ln_adaln_d1024(x_tt, scaler, mean_scale, shift_mlp, scale_mlp, scr["modulated"])
-        fused_lbg_k32(scr["modulated"], dev["%s.fc1_w" % prefix], dev["%s.fc1_b" % prefix], scr["gelu"])
-        scr["fc2"] = ttnn.linear(scr["gelu"], dev["%s.fc2_w" % prefix], bias=dev["%s.fc2_b_1d" % prefix])
-        gated_residual_kernel(x_tt, scr["fc2"], gate_mlp, scr["z_a"])
-        _timer.mark("post_attn")
+    # Mega kernel B: O proj + residual + LN + modulate + FC1 + GELU + FC2 + residual
+    mega_post_attn_kernel(attn_2d, x_tt, gate_msa,
+                          dev["%s.out_w" % prefix], dev["%s.out_b" % prefix],
+                          shift_mlp, scale_mlp, gate_mlp,
+                          dev["%s.fc1_w" % prefix], dev["%s.fc1_b" % prefix],
+                          dev["%s.fc2_w" % prefix], dev["%s.fc2_b" % prefix],
+                          scaler, mean_scale,
+                          scr["z_scratch"], scr["gelu_scratch"], scr["z_a"])
+    _timer.mark("post_attn")
 
     _timer.report(prefix, attn_type)
     return scr["z_a"]
