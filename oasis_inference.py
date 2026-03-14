@@ -85,6 +85,12 @@ EXT_COND_PAD = 32  # padded to tile
 OUT_DIM = PATCH_SIZE * PATCH_SIZE * IN_CHANNELS  # 64
 SCALING_FACTOR = 0.07843137255
 
+# RoPE dimensions (from model weights)
+# Spatial: 16 freqs * 2 (interleave) * 2 (H+W axes) = 64
+SPATIAL_ROPE_DIM = 64
+# Temporal: 32 freqs * 2 (interleave) = 64
+TEMPORAL_ROPE_DIM = 64
+
 D_TILES = D_MODEL // TILE  # 32
 D_MLP_TILES = D_MLP // TILE  # 128
 
@@ -560,6 +566,62 @@ def sigmoid_beta_schedule(timesteps, start=-3, end=3, tau=1, clamp_min=1e-5):
     return torch.clip(betas, 0, 0.999)
 
 # ============================================================
+# RoPE (Rotary Positional Embeddings) - applied on host
+# ============================================================
+
+def rotate_half(x):
+    """Rotary embedding helper: rearrange pairs and negate."""
+    x = rearrange(x, "... (d r) -> ... d r", r=2)
+    x1, x2 = x.unbind(dim=-1)
+    x = torch.stack((-x2, x1), dim=-1)
+    return rearrange(x, "... d r -> ... (d r)")
+
+def apply_rotary_emb(freqs, t):
+    """Apply rotary embeddings to tensor t using precomputed freqs.
+    freqs: (..., rot_dim)  t: (..., d_head)
+    Only the first rot_dim dims of t are rotated; rest pass through."""
+    rot_dim = freqs.shape[-1]
+    t_rot = t[..., :rot_dim]
+    t_pass = t[..., rot_dim:]
+    t_rot = (t_rot * freqs.cos()) + (rotate_half(t_rot) * freqs.sin())
+    return torch.cat((t_rot, t_pass), dim=-1)
+
+def precompute_spatial_rope_freqs(freqs_param):
+    """Precompute spatial axial RoPE freqs for H_GRID x W_GRID grid.
+    freqs_param: learned freqs tensor shape (half_dim,) from weights.
+    Returns: (N_PATCHES, rot_dim) float tensor.
+    rot_dim = 2 axes * 2 * half_dim = 4 * half_dim (e.g. 4*16=64 for Oasis)."""
+    from einops import repeat as einops_repeat
+    h_pos = torch.linspace(-1, 1, steps=FRAME_H)
+    w_pos = torch.linspace(-1, 1, steps=FRAME_W)
+
+    # Per-axis: outer product then interleave-repeat (f0,f0,f1,f1,...)
+    h_freqs = torch.einsum("i, f -> i f", h_pos, freqs_param)
+    h_freqs = einops_repeat(h_freqs, "... n -> ... (n r)", r=2)  # (9, 32)
+    w_freqs = torch.einsum("i, f -> i f", w_pos, freqs_param)
+    w_freqs = einops_repeat(w_freqs, "... n -> ... (n r)", r=2)  # (16, 32)
+
+    # Broadcast to (H, W, 32) each, then cat along last dim -> (H, W, 64)
+    h_broad = h_freqs[:, None, :].expand(FRAME_H, FRAME_W, -1)
+    w_broad = w_freqs[None, :, :].expand(FRAME_H, FRAME_W, -1)
+    axial_freqs = torch.cat([h_broad, w_broad], dim=-1)
+
+    return axial_freqs.reshape(N_PATCHES, -1)  # (144, 64)
+
+def precompute_temporal_rope_freqs(freqs_param, max_t=32):
+    """Precompute temporal RoPE freqs.
+    freqs_param: learned freqs tensor shape (half_dim,) from weights.
+    Returns: (max_t, rot_dim) float tensor. rot_dim = 2 * half_dim."""
+    from einops import repeat as einops_repeat
+    positions = torch.arange(max_t, dtype=torch.float32)
+    freqs = torch.einsum("i, f -> i f", positions, freqs_param)
+    return einops_repeat(freqs, "... n -> ... (n r)", r=2)  # (max_t, 64)
+
+# Global RoPE freq tables (set during weight loading)
+SPATIAL_ROPE_FREQS = None   # (144, 32) float
+TEMPORAL_ROPE_FREQS = None  # (max_t, 64) float
+
+# ============================================================
 # Weight loading
 # ============================================================
 
@@ -583,7 +645,7 @@ def find_vae_weights():
                 return path
     raise FileNotFoundError("VAE weights not found")
 
-def preload_dit_weights(tt_device):
+def preload_dit_weights(tt_device, n_frames=2):
     t0 = time.time()
     path = find_dit_weights()
     print("Loading DiT weights from:", path)
@@ -611,7 +673,7 @@ def preload_dit_weights(tt_device):
         dev["final_adaln_w"] = to_tt(st.get_tensor("final_layer.adaLN_modulation.1.weight").T.contiguous().to(torch.bfloat16), tt_device)
         dev["final_adaln_b"] = to_tt(expand_bias(st.get_tensor("final_layer.adaLN_modulation.1.bias").to(torch.bfloat16), TILE), tt_device)
         dev["final_linear_w"] = to_tt(st.get_tensor("final_layer.linear.weight").T.contiguous().to(torch.bfloat16), tt_device)
-        dev["final_linear_b"] = to_tt(expand_bias(st.get_tensor("final_layer.linear.bias").to(torch.bfloat16), N_PATCH_PAD), tt_device)
+        dev["final_linear_b"] = to_tt(expand_bias(st.get_tensor("final_layer.linear.bias").to(torch.bfloat16), N_PATCH_PAD * n_frames), tt_device)
 
         # Per-block weights
         for i in range(N_BLOCKS):
@@ -629,26 +691,34 @@ def preload_dit_weights(tt_device):
                 dev["%s.qkv_w" % p] = to_tt(qkv_w, tt_device)
 
                 # Output projection: Linear(1024, 1024) with bias
+                SEQ = N_PATCH_PAD * n_frames
                 out_w = st.get_tensor("%s_attn.to_out.weight" % p).T.contiguous().to(torch.bfloat16)
                 dev["%s.out_w" % p] = to_tt(out_w, tt_device)
                 out_b = st.get_tensor("%s_attn.to_out.bias" % p).to(torch.bfloat16)
-                dev["%s.out_b" % p] = to_tt(expand_bias(out_b, N_PATCH_PAD), tt_device)
+                dev["%s.out_b" % p] = to_tt(expand_bias(out_b, SEQ), tt_device)
 
                 # MLP: fc1 Linear(1024, 4096) + fc2 Linear(4096, 1024)
                 fc1_w = st.get_tensor("%s_mlp.fc1.weight" % p).T.contiguous().to(torch.bfloat16)
                 dev["%s.fc1_w" % p] = to_tt(fc1_w, tt_device)
                 fc1_b = st.get_tensor("%s_mlp.fc1.bias" % p).to(torch.bfloat16)
-                dev["%s.fc1_b" % p] = to_tt(expand_bias(fc1_b, N_PATCH_PAD), tt_device)
+                dev["%s.fc1_b" % p] = to_tt(expand_bias(fc1_b, SEQ), tt_device)
                 fc2_w = st.get_tensor("%s_mlp.fc2.weight" % p).T.contiguous().to(torch.bfloat16)
                 dev["%s.fc2_w" % p] = to_tt(fc2_w, tt_device)
                 fc2_b = st.get_tensor("%s_mlp.fc2.bias" % p).to(torch.bfloat16)
-                dev["%s.fc2_b" % p] = to_tt(expand_bias(fc2_b, N_PATCH_PAD), tt_device)
+                dev["%s.fc2_b" % p] = to_tt(expand_bias(fc2_b, SEQ), tt_device)
 
-        # LayerNorm weights: final_layer uses elementwise_affine=False, so no LN weights
-        # Block LayerNorms also use elementwise_affine=False (eps=1e-6)
-        # So norm weight = 1, norm bias = 0 (expanded to seq dim)
-        dev["ln_w_ones"] = to_tt(torch.ones(N_PATCH_PAD, D_MODEL, dtype=torch.bfloat16), tt_device)
-        dev["ln_b_zeros"] = to_tt(torch.zeros(N_PATCH_PAD, D_MODEL, dtype=torch.bfloat16), tt_device)
+        SEQ = N_PATCH_PAD * n_frames
+        dev["ln_w_ones"] = to_tt(torch.ones(SEQ, D_MODEL, dtype=torch.bfloat16), tt_device)
+        dev["ln_b_zeros"] = to_tt(torch.zeros(SEQ, D_MODEL, dtype=torch.bfloat16), tt_device)
+
+        # RoPE: load learned freqs from block 0 (shared across all blocks)
+        global SPATIAL_ROPE_FREQS, TEMPORAL_ROPE_FREQS
+        s_freqs = st.get_tensor("blocks.0.s_attn.rotary_emb.freqs").float()  # (16,)
+        t_freqs = st.get_tensor("blocks.0.t_attn.rotary_emb.freqs").float()  # (32,)
+        SPATIAL_ROPE_FREQS = precompute_spatial_rope_freqs(s_freqs)  # (144, 32)
+        TEMPORAL_ROPE_FREQS = precompute_temporal_rope_freqs(t_freqs)  # (max_t, 64)
+        print("Precomputed RoPE freqs: spatial %s, temporal %s" % (
+            tuple(SPATIAL_ROPE_FREQS.shape), tuple(TEMPORAL_ROPE_FREQS.shape)))
 
     elapsed = time.time() - t0
     print("Preloaded %d tensors in %.1fs" % (len(dev), elapsed))
@@ -658,29 +728,32 @@ def preload_dit_weights(tt_device):
 # Scratch buffers
 # ============================================================
 
-def prealloc_scratch(tt_device):
+def prealloc_scratch(tt_device, n_frames=2):
+    """Pre-allocate scratch buffers. n_frames=2 for prompt+generated frame."""
     t0 = time.time()
     s = {}
-    s["z_a"] = zeros_tt((N_PATCH_PAD, D_MODEL), tt_device)
-    s["z_b"] = zeros_tt((N_PATCH_PAD, D_MODEL), tt_device)
-    s["normed"] = zeros_tt((N_PATCH_PAD, D_MODEL), tt_device)
-    s["modulated"] = zeros_tt((N_PATCH_PAD, D_MODEL), tt_device)
-    s["qkv"] = zeros_tt((N_PATCH_PAD, 3 * D_MODEL), tt_device)
-    s["o_proj"] = zeros_tt((N_PATCH_PAD, D_MODEL), tt_device)
-    s["fc1"] = zeros_tt((N_PATCH_PAD, D_MLP), tt_device)
-    s["gelu"] = zeros_tt((N_PATCH_PAD, D_MLP), tt_device)
-    s["fc2"] = zeros_tt((N_PATCH_PAD, D_MODEL), tt_device)
-    # Conditioning scratch
+    SEQ = N_PATCH_PAD * n_frames  # 320 for T=2
+    s["z_a"] = zeros_tt((SEQ, D_MODEL), tt_device)
+    s["z_b"] = zeros_tt((SEQ, D_MODEL), tt_device)
+    s["normed"] = zeros_tt((SEQ, D_MODEL), tt_device)
+    s["modulated"] = zeros_tt((SEQ, D_MODEL), tt_device)
+    s["qkv"] = zeros_tt((SEQ, 3 * D_MODEL), tt_device)
+    s["o_proj"] = zeros_tt((SEQ, D_MODEL), tt_device)
+    s["fc1"] = zeros_tt((SEQ, D_MLP), tt_device)
+    s["gelu"] = zeros_tt((SEQ, D_MLP), tt_device)
+    s["fc2"] = zeros_tt((SEQ, D_MODEL), tt_device)
+    # Conditioning scratch (per-frame, so TILE * n_frames)
     s["t_emb_a"] = zeros_tt((TILE, D_MODEL), tt_device)
     s["t_emb_b"] = zeros_tt((TILE, D_MODEL), tt_device)
     s["cond"] = zeros_tt((TILE, D_MODEL), tt_device)
-    # adaLN scratch: (TILE, 6*D_MODEL) = (32, 6144)
+    # adaLN scratch
     s["adaln_out"] = zeros_tt((TILE, 6 * D_MODEL), tt_device)
     # Final layer
     s["final_adaln"] = zeros_tt((TILE, 2 * D_MODEL), tt_device)
-    s["final_out"] = zeros_tt((N_PATCH_PAD, OUT_DIM), tt_device)
+    s["final_out"] = zeros_tt((SEQ, OUT_DIM), tt_device)
+    s["n_frames"] = n_frames
     elapsed = time.time() - t0
-    print("Pre-allocated %d scratch tensors in %.1fs" % (len(s), elapsed))
+    print("Pre-allocated %d scratch tensors (T=%d) in %.1fs" % (len(s) - 1, n_frames, elapsed))
     return s
 
 # ============================================================
@@ -702,60 +775,146 @@ def unpatchify_host(x, patch_size, out_channels, h, w):
     x = torch.einsum("nhwpqc->nchpwq", x)
     return x.reshape(1, out_channels, h * patch_size, w * patch_size)
 
-def run_sub_block(prefix, x_tt, cond_tt, dev, scr, tt_device, scaler, mean_scale):
-    """Run one spatial or temporal sub-block (norm -> modulate -> attn -> gated_res -> norm -> modulate -> MLP -> gated_res).
-    prefix: e.g. "blocks.0.s" or "blocks.0.t"
-    x_tt: (N_PATCH_PAD, D_MODEL) device tensor
-    cond_tt: (TILE, D_MODEL) conditioning device tensor
+def build_per_frame_adaln(cond_list, prefix, dev, scr, tt_device):
+    """Compute adaLN params for each frame, return (SEQ, D_MODEL) tensors.
+    cond_list: list of T conditioning device tensors, each (TILE, D_MODEL).
+    Returns: shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
     """
-    # Step 1: Compute adaLN params: adaLN_modulation = Sequential(SiLU, Linear(1024, 6144))
-    # cond_tt is the raw conditioning (already computed), apply SiLU then linear
-    silu_kernel(cond_tt, scr["t_emb_a"])
-    linear_bias_k32(scr["t_emb_a"], dev["%s.adaln_w" % prefix], dev["%s.adaln_b" % prefix], scr["adaln_out"])
+    T = len(cond_list)
+    SEQ = N_PATCH_PAD * T
+    all_chunks = []
+    for cond_tt in cond_list:
+        silu_kernel(cond_tt, scr["t_emb_a"])
+        linear_bias_k32(scr["t_emb_a"], dev["%s.adaln_w" % prefix], dev["%s.adaln_b" % prefix], scr["adaln_out"])
+        adaln_host = ttnn.to_torch(scr["adaln_out"])[0, :6 * D_MODEL].float()
+        all_chunks.append(adaln_host.reshape(6, D_MODEL))
 
-    # Read adaLN params back to host for chunking and broadcasting
-    adaln_host = ttnn.to_torch(scr["adaln_out"])[0, :6 * D_MODEL].float()  # row 0
-    chunks = adaln_host.reshape(6, D_MODEL)
+    results = []
+    for param_idx in range(6):
+        # Build (SEQ, D_MODEL) with per-frame values
+        param_2d = torch.zeros(SEQ, D_MODEL, dtype=torch.bfloat16)
+        for t_idx in range(T):
+            start = t_idx * N_PATCH_PAD
+            param_2d[start:start + N_PATCH_PAD] = expand_bias(
+                all_chunks[t_idx][param_idx].to(torch.bfloat16), N_PATCH_PAD)
+        results.append(to_tt(param_2d, tt_device))
+    return results  # [shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp]
 
-    # Broadcast each chunk to (N_PATCH_PAD, D_MODEL) and send to device
-    shift_msa = to_tt(expand_bias(chunks[0].to(torch.bfloat16), N_PATCH_PAD), tt_device)
-    scale_msa = to_tt(expand_bias(chunks[1].to(torch.bfloat16), N_PATCH_PAD), tt_device)
-    gate_msa = to_tt(expand_bias(chunks[2].to(torch.bfloat16), N_PATCH_PAD), tt_device)
-    shift_mlp = to_tt(expand_bias(chunks[3].to(torch.bfloat16), N_PATCH_PAD), tt_device)
-    scale_mlp = to_tt(expand_bias(chunks[4].to(torch.bfloat16), N_PATCH_PAD), tt_device)
-    gate_mlp = to_tt(expand_bias(chunks[5].to(torch.bfloat16), N_PATCH_PAD), tt_device)
+def run_sub_block(prefix, x_tt, cond_list, dev, scr, tt_device, scaler, mean_scale, attn_type="spatial"):
+    """Run one spatial or temporal sub-block.
+    prefix: e.g. "blocks.0.s" or "blocks.0.t"
+    cond_list: list of T conditioning device tensors, each (TILE, D_MODEL)
+    attn_type: "spatial" or "temporal"
+    x_tt: (N_PATCH_PAD * T, D_MODEL) device tensor
+    """
+    T = len(cond_list)
+    SEQ = N_PATCH_PAD * T
 
-    # Attention path
+    # Compute per-frame adaLN params
+    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
+        build_per_frame_adaln(cond_list, prefix, dev, scr, tt_device)
+
+    # Attention path: LayerNorm -> adaLN modulate -> QKV
     layernorm_d1024(x_tt, dev["ln_w_ones"], dev["ln_b_zeros"], scaler, mean_scale, scr["normed"])
     adaln_modulate_kernel(scr["normed"], shift_msa, scale_msa, scr["modulated"])
     linear_k32(scr["modulated"], dev["%s.qkv_w" % prefix], scr["qkv"])
 
-    # SDPA on host via ttnn (reshape Q/K/V)
-    qkv_host = ttnn.to_torch(scr["qkv"])[:N_PATCHES].to(torch.bfloat16)
-    q, k, v = qkv_host.float().chunk(3, dim=-1)
-    q = q.view(N_PATCHES, N_HEADS, D_HEAD).permute(1, 0, 2).unsqueeze(0).to(torch.bfloat16)
-    k = k.view(N_PATCHES, N_HEADS, D_HEAD).permute(1, 0, 2).unsqueeze(0).to(torch.bfloat16)
-    v = v.view(N_PATCHES, N_HEADS, D_HEAD).permute(1, 0, 2).unsqueeze(0).to(torch.bfloat16)
+    # Read QKV to host for reshaping + RoPE + SDPA
+    qkv_host_full = ttnn.to_torch(scr["qkv"])  # (SEQ, 3*D_MODEL)
 
-    # Pad to tile alignment
-    q = F.pad(q, [0, 0, 0, N_PATCH_PAD - N_PATCHES])
-    k = F.pad(k, [0, 0, 0, N_PATCH_PAD - N_PATCHES])
-    v = F.pad(v, [0, 0, 0, N_PATCH_PAD - N_PATCHES])
+    if attn_type == "spatial":
+        # Spatial: each frame independently, (B*T, heads, H*W, d_head)
+        # Process T frames as batch dimension
+        q_all, k_all, v_all = [], [], []
+        for t_idx in range(T):
+            start = t_idx * N_PATCH_PAD
+            qkv_frame = qkv_host_full[start:start + N_PATCHES].to(torch.bfloat16).float()
+            q, k, v = qkv_frame.chunk(3, dim=-1)
 
-    q_tt = to_tt(q, tt_device)
-    k_tt = to_tt(k, tt_device)
-    v_tt = to_tt(v, tt_device)
+            # Apply spatial RoPE
+            q_mh = q.view(N_PATCHES, N_HEADS, D_HEAD)
+            k_mh = k.view(N_PATCHES, N_HEADS, D_HEAD)
+            freqs = SPATIAL_ROPE_FREQS.unsqueeze(1)  # (144, 1, 64)
+            q_mh = apply_rotary_emb(freqs, q_mh)
+            k_mh = apply_rotary_emb(freqs, k_mh)
 
-    attn_out = ttnn.transformer.scaled_dot_product_attention(q_tt, k_tt, v_tt, is_causal=False)
-    attn_perm = ttnn.permute(attn_out, [0, 2, 1, 3])
-    attn_2d = ttnn.reshape(attn_perm, [N_PATCH_PAD, N_HEADS * D_HEAD])
+            # Reshape to (1, heads, N_PATCHES, d_head), pad
+            q_4d = q_mh.permute(1, 0, 2).unsqueeze(0).to(torch.bfloat16)
+            k_4d = k_mh.permute(1, 0, 2).unsqueeze(0).to(torch.bfloat16)
+            v_4d = v.view(N_PATCHES, N_HEADS, D_HEAD).permute(1, 0, 2).unsqueeze(0).to(torch.bfloat16)
+            q_4d = F.pad(q_4d, [0, 0, 0, N_PATCH_PAD - N_PATCHES])
+            k_4d = F.pad(k_4d, [0, 0, 0, N_PATCH_PAD - N_PATCHES])
+            v_4d = F.pad(v_4d, [0, 0, 0, N_PATCH_PAD - N_PATCHES])
+            q_all.append(q_4d)
+            k_all.append(k_4d)
+            v_all.append(v_4d)
+
+        # Batch all frames: (T, heads, N_PATCH_PAD, d_head)
+        q_batch = torch.cat(q_all, dim=0)
+        k_batch = torch.cat(k_all, dim=0)
+        v_batch = torch.cat(v_all, dim=0)
+
+        q_tt = to_tt(q_batch, tt_device)
+        k_tt = to_tt(k_batch, tt_device)
+        v_tt = to_tt(v_batch, tt_device)
+
+        attn_out = ttnn.transformer.scaled_dot_product_attention(q_tt, k_tt, v_tt, is_causal=False)
+        attn_perm = ttnn.permute(attn_out, [0, 2, 1, 3])  # (T, N_PATCH_PAD, heads, d_head)
+        attn_2d = ttnn.reshape(attn_perm, [SEQ, D_MODEL])
+
+    else:
+        # Temporal: (B*H*W, heads, T, d_head) with causal attention
+        # Gather per-frame patches, reshape for temporal
+        frames_qkv = []
+        for t_idx in range(T):
+            start = t_idx * N_PATCH_PAD
+            qkv_frame = qkv_host_full[start:start + N_PATCHES].to(torch.bfloat16).float()
+            frames_qkv.append(qkv_frame)
+
+        # Stack: (N_PATCHES, T, D_MODEL*3) then split Q/K/V
+        stacked = torch.stack(frames_qkv, dim=1)  # (N_PATCHES, T, 3*D_MODEL)
+        q, k, v = stacked.chunk(3, dim=-1)  # each (N_PATCHES, T, D_MODEL)
+
+        # Reshape to multi-head: (N_PATCHES, T, N_HEADS, D_HEAD)
+        q_mh = q.view(N_PATCHES, T, N_HEADS, D_HEAD)
+        k_mh = k.view(N_PATCHES, T, N_HEADS, D_HEAD)
+        v_mh = v.view(N_PATCHES, T, N_HEADS, D_HEAD)
+
+        # Apply temporal RoPE: freqs are per-timestep
+        t_freqs = TEMPORAL_ROPE_FREQS[:T].unsqueeze(1)  # (T, 1, 64) broadcast over heads
+        q_mh = apply_rotary_emb(t_freqs.unsqueeze(0), q_mh)  # broadcast over N_PATCHES
+        k_mh = apply_rotary_emb(t_freqs.unsqueeze(0), k_mh)
+
+        # Reshape to SDPA format: (N_PATCHES, heads, T, d_head)
+        q_sdpa = q_mh.permute(0, 2, 1, 3).to(torch.bfloat16)
+        k_sdpa = k_mh.permute(0, 2, 1, 3).to(torch.bfloat16)
+        v_sdpa = v_mh.permute(0, 2, 1, 3).to(torch.bfloat16)
+
+        # Pad N_PATCHES -> N_PATCH_PAD in batch dim for tile alignment
+        q_sdpa = F.pad(q_sdpa, [0, 0, 0, 0, 0, 0, 0, N_PATCH_PAD - N_PATCHES])
+        k_sdpa = F.pad(k_sdpa, [0, 0, 0, 0, 0, 0, 0, N_PATCH_PAD - N_PATCHES])
+        v_sdpa = F.pad(v_sdpa, [0, 0, 0, 0, 0, 0, 0, N_PATCH_PAD - N_PATCHES])
+
+        # T=2 is not tile-aligned (needs 32). For small T, do SDPA on host CPU
+        attn_host = F.scaled_dot_product_attention(
+            q_sdpa.float(), k_sdpa.float(), v_sdpa.float(), is_causal=True
+        )  # (N_PATCH_PAD, heads, T, d_head)
+
+        # Reshape back to (SEQ, D_MODEL): permute to (N_PATCH_PAD, T, heads, d_head)
+        attn_host = attn_host.permute(0, 2, 1, 3)  # (N_PATCH_PAD, T, heads, d_head)
+        attn_host = attn_host.reshape(N_PATCH_PAD, T, D_MODEL)
+        # Interleave frames: frame0 rows then frame1 rows
+        attn_2d_host = torch.zeros(SEQ, D_MODEL, dtype=torch.bfloat16)
+        for t_idx in range(T):
+            attn_2d_host[t_idx * N_PATCH_PAD:(t_idx + 1) * N_PATCH_PAD] = \
+                attn_host[:, t_idx].to(torch.bfloat16)
+        attn_2d = to_tt(attn_2d_host, tt_device)
 
     # O projection + bias + gated residual
     linear_k32(attn_2d, dev["%s.out_w" % prefix], scr["o_proj"])
     o_with_bias = ttnn.add(scr["o_proj"], dev["%s.out_b" % prefix])
     gated_residual_kernel(x_tt, o_with_bias, gate_msa, scr["z_b"])
 
-    # Swap z_a and z_b (z_b becomes new x)
     x_tt = scr["z_b"]
 
     # MLP path
@@ -769,87 +928,103 @@ def run_sub_block(prefix, x_tt, cond_tt, dev, scr, tt_device, scaler, mean_scale
 
     return scr["z_a"]
 
-def dit_forward(x_latent, timesteps, actions, dev, scr, tt_device, scaler, mean_scale):
-    """Full DiT forward pass.
-    x_latent: (B, T, C, H, W) = (1, 1, 16, 18, 32)
-    timesteps: (B, T) = (1, 1) long tensor
-    actions: (B, T, 25) float tensor
-    Returns: (B, T, C, H, W) velocity prediction
+def compute_cond_for_frame(t_scalar, action_vec, dev, scr, tt_device):
+    """Compute conditioning vector for a single frame.
+    t_scalar: integer timestep
+    action_vec: (25,) action tensor or None
+    Returns: (TILE, D_MODEL) device tensor
     """
-    B, T = 1, 1
-
-    # Patch embedding on host - ensure 4D input (1, C, H, W)
-    x_for_conv = x_latent.reshape(-1, IN_CHANNELS, INPUT_H, INPUT_W)[:1]  # (1, 16, 18, 32)
-    x_2d_host = patch_embed_host(
-        x_for_conv,
-        dev["x_emb_conv_w"], dev["x_emb_conv_b"]
-    )  # (144, 1024)
-
-    # Pad to tile alignment
-    x_pad = torch.zeros(N_PATCH_PAD, D_MODEL, dtype=torch.bfloat16)
-    x_pad[:N_PATCHES] = x_2d_host
-    z_cur = to_tt(x_pad, tt_device)
-
-    # Timestep conditioning
-    t_freq = timestep_embedding(timesteps.flatten(), FREQ_DIM)  # (1, 256)
+    t_freq = timestep_embedding(torch.tensor([t_scalar]), FREQ_DIM)  # (1, 256)
     t_freq_pad = torch.zeros(TILE, FREQ_DIM, dtype=torch.bfloat16)
     t_freq_pad[0] = t_freq[0].to(torch.bfloat16)
     t_freq_tt = to_tt(t_freq_pad, tt_device)
 
-    # t_embedder: Linear(256, 1024) -> SiLU -> Linear(1024, 1024)
     linear_bias_k8(t_freq_tt, dev["t_emb_w0"], dev["t_emb_b0"], scr["t_emb_a"])
     silu_kernel(scr["t_emb_a"], scr["t_emb_b"])
-    linear_bias_k32(scr["t_emb_b"], dev["t_emb_w2"], dev["t_emb_b2"], scr["cond"])
+    cond_out = zeros_tt((TILE, D_MODEL), tt_device)
+    linear_bias_k32(scr["t_emb_b"], dev["t_emb_w2"], dev["t_emb_b2"], cond_out)
 
-    # External conditioning: Linear(25, 1024) + add to cond
-    # ext_cond_w is (32, 1024), K=1 tile, so use linear_k1
-    if actions is not None:
-        act = actions[0, 0]  # (25,)
+    if action_vec is not None:
         act_pad = torch.zeros(TILE, EXT_COND_PAD, dtype=torch.bfloat16)
-        act_pad[0, :EXT_COND_DIM] = act.to(torch.bfloat16)
+        act_pad[0, :EXT_COND_DIM] = action_vec.to(torch.bfloat16)
         act_tt = to_tt(act_pad, tt_device)
         ext_out = zeros_tt((TILE, D_MODEL), tt_device)
         linear_k1(act_tt, dev["ext_cond_w"], ext_out)
         ext_out = ttnn.add(ext_out, dev["ext_cond_b"])
-        scr["cond"] = ttnn.add(scr["cond"], ext_out)
+        cond_out = ttnn.add(cond_out, ext_out)
+
+    return cond_out
+
+def dit_forward(x_latent, timesteps, actions, dev, scr, tt_device, scaler, mean_scale):
+    """Full DiT forward pass.
+    x_latent: (B, T, C, H, W) = (1, T, 16, 18, 32)
+    timesteps: (B, T) = (1, T) long tensor
+    actions: (B, T, 25) float tensor
+    Returns: (B, T, C, H, W) velocity prediction
+    """
+    B = 1
+    T = x_latent.shape[1]
+    SEQ = N_PATCH_PAD * T
+
+    # Patch embedding on host for each frame
+    x_pad = torch.zeros(SEQ, D_MODEL, dtype=torch.bfloat16)
+    for t_idx in range(T):
+        x_frame = x_latent[0, t_idx].unsqueeze(0)  # (1, C, H, W)
+        x_2d = patch_embed_host(x_frame, dev["x_emb_conv_w"], dev["x_emb_conv_b"])
+        start = t_idx * N_PATCH_PAD
+        x_pad[start:start + N_PATCHES] = x_2d
+    z_cur = to_tt(x_pad, tt_device)
+
+    # Per-frame conditioning
+    cond_list = []
+    for t_idx in range(T):
+        t_val = timesteps[0, t_idx].item()
+        act = actions[0, t_idx] if actions is not None else None
+        cond_list.append(compute_cond_for_frame(t_val, act, dev, scr, tt_device))
 
     # 16 blocks: each has spatial + temporal sub-block
     for block_idx in range(N_BLOCKS):
-        # Spatial sub-block
         z_cur = run_sub_block(
-            "blocks.%d.s" % block_idx, z_cur, scr["cond"],
-            dev, scr, tt_device, scaler, mean_scale
+            "blocks.%d.s" % block_idx, z_cur, cond_list,
+            dev, scr, tt_device, scaler, mean_scale, attn_type="spatial"
         )
-        # Temporal sub-block (at T=1, attention is trivial but MLP still applies)
         z_cur = run_sub_block(
-            "blocks.%d.t" % block_idx, z_cur, scr["cond"],
-            dev, scr, tt_device, scaler, mean_scale
+            "blocks.%d.t" % block_idx, z_cur, cond_list,
+            dev, scr, tt_device, scaler, mean_scale, attn_type="temporal"
         )
         print("  Block %d done" % block_idx)
 
-    # Final layer: SiLU(cond) -> Linear(1024, 2048) -> chunk(shift, scale)
-    silu_kernel(scr["cond"], scr["t_emb_a"])
-    linear_bias_k32(scr["t_emb_a"], dev["final_adaln_w"], dev["final_adaln_b"], scr["final_adaln"])
+    # Final layer: per-frame adaLN
+    final_shift_all = torch.zeros(SEQ, D_MODEL, dtype=torch.bfloat16)
+    final_scale_all = torch.zeros(SEQ, D_MODEL, dtype=torch.bfloat16)
+    for t_idx in range(T):
+        cond_tt = cond_list[t_idx]
+        silu_kernel(cond_tt, scr["t_emb_a"])
+        linear_bias_k32(scr["t_emb_a"], dev["final_adaln_w"], dev["final_adaln_b"], scr["final_adaln"])
+        mod_host = ttnn.to_torch(scr["final_adaln"])[0, :2 * D_MODEL].float()
+        start = t_idx * N_PATCH_PAD
+        final_shift_all[start:start + N_PATCH_PAD] = expand_bias(
+            mod_host[:D_MODEL].to(torch.bfloat16), N_PATCH_PAD)
+        final_scale_all[start:start + N_PATCH_PAD] = expand_bias(
+            mod_host[D_MODEL:].to(torch.bfloat16), N_PATCH_PAD)
 
-    final_mod_host = ttnn.to_torch(scr["final_adaln"])[0, :2 * D_MODEL].float()
-    shift_f = expand_bias(final_mod_host[:D_MODEL].to(torch.bfloat16), N_PATCH_PAD)
-    scale_f = expand_bias(final_mod_host[D_MODEL:].to(torch.bfloat16), N_PATCH_PAD)
-    shift_tt = to_tt(shift_f, tt_device)
-    scale_tt = to_tt(scale_f, tt_device)
+    shift_tt = to_tt(final_shift_all, tt_device)
+    scale_tt = to_tt(final_scale_all, tt_device)
 
-    # LayerNorm + adaLN modulate
     layernorm_d1024(z_cur, dev["ln_w_ones"], dev["ln_b_zeros"], scaler, mean_scale, scr["normed"])
     adaln_modulate_kernel(scr["normed"], shift_tt, scale_tt, scr["modulated"])
-
-    # Final linear: (N_PATCH_PAD, 1024) @ (1024, 64) = (N_PATCH_PAD, 64)
-    # OUT_DIM=64=2 tiles, use linear_k32 (no bias) + ttnn.add since n_chunk must divide n_tiles
     linear_k32(scr["modulated"], dev["final_linear_w"], scr["final_out"])
     scr["final_out"] = ttnn.add(scr["final_out"], dev["final_linear_b"])
 
-    # Read back and unpatchify on host
-    out_host = ttnn.to_torch(scr["final_out"])[:N_PATCHES].float()
-    out_img = unpatchify_host(out_host, PATCH_SIZE, IN_CHANNELS, FRAME_H, FRAME_W)
-    return out_img.unsqueeze(1)  # (1, 1, 16, 18, 32)
+    # Read back all frames and unpatchify
+    out_host_full = ttnn.to_torch(scr["final_out"])
+    out_frames = []
+    for t_idx in range(T):
+        start = t_idx * N_PATCH_PAD
+        out_host = out_host_full[start:start + N_PATCHES].float()
+        out_img = unpatchify_host(out_host, PATCH_SIZE, IN_CHANNELS, FRAME_H, FRAME_W)
+        out_frames.append(out_img)
+    return torch.stack(out_frames, dim=1)  # (1, T, C, H, W)
 
 # ============================================================
 # VAE (CPU only)
@@ -897,9 +1072,30 @@ if __name__ == "__main__":
     scaler = to_tt_l1(torch.ones(TILE, TILE, dtype=torch.bfloat16), tt_device)
     mean_scale = to_tt_l1(torch.full((TILE, TILE), 1.0 / D_MODEL, dtype=torch.bfloat16), tt_device)
 
-    # Load weights
-    dev = preload_dit_weights(tt_device)
-    scr = prealloc_scratch(tt_device)
+    N_FRAMES = 2  # prompt + generated
+
+    # Load VAE first (needed for encoding prompt)
+    print("\nLoading VAE...")
+    vae = load_vae_cpu()
+
+    # Encode prompt image
+    prompt_path = "/tmp/sample_image_0.png"
+    print("Encoding prompt image:", prompt_path)
+    from PIL import Image
+    prompt_img = Image.open(prompt_path).convert("RGB").resize((640, 360))
+    prompt_tensor = torch.tensor(list(prompt_img.getdata()), dtype=torch.float32)
+    prompt_tensor = prompt_tensor.reshape(1, 360, 640, 3).permute(0, 3, 1, 2) / 255.0  # (1, 3, 360, 640)
+    with torch.no_grad():
+        prompt_latent = vae.encode(prompt_tensor * 2 - 1).mean * SCALING_FACTOR
+    # prompt_latent: (1, H*W, C) -> reshape to (1, 1, C, H, W)
+    prompt_latent = rearrange(prompt_latent, "b (h w) c -> b 1 c h w",
+                              h=INPUT_H, w=INPUT_W)
+    print("Prompt latent shape:", prompt_latent.shape,
+          "range: [%.2f, %.2f]" % (prompt_latent.min().item(), prompt_latent.max().item()))
+
+    # Load weights and scratch (sized for T=2)
+    dev = preload_dit_weights(tt_device, n_frames=N_FRAMES)
+    scr = prealloc_scratch(tt_device, n_frames=N_FRAMES)
 
     # Diffusion schedule
     max_noise_level = 1000
@@ -913,34 +1109,39 @@ if __name__ == "__main__":
     alphas_cumprod = torch.cumprod(alphas, dim=0)
     alphas_cumprod = rearrange(alphas_cumprod, "T -> T 1 1 1")
 
-    # For initial test: random latent as prompt (skip VAE encode)
-    print("\nGenerating with random latent prompt...")
-    x = torch.randn(1, 1, IN_CHANNELS, INPUT_H, INPUT_W)
-    x = torch.clamp(x, -noise_abs_max, noise_abs_max)
-
-    # Single frame: generate frame index 1 (denoise from noise)
+    # x = [prompt_latent, noisy_chunk] with T=2
     chunk = torch.randn(1, 1, IN_CHANNELS, INPUT_H, INPUT_W)
     chunk = torch.clamp(chunk, -noise_abs_max, noise_abs_max)
-    actions = torch.zeros(1, 1, EXT_COND_DIM)  # no-op action
 
-    print("\nRunning DDIM denoising (%d steps)..." % ddim_steps)
+    # Actions: no-op for both frames
+    actions = torch.zeros(1, N_FRAMES, EXT_COND_DIM)
+
+    print("\nRunning DDIM denoising (%d steps, T=%d)..." % (ddim_steps, N_FRAMES))
     t_total = time.time()
 
     for noise_idx in reversed(range(1, ddim_steps + 1)):
         t_step = time.time()
-        t_val = torch.full((1, 1), noise_range[noise_idx], dtype=torch.long)
 
-        print("Step %d/%d (noise_level=%d)..." % (ddim_steps - noise_idx + 1, ddim_steps, t_val.item()))
+        # Timesteps: [stabilization_level for prompt, noise_level for generated]
+        noise_level = int(noise_range[noise_idx].item())
+        timesteps = torch.tensor([[stabilization_level - 1, noise_level]], dtype=torch.long)
 
-        v = dit_forward(chunk, t_val, actions, dev, scr, tt_device, scaler, mean_scale)
+        print("Step %d/%d (noise_level=%d)..." % (ddim_steps - noise_idx + 1, ddim_steps, noise_level))
 
-        # DDIM update
-        t_next_val = torch.full((1, 1), noise_range[noise_idx - 1], dtype=torch.long)
-        t_next_val = torch.where(t_next_val < 0, t_val, t_next_val)
+        # Concatenate prompt + noisy chunk: (1, 2, C, H, W)
+        x_input = torch.cat([prompt_latent, chunk], dim=1)
+        v_all = dit_forward(x_input, timesteps, actions, dev, scr, tt_device, scaler, mean_scale)
 
-        # alphas_cumprod[t_val] gives (1, 1, 1, 1, 1) which broadcasts with (1, 1, 16, 18, 32)
-        alpha_t = alphas_cumprod[t_val]
-        alpha_next = alphas_cumprod[t_next_val]
+        # Only use the velocity for the generated frame (index 1)
+        v = v_all[:, -1:]  # (1, 1, C, H, W)
+
+        # DDIM update on generated frame only
+        t_next_noise = int(noise_range[noise_idx - 1].item())
+        t_val_long = torch.full((1, 1), noise_level, dtype=torch.long)
+        t_next_long = torch.full((1, 1), max(t_next_noise, noise_level if t_next_noise < 0 else 0), dtype=torch.long)
+
+        alpha_t = alphas_cumprod[t_val_long]
+        alpha_next = alphas_cumprod[t_next_long]
         if noise_idx == 1:
             alpha_next = torch.ones_like(alpha_next)
 
@@ -948,31 +1149,15 @@ if __name__ == "__main__":
         x_noise = ((1 / alpha_t).sqrt() * chunk - x_start) / (1 / alpha_t - 1).sqrt()
         chunk = alpha_next.sqrt() * x_start + x_noise * (1 - alpha_next).sqrt()
 
-        print("  Step time: %.1fs, output range: [%.2f, %.2f]" % (
+        print("  Step time: %.1fs, v range: [%.2f, %.2f]" % (
             time.time() - t_step, v.min().item(), v.max().item()))
 
     total_time = time.time() - t_total
     print("\nDDIM complete in %.1fs" % total_time)
     print("Final latent range: [%.2f, %.2f]" % (chunk.min().item(), chunk.max().item()))
 
-    # Save raw latent
-    print("\nSaving output latent to /tmp/oasis_output_latent.pt")
-    torch.save(chunk, "/tmp/oasis_output_latent.pt")
-
-    # Latent preview (3 of 16 channels)
-    from PIL import Image
-    latent_vis = chunk[0, 0, :3]
-    latent_vis = (latent_vis - latent_vis.min()) / (latent_vis.max() - latent_vis.min() + 1e-8)
-    latent_vis = (latent_vis * 255).byte()
-    latent_vis = F.interpolate(latent_vis.unsqueeze(0).float(), size=(180, 320), mode="nearest").byte()
-    img = Image.fromarray(latent_vis[0].permute(1, 2, 0).numpy())
-    img.save("/tmp/oasis_latent_preview.png")
-    print("Saved latent preview to /tmp/oasis_latent_preview.png")
-
-    # VAE decode
-    print("\nLoading VAE for decode...")
-    vae = load_vae_cpu()
-    print("Running VAE decode...")
+    # VAE decode the generated frame
+    print("\nRunning VAE decode...")
     t_vae = time.time()
     frames = vae_decode_cpu(chunk, vae)  # (1, 1, 360, 640, 3) in [0, 1]
     print("VAE decode: %.1fs" % (time.time() - t_vae))
