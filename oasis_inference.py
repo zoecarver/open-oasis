@@ -254,6 +254,61 @@ def make_fused_linear_bias_gated_res_kernel(k_chunk):
                         tx = ttl.copy(blk, out[row, col]); tx.wait()
     return fused_lbgr_kernel
 
+def make_fused_linear_bias_gelu_kernel(k_chunk, n_chunk=1):
+    """Fused: out = gelu_approx(x @ w + bias). Saves DRAM round-trip between FC1 and GELU."""
+    @ttl.kernel(grid="auto")
+    def fused_lbg_kernel(x, w, bias, out):
+        grid_cols, _ = ttl.grid_size(dims=2)
+        m_tiles = x.shape[0] // TILE
+        n_blocks = w.shape[1] // TILE // n_chunk
+        total_out = m_tiles * n_blocks
+        tiles_per_core = -(-total_out // grid_cols)
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, k_chunk), buffer_factor=2)
+        w_dfb = ttl.make_dataflow_buffer_like(w, shape=(k_chunk, n_chunk), buffer_factor=2)
+        b_dfb = ttl.make_dataflow_buffer_like(bias, shape=(1, n_chunk), buffer_factor=2)
+        mm_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, n_chunk), buffer_factor=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, n_chunk), buffer_factor=2)
+        @ttl.compute()
+        def compute():
+            core_x, _ = ttl.core(dims=2)
+            for local_t in range(tiles_per_core):
+                idx = core_x * tiles_per_core + local_t
+                if idx < total_out:
+                    with x_dfb.wait() as xv, w_dfb.wait() as wv, mm_dfb.reserve() as mm:
+                        mm.store(xv @ wv)
+                    with mm_dfb.wait() as mmv, b_dfb.wait() as bv, out_dfb.reserve() as o:
+                        h = mmv + bv
+                        x3 = h * h * h
+                        inner = ttl.math.fill(h, 0.7978845608) * (h + ttl.math.fill(h, 0.044715) * x3)
+                        o.store(ttl.math.fill(h, 0.5) * h * (ttl.math.fill(h, 1.0) + ttl.math.tanh(inner)))
+        @ttl.datamovement()
+        def dm_read():
+            core_x, _ = ttl.core(dims=2)
+            for local_t in range(tiles_per_core):
+                idx = core_x * tiles_per_core + local_t
+                if idx < total_out:
+                    row = idx // n_blocks
+                    cb = idx % n_blocks
+                    sc = cb * n_chunk
+                    with x_dfb.reserve() as blk:
+                        tx = ttl.copy(x[row, 0:k_chunk], blk); tx.wait()
+                    with w_dfb.reserve() as blk:
+                        tx = ttl.copy(w[0:k_chunk, sc:sc + n_chunk], blk); tx.wait()
+                    with b_dfb.reserve() as blk:
+                        tx = ttl.copy(bias[row, sc:sc + n_chunk], blk); tx.wait()
+        @ttl.datamovement()
+        def dm_write():
+            core_x, _ = ttl.core(dims=2)
+            for local_t in range(tiles_per_core):
+                idx = core_x * tiles_per_core + local_t
+                if idx < total_out:
+                    row = idx // n_blocks
+                    cb = idx % n_blocks
+                    sc = cb * n_chunk
+                    with out_dfb.wait() as blk:
+                        tx = ttl.copy(blk, out[row, sc:sc + n_chunk]); tx.wait()
+    return fused_lbg_kernel
+
 def make_linear_accum_kernel(k_chunk, k_iters):
     @ttl.kernel(grid="auto")
     def linear_accum_kernel(x, w, out):
@@ -753,6 +808,7 @@ linear_bias_k32 = make_linear_bias_kernel(D_TILES, n_chunk=4)
 linear_bias_k8 = make_linear_bias_kernel(FREQ_DIM // TILE, n_chunk=4)
 linear_accum_k32_4 = make_linear_accum_kernel(D_TILES, 4)  # MLP down 4096->1024
 fused_lbgr_k32 = make_fused_linear_bias_gated_res_kernel(D_TILES)  # O proj + bias + gated residual
+fused_lbg_k32 = make_fused_linear_bias_gelu_kernel(D_TILES, n_chunk=4)  # FC1 + bias + GELU
 fused_ln_adaln_d1024 = make_fused_ln_adaln_kernel(D_TILES)  # LayerNorm + adaLN modulate
 layernorm_d1024 = make_layernorm_kernel(D_TILES)
 
@@ -1251,8 +1307,7 @@ def run_sub_block(prefix, x_tt, cond_list, dev, scr, tt_device, scaler, mean_sca
     # Fused MLP LayerNorm + adaLN modulate
     fused_ln_adaln_d1024(x_tt, scaler, mean_scale, shift_mlp, scale_mlp, scr["modulated"])
     _timer.mark("mlp_norm+mod")
-    linear_bias_k32(scr["modulated"], dev["%s.fc1_w" % prefix], dev["%s.fc1_b" % prefix], scr["fc1"])
-    gelu_approx_kernel(scr["fc1"], scr["gelu"])
+    fused_lbg_k32(scr["modulated"], dev["%s.fc1_w" % prefix], dev["%s.fc1_b" % prefix], scr["gelu"])
     _timer.mark("fc1+gelu")
     # FC2 uses ttnn.matmul for precision (4096->1024 accumulation).
     scr["fc2"] = ttnn.linear(scr["gelu"], dev["%s.fc2_w" % prefix], bias=dev["%s.fc2_b_1d" % prefix])
