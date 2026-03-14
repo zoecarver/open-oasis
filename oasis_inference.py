@@ -902,6 +902,192 @@ def make_qkv_rope_sdpa_kernel(dim_tiles, seq_tiles, head_tiles, n_heads_val, sca
 
 mega_qkv_rope_sdpa = make_qkv_rope_sdpa_kernel(D_TILES, N_PATCH_PAD_TILES, D_HEAD_TILES, N_HEADS, 0.125)
 
+def make_mega_post_attn_kernel(dim_tiles, mlp_dim_tiles):
+    """Mega kernel B: O proj + residual + LN + modulate + FC1 + GELU + FC2 + residual.
+    Per-row processing. Uses DRAM scratch between phases."""
+    @ttl.kernel(grid="auto")
+    def mega_post_attn(attn_out, x_residual, gate_msa,
+                       out_w, out_b,
+                       shift_mlp, scale_mlp, gate_mlp,
+                       fc1_w, fc1_b, fc2_w, fc2_b,
+                       scaler, mean_scale,
+                       z_scratch, gelu_scratch, final_out):
+        grid_cols, _ = ttl.grid_size(dims=2)
+        seq_tiles = attn_out.shape[0] // TILE
+        tiles_per_core = -(-seq_tiles // grid_cols)
+        attn_dfb = ttl.make_dataflow_buffer_like(attn_out, shape=(1, dim_tiles), buffer_factor=2)
+        wcol_dfb = ttl.make_dataflow_buffer_like(out_w, shape=(dim_tiles, 1), buffer_factor=2)
+        x_dfb = ttl.make_dataflow_buffer_like(attn_out, shape=(1, 1), buffer_factor=2)
+        w_dfb = ttl.make_dataflow_buffer_like(out_w, shape=(1, 1), buffer_factor=2)
+        p1_dfb = ttl.make_dataflow_buffer_like(attn_out, shape=(1, 1), buffer_factor=2)
+        p2_dfb = ttl.make_dataflow_buffer_like(attn_out, shape=(1, 1), buffer_factor=2)
+        p3_dfb = ttl.make_dataflow_buffer_like(attn_out, shape=(1, 1), buffer_factor=2)
+        scaler_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=1)
+        ms_dfb = ttl.make_dataflow_buffer_like(mean_scale, shape=(1, 1), buffer_factor=1)
+        mm_dfb = ttl.make_dataflow_buffer_like(final_out, shape=(1, 1), buffer_factor=2)
+        acc_dfb = ttl.make_dataflow_buffer_like(final_out, shape=(1, 1), buffer_factor=2)
+        red_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        bcast_dfb = ttl.make_dataflow_buffer_like(final_out, shape=(1, 1), buffer_factor=2)
+        sq_dfb = ttl.make_dataflow_buffer_like(final_out, shape=(1, 1), buffer_factor=2)
+        mean_dfb = ttl.make_dataflow_buffer_like(final_out, shape=(1, 1), buffer_factor=2)
+        istd_dfb = ttl.make_dataflow_buffer_like(final_out, shape=(1, 1), buffer_factor=2)
+        out_dfb = ttl.make_dataflow_buffer_like(final_out, shape=(1, 1), buffer_factor=2)
+        @ttl.compute()
+        def compute():
+            core_x, _ = ttl.core(dims=2)
+            with scaler_dfb.wait() as sclr, ms_dfb.wait() as ms:
+                for local_t in range(tiles_per_core):
+                    tile_idx = core_x * tiles_per_core + local_t
+                    if tile_idx < seq_tiles:
+                        with attn_dfb.wait() as a_row:
+                            for col in range(dim_tiles):
+                                with wcol_dfb.wait() as w_col, mm_dfb.reserve() as mm:
+                                    mm.store(a_row @ w_col)
+                                with mm_dfb.wait() as oproj, p1_dfb.wait() as bv, p2_dfb.wait() as gv, p3_dfb.wait() as rv:
+                                    with out_dfb.reserve() as o:
+                                        o.store(rv + (oproj + bv) * gv)
+                        with x_dfb.wait() as z0:
+                            with red_dfb.reserve() as r:
+                                r.store(ttl.math.reduce_sum(z0, sclr, dims=[1]))
+                        with red_dfb.wait() as rv, acc_dfb.reserve() as a:
+                            a.store(rv)
+                        for j in range(dim_tiles - 1):
+                            with x_dfb.wait() as zj:
+                                with red_dfb.reserve() as r:
+                                    r.store(ttl.math.reduce_sum(zj, sclr, dims=[1]))
+                            with red_dfb.wait() as rv, acc_dfb.wait() as prev, acc_dfb.reserve() as a:
+                                a.store(prev + rv)
+                        with acc_dfb.wait() as sum_x, bcast_dfb.reserve() as bc:
+                            bc.store(ttl.math.broadcast(sum_x, dims=[1]))
+                        with bcast_dfb.wait() as sum_bc, mean_dfb.reserve() as mn:
+                            mn.store(sum_bc * ms)
+                        with mean_dfb.wait() as mean_val:
+                            with x_dfb.wait() as z0:
+                                with sq_dfb.reserve() as sq:
+                                    sq.store((z0 - mean_val) * (z0 - mean_val))
+                            with sq_dfb.wait() as sqv, red_dfb.reserve() as r:
+                                r.store(ttl.math.reduce_sum(sqv, sclr, dims=[1]))
+                            with red_dfb.wait() as rv, acc_dfb.reserve() as a:
+                                a.store(rv)
+                            for j in range(dim_tiles - 1):
+                                with x_dfb.wait() as zj:
+                                    with sq_dfb.reserve() as sq:
+                                        sq.store((zj - mean_val) * (zj - mean_val))
+                                with sq_dfb.wait() as sqv, red_dfb.reserve() as r:
+                                    r.store(ttl.math.reduce_sum(sqv, sclr, dims=[1]))
+                                with red_dfb.wait() as rv, acc_dfb.wait() as prev, acc_dfb.reserve() as a:
+                                    a.store(prev + rv)
+                            with acc_dfb.wait() as sum_sq, bcast_dfb.reserve() as bc:
+                                bc.store(ttl.math.broadcast(sum_sq, dims=[1]))
+                            with bcast_dfb.wait() as var_bc, istd_dfb.reserve() as istd:
+                                istd.store(ttl.math.rsqrt(var_bc * ms + ttl.math.fill(var_bc, 1e-6)))
+                            with istd_dfb.wait() as inv_std:
+                                for j in range(dim_tiles):
+                                    with x_dfb.wait() as zj, p1_dfb.wait() as shv, p2_dfb.wait() as sclv:
+                                        normed = (zj - mean_val) * inv_std
+                                        with out_dfb.reserve() as o:
+                                            o.store(normed * (sclv + ttl.math.fill(sclv, 1.0)) + shv)
+                        for fc1_col in range(mlp_dim_tiles):
+                            with x_dfb.wait() as m0, w_dfb.wait() as fw0, acc_dfb.reserve() as a:
+                                a.store(m0 @ fw0)
+                            for k in range(dim_tiles - 1):
+                                with x_dfb.wait() as mk, w_dfb.wait() as fwk, mm_dfb.reserve() as mm:
+                                    mm.store(mk @ fwk)
+                                with mm_dfb.wait() as mmv, acc_dfb.wait() as prev, acc_dfb.reserve() as a:
+                                    a.store(prev + mmv)
+                            with acc_dfb.wait() as fc1r, p1_dfb.wait() as fb:
+                                h = fc1r + fb
+                                x3 = h * h * h
+                                inner = ttl.math.fill(h, 0.7978845608) * (h + ttl.math.fill(h, 0.044715) * x3)
+                                with out_dfb.reserve() as o:
+                                    o.store(ttl.math.fill(h, 0.5) * h * (ttl.math.fill(h, 1.0) + ttl.math.tanh(inner)))
+                        for col in range(dim_tiles):
+                            with x_dfb.wait() as g0, w_dfb.wait() as fw0, acc_dfb.reserve() as a:
+                                a.store(g0 @ fw0)
+                            for k in range(mlp_dim_tiles - 1):
+                                with x_dfb.wait() as gk, w_dfb.wait() as fwk, mm_dfb.reserve() as mm:
+                                    mm.store(gk @ fwk)
+                                with mm_dfb.wait() as mmv, acc_dfb.wait() as prev, acc_dfb.reserve() as a:
+                                    a.store(prev + mmv)
+                            with acc_dfb.wait() as fc2r, p1_dfb.wait() as fb, p2_dfb.wait() as gv, p3_dfb.wait() as zv:
+                                with out_dfb.reserve() as o:
+                                    o.store(zv + (fc2r + fb) * gv)
+        @ttl.datamovement()
+        def dm_read():
+            core_x, _ = ttl.core(dims=2)
+            with scaler_dfb.reserve() as blk:
+                tx = ttl.copy(scaler[0, 0], blk); tx.wait()
+            with ms_dfb.reserve() as blk:
+                tx = ttl.copy(mean_scale[0, 0], blk); tx.wait()
+            for local_t in range(tiles_per_core):
+                tile_idx = core_x * tiles_per_core + local_t
+                if tile_idx < seq_tiles:
+                    with attn_dfb.reserve() as blk:
+                        tx = ttl.copy(attn_out[tile_idx, 0:dim_tiles], blk); tx.wait()
+                    for col in range(dim_tiles):
+                        with wcol_dfb.reserve() as blk:
+                            tx = ttl.copy(out_w[0:dim_tiles, col], blk); tx.wait()
+                        with p1_dfb.reserve() as blk:
+                            tx = ttl.copy(out_b[tile_idx, col], blk); tx.wait()
+                        with p2_dfb.reserve() as blk:
+                            tx = ttl.copy(gate_msa[tile_idx, col], blk); tx.wait()
+                        with p3_dfb.reserve() as blk:
+                            tx = ttl.copy(x_residual[tile_idx, col], blk); tx.wait()
+                    for j in range(dim_tiles):
+                        with x_dfb.reserve() as blk:
+                            tx = ttl.copy(z_scratch[tile_idx, j], blk); tx.wait()
+                    for j in range(dim_tiles):
+                        with x_dfb.reserve() as blk:
+                            tx = ttl.copy(z_scratch[tile_idx, j], blk); tx.wait()
+                    for j in range(dim_tiles):
+                        with x_dfb.reserve() as blk:
+                            tx = ttl.copy(z_scratch[tile_idx, j], blk); tx.wait()
+                        with p1_dfb.reserve() as blk:
+                            tx = ttl.copy(shift_mlp[tile_idx, j], blk); tx.wait()
+                        with p2_dfb.reserve() as blk:
+                            tx = ttl.copy(scale_mlp[tile_idx, j], blk); tx.wait()
+                    for fc1_col in range(mlp_dim_tiles):
+                        for k in range(dim_tiles):
+                            with x_dfb.reserve() as blk:
+                                tx = ttl.copy(final_out[tile_idx, k], blk); tx.wait()
+                            with w_dfb.reserve() as blk:
+                                tx = ttl.copy(fc1_w[k, fc1_col], blk); tx.wait()
+                        with p1_dfb.reserve() as blk:
+                            tx = ttl.copy(fc1_b[tile_idx, fc1_col], blk); tx.wait()
+                    for col in range(dim_tiles):
+                        for k in range(mlp_dim_tiles):
+                            with x_dfb.reserve() as blk:
+                                tx = ttl.copy(gelu_scratch[tile_idx, k], blk); tx.wait()
+                            with w_dfb.reserve() as blk:
+                                tx = ttl.copy(fc2_w[k, col], blk); tx.wait()
+                        with p1_dfb.reserve() as blk:
+                            tx = ttl.copy(fc2_b[tile_idx, col], blk); tx.wait()
+                        with p2_dfb.reserve() as blk:
+                            tx = ttl.copy(gate_mlp[tile_idx, col], blk); tx.wait()
+                        with p3_dfb.reserve() as blk:
+                            tx = ttl.copy(z_scratch[tile_idx, col], blk); tx.wait()
+        @ttl.datamovement()
+        def dm_write():
+            core_x, _ = ttl.core(dims=2)
+            for local_t in range(tiles_per_core):
+                tile_idx = core_x * tiles_per_core + local_t
+                if tile_idx < seq_tiles:
+                    for col in range(dim_tiles):
+                        with out_dfb.wait() as blk:
+                            tx = ttl.copy(blk, z_scratch[tile_idx, col]); tx.wait()
+                    for col in range(dim_tiles):
+                        with out_dfb.wait() as blk:
+                            tx = ttl.copy(blk, final_out[tile_idx, col]); tx.wait()
+                    for fc1_col in range(mlp_dim_tiles):
+                        with out_dfb.wait() as blk:
+                            tx = ttl.copy(blk, gelu_scratch[tile_idx, fc1_col]); tx.wait()
+                    for col in range(dim_tiles):
+                        with out_dfb.wait() as blk:
+                            tx = ttl.copy(blk, final_out[tile_idx, col]); tx.wait()
+    return mega_post_attn
+
+mega_post_attn_kernel = make_mega_post_attn_kernel(D_TILES, D_MLP_TILES)
+
 def make_fused_ln_adaln_kernel(dim_tiles):
     """Fused LayerNorm + adaLN modulate: out = layernorm(x) * (1 + scale) + shift.
     Eliminates DRAM round-trip for the intermediate normed tensor."""
@@ -1436,6 +1622,9 @@ def prealloc_scratch(tt_device, n_frames=2):
     s["k_roped"] = zeros_tt((SEQ, D_MODEL), tt_device)
     # SDPA scratch: (SEQ, D_MODEL) for TT-Lang spatial SDPA output
     s["sdpa_out"] = zeros_tt((SEQ, D_MODEL), tt_device)
+    # Mega kernel B scratch
+    s["z_scratch"] = zeros_tt((SEQ, D_MODEL), tt_device)
+    s["gelu_scratch"] = zeros_tt((SEQ, D_MLP), tt_device)
     # Final layer
     s["final_adaln"] = zeros_tt((TILE, 2 * D_MODEL), tt_device)
     s["final_out"] = zeros_tt((SEQ, OUT_DIM), tt_device)
@@ -1588,22 +1777,25 @@ def run_sub_block(prefix, x_tt, cond_list, dev, scr, tt_device, scaler, mean_sca
         attn_2d = ttnn.reshape(attn_out, [SEQ, D_MODEL])
         _timer.mark("sdpa")
 
-    # Fused: O projection + bias + gated residual (saves 2 DRAM round-trips)
-    fused_lbgr_k32(attn_2d, dev["%s.out_w" % prefix], dev["%s.out_b" % prefix],
-                    gate_msa, x_tt, scr["z_b"])
-    _timer.mark("o_proj+res")
-
-    x_tt = scr["z_b"]
-
-    # Fused MLP LayerNorm + adaLN modulate
-    fused_ln_adaln_d1024(x_tt, scaler, mean_scale, shift_mlp, scale_mlp, scr["modulated"])
-    _timer.mark("mlp_norm+mod")
-    fused_lbg_k32(scr["modulated"], dev["%s.fc1_w" % prefix], dev["%s.fc1_b" % prefix], scr["gelu"])
-    _timer.mark("fc1+gelu")
-    # FC2 uses ttnn.matmul for precision (4096->1024 accumulation).
-    scr["fc2"] = ttnn.linear(scr["gelu"], dev["%s.fc2_w" % prefix], bias=dev["%s.fc2_b_1d" % prefix])
-    gated_residual_kernel(x_tt, scr["fc2"], gate_mlp, scr["z_a"])
-    _timer.mark("fc2+res")
+    if attn_type == "spatial":
+        # Mega kernel B: O proj + residual + LN + modulate + FC1 + GELU + FC2 + residual
+        mega_post_attn_kernel(attn_2d, x_tt, gate_msa,
+                              dev["%s.out_w" % prefix], dev["%s.out_b" % prefix],
+                              shift_mlp, scale_mlp, gate_mlp,
+                              dev["%s.fc1_w" % prefix], dev["%s.fc1_b" % prefix],
+                              dev["%s.fc2_w" % prefix], dev["%s.fc2_b" % prefix],
+                              scaler, mean_scale,
+                              scr["z_scratch"], scr["gelu_scratch"], scr["z_a"])
+        _timer.mark("post_attn")
+    else:
+        fused_lbgr_k32(attn_2d, dev["%s.out_w" % prefix], dev["%s.out_b" % prefix],
+                        gate_msa, x_tt, scr["z_b"])
+        x_tt = scr["z_b"]
+        fused_ln_adaln_d1024(x_tt, scaler, mean_scale, shift_mlp, scale_mlp, scr["modulated"])
+        fused_lbg_k32(scr["modulated"], dev["%s.fc1_w" % prefix], dev["%s.fc1_b" % prefix], scr["gelu"])
+        scr["fc2"] = ttnn.linear(scr["gelu"], dev["%s.fc2_w" % prefix], bias=dev["%s.fc2_b_1d" % prefix])
+        gated_residual_kernel(x_tt, scr["fc2"], gate_mlp, scr["z_a"])
+        _timer.mark("post_attn")
 
     _timer.report(prefix, attn_type)
     return scr["z_a"]
