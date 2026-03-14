@@ -665,9 +665,10 @@ def preload_dit_weights(tt_device, n_frames=2):
         dev["x_emb_conv_w"] = st.get_tensor("x_embedder.proj.weight")  # (1024, 16, 2, 2)
         dev["x_emb_conv_b"] = st.get_tensor("x_embedder.proj.bias")  # (1024,)
 
-        # Final layer adaLN: computed on HOST in fp32
-        dev["final_adaln_w_host"] = st.get_tensor("final_layer.adaLN_modulation.1.weight").T.contiguous().float()  # (1024, 2048)
-        dev["final_adaln_b_host"] = st.get_tensor("final_layer.adaLN_modulation.1.bias").float()  # (2048,)
+        # Final layer adaLN: on device with ttnn.matmul for precision
+        dev["final_adaln_w"] = to_tt(st.get_tensor("final_layer.adaLN_modulation.1.weight").T.contiguous().to(torch.bfloat16), tt_device)
+        final_adaln_b = st.get_tensor("final_layer.adaLN_modulation.1.bias").to(torch.bfloat16)
+        dev["final_adaln_b"] = to_tt(final_adaln_b.unsqueeze(0).expand(TILE, -1).contiguous(), tt_device)
         dev["final_linear_w"] = to_tt(st.get_tensor("final_layer.linear.weight").T.contiguous().to(torch.bfloat16), tt_device)
         dev["final_linear_b"] = to_tt(expand_bias(st.get_tensor("final_layer.linear.bias").to(torch.bfloat16), N_PATCH_PAD * n_frames), tt_device)
 
@@ -676,10 +677,10 @@ def preload_dit_weights(tt_device, n_frames=2):
             for prefix in ["s", "t"]:
                 p = "blocks.%d.%s" % (i, prefix)
 
-                # adaLN modulation: computed on HOST in fp32 for precision
-                # Store as host fp32 tensors (not on TT device)
-                dev["%s.adaln_w_host" % p] = st.get_tensor("%s_adaLN_modulation.1.weight" % p).T.contiguous().float()  # (1024, 6144)
-                dev["%s.adaln_b_host" % p] = st.get_tensor("%s_adaLN_modulation.1.bias" % p).float()  # (6144,)
+                # adaLN modulation: on device with ttnn.matmul for precision
+                dev["%s.adaln_w" % p] = to_tt(st.get_tensor("%s_adaLN_modulation.1.weight" % p).T.contiguous().to(torch.bfloat16), tt_device)
+                adaln_b_raw = st.get_tensor("%s_adaLN_modulation.1.bias" % p).to(torch.bfloat16)
+                dev["%s.adaln_b" % p] = to_tt(adaln_b_raw.unsqueeze(0).expand(TILE, -1).contiguous(), tt_device)
 
                 # QKV: Linear(1024, 3072) NO bias
                 qkv_w = st.get_tensor("%s_attn.to_qkv.weight" % p).T.contiguous().to(torch.bfloat16)
@@ -743,6 +744,7 @@ def prealloc_scratch(tt_device, n_frames=2):
     s["cond"] = zeros_tt((TILE, D_MODEL), tt_device)
     # adaLN scratch
     s["adaln_out"] = zeros_tt((TILE, 6 * D_MODEL), tt_device)
+    s["silu_cond"] = zeros_tt((TILE, D_MODEL), tt_device)
     # Final layer
     s["final_adaln"] = zeros_tt((TILE, 2 * D_MODEL), tt_device)
     s["final_out"] = zeros_tt((SEQ, OUT_DIM), tt_device)
@@ -771,32 +773,42 @@ def unpatchify_host(x, patch_size, out_channels, h, w):
     return x.reshape(1, out_channels, h * patch_size, w * patch_size)
 
 def build_per_frame_adaln(cond_list, prefix, dev, scr, tt_device):
-    """Compute adaLN params on HOST in fp32 for precision.
-    cond_list: list of T conditioning device tensors, each (TILE, D_MODEL).
+    """Compute adaLN params on DEVICE using ttnn.matmul.
+    cond_list: list of T conditioning device tensors, each (TILE, D_MODEL) with all rows filled.
     Returns: [shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp] as device tensors.
     """
     T = len(cond_list)
     SEQ = N_PATCH_PAD * T
-    all_chunks = []
-    for cond_tt in cond_list:
-        # Read conditioning to host and compute adaLN in fp32
-        cond_host = ttnn.to_torch(cond_tt)[0, :D_MODEL].float()  # (D_MODEL,)
-        cond_silu = cond_host * torch.sigmoid(cond_host)  # SiLU in fp32
-        # Linear(1024, 6144) in fp32: w is stored transposed (1024, 6144), b is (6144,)
-        adaln_w_host = dev["%s.adaln_w_host" % prefix]  # (1024, 6144) fp32
-        adaln_b_host = dev["%s.adaln_b_host" % prefix]  # (6144,) fp32
-        adaln_out = cond_silu @ adaln_w_host + adaln_b_host  # (6144,) fp32
-        all_chunks.append(adaln_out.reshape(6, D_MODEL))
+    N_REPEAT = N_PATCH_PAD // TILE  # 5
 
+    per_frame_expanded = []
+    for cond_tt in cond_list:
+        # SiLU on device
+        silu_kernel(cond_tt, scr["silu_cond"])
+        # Linear(1024, 6144) on device via ttnn.matmul
+        adaln_raw = ttnn.matmul(scr["silu_cond"], dev["%s.adaln_w" % prefix])
+        adaln_raw = ttnn.add(adaln_raw, dev["%s.adaln_b" % prefix])
+        # adaln_raw: (TILE, 6*D_MODEL) = (32, 6144), all rows have same values
+        # Expand to (N_PATCH_PAD, 6*D_MODEL) by repeating the tile block
+        expanded = ttnn.concat([adaln_raw] * N_REPEAT, dim=0)
+        per_frame_expanded.append(expanded)
+
+    # Combine frames: (SEQ, 6*D_MODEL)
+    if T == 1:
+        full = per_frame_expanded[0]
+    else:
+        full = ttnn.concat(per_frame_expanded, dim=0)
+
+    # Slice into 6 params of (SEQ, D_MODEL) each
     results = []
-    for param_idx in range(6):
-        param_2d = torch.zeros(SEQ, D_MODEL, dtype=torch.bfloat16)
-        for t_idx in range(T):
-            start = t_idx * N_PATCH_PAD
-            param_2d[start:start + N_PATCH_PAD] = expand_bias(
-                all_chunks[t_idx][param_idx].to(torch.bfloat16), N_PATCH_PAD)
-        results.append(to_tt(param_2d, tt_device))
+    for i in range(6):
+        start_col = i * D_MODEL
+        end_col = (i + 1) * D_MODEL
+        param = ttnn.slice(full, [0, start_col], [SEQ, end_col])
+        results.append(param)
     return results
+
+PROFILE_BLOCKS = True  # Set True for timing breakdown
 
 def run_sub_block(prefix, x_tt, cond_list, dev, scr, tt_device, scaler, mean_scale, attn_type="spatial"):
     """Run one spatial or temporal sub-block.
@@ -808,17 +820,43 @@ def run_sub_block(prefix, x_tt, cond_list, dev, scr, tt_device, scaler, mean_sca
     T = len(cond_list)
     SEQ = N_PATCH_PAD * T
 
+    if PROFILE_BLOCKS:
+        import time as _t
+        _p = lambda label: None
+        class _Timer:
+            def __init__(self):
+                self.t = _t.time()
+                self.times = []
+            def mark(self, label):
+                now = _t.time()
+                self.times.append((label, (now - self.t) * 1000))
+                self.t = now
+            def report(self, prefix, attn_type):
+                parts = " | ".join("%s:%.1fms" % (l, t) for l, t in self.times)
+                total = sum(t for _, t in self.times)
+                print("    [%s %s] %.1fms: %s" % (prefix, attn_type, total, parts))
+        _timer = _Timer()
+    else:
+        class _DummyTimer:
+            def mark(self, label): pass
+            def report(self, prefix, attn_type): pass
+        _timer = _DummyTimer()
+
     # Compute per-frame adaLN params
     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
         build_per_frame_adaln(cond_list, prefix, dev, scr, tt_device)
+    _timer.mark("adaln")
 
     # Attention path: LayerNorm -> adaLN modulate -> QKV
     layernorm_d1024(x_tt, dev["ln_w_ones"], dev["ln_b_zeros"], scaler, mean_scale, scr["normed"])
     adaln_modulate_kernel(scr["normed"], shift_msa, scale_msa, scr["modulated"])
+    _timer.mark("norm+mod")
     linear_k32(scr["modulated"], dev["%s.qkv_w" % prefix], scr["qkv"])
+    _timer.mark("qkv")
 
     # Read QKV to host for reshaping + RoPE + SDPA
     qkv_host_full = ttnn.to_torch(scr["qkv"])  # (SEQ, 3*D_MODEL)
+    _timer.mark("qkv_read")
 
     if attn_type == "spatial":
         # Spatial: each frame independently, (B*T, heads, H*W, d_head)
@@ -859,6 +897,7 @@ def run_sub_block(prefix, x_tt, cond_list, dev, scr, tt_device, scaler, mean_sca
         attn_out = ttnn.transformer.scaled_dot_product_attention(q_tt, k_tt, v_tt, is_causal=False)
         attn_perm = ttnn.permute(attn_out, [0, 2, 1, 3])  # (T, N_PATCH_PAD, heads, d_head)
         attn_2d = ttnn.reshape(attn_perm, [SEQ, D_MODEL])
+        _timer.mark("sdpa")
 
     else:
         # Temporal: (B*H*W, heads, T, d_head) with causal attention
@@ -907,26 +946,32 @@ def run_sub_block(prefix, x_tt, cond_list, dev, scr, tt_device, scaler, mean_sca
             attn_2d_host[t_idx * N_PATCH_PAD:(t_idx + 1) * N_PATCH_PAD] = \
                 attn_host[:, t_idx].to(torch.bfloat16)
         attn_2d = to_tt(attn_2d_host, tt_device)
+        _timer.mark("sdpa")
 
     # O projection + bias + gated residual
     linear_k32(attn_2d, dev["%s.out_w" % prefix], scr["o_proj"])
     o_with_bias = ttnn.add(scr["o_proj"], dev["%s.out_b" % prefix])
     gated_residual_kernel(x_tt, o_with_bias, gate_msa, scr["z_b"])
+    _timer.mark("o_proj+res")
 
     x_tt = scr["z_b"]
 
     # MLP path
     layernorm_d1024(x_tt, dev["ln_w_ones"], dev["ln_b_zeros"], scaler, mean_scale, scr["normed"])
     adaln_modulate_kernel(scr["normed"], shift_mlp, scale_mlp, scr["modulated"])
+    _timer.mark("mlp_norm+mod")
     linear_bias_k32(scr["modulated"], dev["%s.fc1_w" % prefix], dev["%s.fc1_b" % prefix], scr["fc1"])
     gelu_approx_kernel(scr["fc1"], scr["gelu"])
+    _timer.mark("fc1+gelu")
     # TODO: investigate why tt-lang linear_accum kernel has much worse precision than
     # ttnn.matmul for large-K accumulation (4096->1024, k_chunk=32, k_iters=4).
     # Our kernel: max_err=11.7, ttnn.matmul: max_err=0.34 on same inputs.
     scr["fc2"] = ttnn.matmul(scr["gelu"], dev["%s.fc2_w" % prefix])
     fc2_with_bias = ttnn.add(scr["fc2"], dev["%s.fc2_b" % prefix])
     gated_residual_kernel(x_tt, fc2_with_bias, gate_mlp, scr["z_a"])
+    _timer.mark("fc2+res")
 
+    _timer.report(prefix, attn_type)
     return scr["z_a"]
 
 def compute_cond_for_frame(t_scalar, action_vec, dev, scr, tt_device):
@@ -947,9 +992,9 @@ def compute_cond_for_frame(t_scalar, action_vec, dev, scr, tt_device):
         ext = (action_vec.float() @ dev["ext_cond_w_host"]) + dev["ext_cond_b_host"]
         cond = cond + ext
 
-    # Package as (TILE, D_MODEL) device tensor
-    cond_pad = torch.zeros(TILE, D_MODEL, dtype=torch.bfloat16)
-    cond_pad[0] = cond.to(torch.bfloat16)
+    # Package as (TILE, D_MODEL) device tensor - fill ALL rows for device-side broadcast
+    cond_bf16 = cond.to(torch.bfloat16)
+    cond_pad = cond_bf16.unsqueeze(0).expand(TILE, -1).contiguous()
     return to_tt(cond_pad, tt_device)
 
 def dit_forward(x_latent, timesteps, actions, dev, scr, tt_device, scaler, mean_scale):
@@ -991,21 +1036,22 @@ def dit_forward(x_latent, timesteps, actions, dev, scr, tt_device, scaler, mean_
         )
         print("  Block %d done" % block_idx)
 
-    # Final layer: per-frame adaLN (computed on HOST in fp32)
-    final_shift_all = torch.zeros(SEQ, D_MODEL, dtype=torch.bfloat16)
-    final_scale_all = torch.zeros(SEQ, D_MODEL, dtype=torch.bfloat16)
+    # Final layer: per-frame adaLN (on device)
+    N_REPEAT = N_PATCH_PAD // TILE  # 5
+    per_frame_final = []
     for t_idx in range(T):
-        cond_host = ttnn.to_torch(cond_list[t_idx])[0, :D_MODEL].float()
-        cond_silu = cond_host * torch.sigmoid(cond_host)
-        mod_host = (cond_silu @ dev["final_adaln_w_host"] + dev["final_adaln_b_host"])
-        start = t_idx * N_PATCH_PAD
-        final_shift_all[start:start + N_PATCH_PAD] = expand_bias(
-            mod_host[:D_MODEL].to(torch.bfloat16), N_PATCH_PAD)
-        final_scale_all[start:start + N_PATCH_PAD] = expand_bias(
-            mod_host[D_MODEL:].to(torch.bfloat16), N_PATCH_PAD)
+        silu_kernel(cond_list[t_idx], scr["silu_cond"])
+        final_raw = ttnn.matmul(scr["silu_cond"], dev["final_adaln_w"])
+        final_raw = ttnn.add(final_raw, dev["final_adaln_b"])
+        expanded = ttnn.concat([final_raw] * N_REPEAT, dim=0)
+        per_frame_final.append(expanded)
+    if T == 1:
+        full_final = per_frame_final[0]
+    else:
+        full_final = ttnn.concat(per_frame_final, dim=0)
 
-    shift_tt = to_tt(final_shift_all, tt_device)
-    scale_tt = to_tt(final_scale_all, tt_device)
+    shift_tt = ttnn.slice(full_final, [0, 0], [SEQ, D_MODEL])
+    scale_tt = ttnn.slice(full_final, [0, D_MODEL], [SEQ, 2 * D_MODEL])
 
     layernorm_d1024(z_cur, dev["ln_w_ones"], dev["ln_b_zeros"], scaler, mean_scale, scr["normed"])
     adaln_modulate_kernel(scr["normed"], shift_tt, scale_tt, scr["modulated"])
