@@ -331,6 +331,60 @@ def silu_kernel(x, out):
                     tx = ttl.copy(blk, out[row, sc:sc + ELEM_GRAN]); tx.wait()
 
 @ttl.kernel(grid="auto")
+def fused_rope_kernel(a, b, cos_tab, sin_tab, out):
+    """out = a * cos + b * sin. Fused multiply-add for RoPE.
+    Eliminates 3 ttnn intermediates (2 multiply + 1 add)."""
+    grid_cols, _ = ttl.grid_size(dims=2)
+    row_tiles = a.shape[0] // TILE
+    col_blocks = a.shape[1] // TILE // ELEM_GRAN
+    total = row_tiles * col_blocks
+    tiles_per_core = -(-total // grid_cols)
+    a_dfb = ttl.make_dataflow_buffer_like(a, shape=(1, ELEM_GRAN), buffer_factor=2)
+    b_dfb = ttl.make_dataflow_buffer_like(b, shape=(1, ELEM_GRAN), buffer_factor=2)
+    c_dfb = ttl.make_dataflow_buffer_like(cos_tab, shape=(1, ELEM_GRAN), buffer_factor=2)
+    s_dfb = ttl.make_dataflow_buffer_like(sin_tab, shape=(1, ELEM_GRAN), buffer_factor=2)
+    tmp_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, ELEM_GRAN), buffer_factor=2)
+    out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, ELEM_GRAN), buffer_factor=2)
+    @ttl.compute()
+    def compute():
+        core_x, _ = ttl.core(dims=2)
+        for local_t in range(tiles_per_core):
+            t = core_x * tiles_per_core + local_t
+            if t < total:
+                with a_dfb.wait() as av, c_dfb.wait() as cv, tmp_dfb.reserve() as tmp:
+                    tmp.store(av * cv)
+                with tmp_dfb.wait() as tv, b_dfb.wait() as bv, s_dfb.wait() as sv, out_dfb.reserve() as o:
+                    o.store(tv + bv * sv)
+    @ttl.datamovement()
+    def dm_read():
+        core_x, _ = ttl.core(dims=2)
+        for local_t in range(tiles_per_core):
+            t = core_x * tiles_per_core + local_t
+            if t < total:
+                row = t // col_blocks
+                cb = t % col_blocks
+                sc = cb * ELEM_GRAN
+                with a_dfb.reserve() as blk:
+                    tx = ttl.copy(a[row, sc:sc + ELEM_GRAN], blk); tx.wait()
+                with c_dfb.reserve() as blk:
+                    tx = ttl.copy(cos_tab[row, sc:sc + ELEM_GRAN], blk); tx.wait()
+                with b_dfb.reserve() as blk:
+                    tx = ttl.copy(b[row, sc:sc + ELEM_GRAN], blk); tx.wait()
+                with s_dfb.reserve() as blk:
+                    tx = ttl.copy(sin_tab[row, sc:sc + ELEM_GRAN], blk); tx.wait()
+    @ttl.datamovement()
+    def dm_write():
+        core_x, _ = ttl.core(dims=2)
+        for local_t in range(tiles_per_core):
+            t = core_x * tiles_per_core + local_t
+            if t < total:
+                row = t // col_blocks
+                cb = t % col_blocks
+                sc = cb * ELEM_GRAN
+                with out_dfb.wait() as blk:
+                    tx = ttl.copy(blk, out[row, sc:sc + ELEM_GRAN]); tx.wait()
+
+@ttl.kernel(grid="auto")
 def adaln_modulate_kernel(x, shift, scale, out):
     grid_cols, _ = ttl.grid_size(dims=2)
     row_tiles = x.shape[0] // TILE
@@ -629,6 +683,34 @@ def swap_adjacent_columns(w):
     w_swap[:, 1::2] = w[:, 0::2]
     return w_swap
 
+def build_rope_device_tables(freqs_per_position, n_positions, n_patch_pad, n_heads, n_frames, tt_device):
+    """Build cos/sin_perm device tables from per-position freq table.
+    freqs_per_position: (n_positions, freq_dim) float tensor.
+    Returns cos_tt, sin_perm_tt each (n_patch_pad * n_frames, n_heads * freq_dim) on device.
+    """
+    freq_dim = freqs_per_position.shape[-1]
+    d_model = n_heads * freq_dim
+    SEQ = n_patch_pad * n_frames
+
+    cos_vals = freqs_per_position.cos()  # (n_positions, freq_dim)
+    sin_vals = freqs_per_position.sin()
+    sign = torch.ones(freq_dim)
+    sign[0::2] = -1
+    sin_perm_vals = sin_vals * sign.unsqueeze(0)
+
+    cos_expanded = cos_vals.repeat(1, n_heads)  # (n_positions, d_model)
+    sin_expanded = sin_perm_vals.repeat(1, n_heads)
+
+    cos_full = torch.zeros(SEQ, d_model, dtype=torch.bfloat16)
+    sin_full = torch.zeros(SEQ, d_model, dtype=torch.bfloat16)
+    for t in range(n_frames):
+        start = t * n_patch_pad
+        n = min(n_positions, n_patch_pad)
+        cos_full[start:start + n] = cos_expanded[:n].to(torch.bfloat16)
+        sin_full[start:start + n] = sin_expanded[:n].to(torch.bfloat16)
+
+    return to_tt(cos_full, tt_device), to_tt(sin_full, tt_device)
+
 def build_spatial_rope_device_tables(spatial_freqs, n_frames, tt_device):
     """Build device-side cos/sin_perm tables for spatial RoPE.
     spatial_freqs: (N_PATCHES, 64) float.
@@ -764,6 +846,17 @@ def preload_dit_weights(tt_device, n_frames=2):
         dev["spatial_cos"], dev["spatial_sin_perm"] = \
             build_spatial_rope_device_tables(SPATIAL_ROPE_FREQS, n_frames, tt_device)
 
+        # Device-side temporal RoPE tables: per-frame freqs broadcast to all patches
+        # For T frames: frame t uses temporal_freqs[t], broadcast across N_PATCH_PAD rows
+        temporal_per_frame = TEMPORAL_ROPE_FREQS[:n_frames]  # (T, 64)
+        # Expand each frame's freqs to fill N_PATCH_PAD rows
+        temporal_expanded = temporal_per_frame.unsqueeze(1).expand(
+            n_frames, N_PATCH_PAD, TEMPORAL_ROPE_DIM).reshape(
+            n_frames * N_PATCH_PAD, TEMPORAL_ROPE_DIM)  # (SEQ, 64)
+        dev["temporal_cos"], dev["temporal_sin_perm"] = \
+            build_rope_device_tables(temporal_expanded, n_frames * N_PATCH_PAD,
+                                     N_PATCH_PAD, N_HEADS, 1, tt_device)
+
     elapsed = time.time() - t0
     print("Preloaded %d tensors in %.1fs" % (len(dev), elapsed))
     return dev
@@ -793,6 +886,9 @@ def prealloc_scratch(tt_device, n_frames=2):
     # adaLN scratch
     s["adaln_out"] = zeros_tt((TILE, 6 * D_MODEL), tt_device)
     s["silu_cond"] = zeros_tt((TILE, D_MODEL), tt_device)
+    # RoPE scratch (reused for spatial and temporal)
+    s["q_roped"] = zeros_tt((SEQ, D_MODEL), tt_device)
+    s["k_roped"] = zeros_tt((SEQ, D_MODEL), tt_device)
     # Final layer
     s["final_adaln"] = zeros_tt((TILE, 2 * D_MODEL), tt_device)
     s["final_out"] = zeros_tt((SEQ, OUT_DIM), tt_device)
@@ -915,10 +1011,10 @@ def run_sub_block(prefix, x_tt, cond_list, dev, scr, tt_device, scaler, mean_sca
         k_swap = ttnn.slice(qk_swap, [0, D_MODEL], [SEQ, 2 * D_MODEL])
 
         # Apply spatial RoPE: q_roped = q * cos + q_swap * sin_perm
-        q_roped = ttnn.add(ttnn.multiply(q, dev["spatial_cos"]),
-                           ttnn.multiply(q_swap, dev["spatial_sin_perm"]))
-        k_roped = ttnn.add(ttnn.multiply(k, dev["spatial_cos"]),
-                           ttnn.multiply(k_swap, dev["spatial_sin_perm"]))
+        fused_rope_kernel(q, q_swap, dev["spatial_cos"], dev["spatial_sin_perm"], scr["q_roped"])
+        fused_rope_kernel(k, k_swap, dev["spatial_cos"], dev["spatial_sin_perm"], scr["k_roped"])
+        q_roped = scr["q_roped"]
+        k_roped = scr["k_roped"]
 
         # Reshape for SDPA: (SEQ, D_MODEL) -> (T, N_HEADS, N_PATCH_PAD, D_HEAD)
         q_4d = ttnn.reshape(q_roped, [T, N_PATCH_PAD, N_HEADS, D_HEAD])
@@ -934,55 +1030,43 @@ def run_sub_block(prefix, x_tt, cond_list, dev, scr, tt_device, scaler, mean_sca
         _timer.mark("sdpa")
 
     else:
-        # Temporal: read QKV to host for CPU SDPA (T=2 too small for device)
-        qkv_host_full = ttnn.to_torch(scr["qkv"])  # (SEQ, 3*D_MODEL)
-        _timer.mark("qkv_read")
-        # Temporal: (B*H*W, heads, T, d_head) with causal attention
-        # Gather per-frame patches, reshape for temporal
-        frames_qkv = []
-        for t_idx in range(T):
-            start = t_idx * N_PATCH_PAD
-            qkv_frame = qkv_host_full[start:start + N_PATCHES].to(torch.bfloat16).float()
-            frames_qkv.append(qkv_frame)
+        # All-device temporal attention
+        # Slice Q, K, V from QKV on device
+        q = ttnn.slice(scr["qkv"], [0, 0], [SEQ, D_MODEL])
+        k = ttnn.slice(scr["qkv"], [0, D_MODEL], [SEQ, 2 * D_MODEL])
+        v = ttnn.slice(scr["qkv"], [0, 2 * D_MODEL], [SEQ, 3 * D_MODEL])
 
-        # Stack: (N_PATCHES, T, D_MODEL*3) then split Q/K/V
-        stacked = torch.stack(frames_qkv, dim=1)  # (N_PATCHES, T, 3*D_MODEL)
-        q, k, v = stacked.chunk(3, dim=-1)  # each (N_PATCHES, T, D_MODEL)
+        # Compute pair-swapped Q/K for temporal RoPE
+        qk_swap = ttnn.matmul(scr["modulated"], dev["%s.qk_swap_w" % prefix])
+        q_swap = ttnn.slice(qk_swap, [0, 0], [SEQ, D_MODEL])
+        k_swap = ttnn.slice(qk_swap, [0, D_MODEL], [SEQ, 2 * D_MODEL])
 
-        # Reshape to multi-head: (N_PATCHES, T, N_HEADS, D_HEAD)
-        q_mh = q.view(N_PATCHES, T, N_HEADS, D_HEAD)
-        k_mh = k.view(N_PATCHES, T, N_HEADS, D_HEAD)
-        v_mh = v.view(N_PATCHES, T, N_HEADS, D_HEAD)
+        # Apply temporal RoPE on device
+        fused_rope_kernel(q, q_swap, dev["temporal_cos"], dev["temporal_sin_perm"], scr["q_roped"])
+        fused_rope_kernel(k, k_swap, dev["temporal_cos"], dev["temporal_sin_perm"], scr["k_roped"])
 
-        # Apply temporal RoPE: freqs are per-timestep
-        t_freqs = TEMPORAL_ROPE_FREQS[:T].unsqueeze(1)  # (T, 1, 64) broadcast over heads
-        q_mh = apply_rotary_emb(t_freqs.unsqueeze(0), q_mh)  # broadcast over N_PATCHES
-        k_mh = apply_rotary_emb(t_freqs.unsqueeze(0), k_mh)
+        # Reshape for temporal SDPA: batch over (patch, head) pairs
+        # (SEQ, D_MODEL) = (T*N_PATCH_PAD, N_HEADS*D_HEAD)
+        # → (T, N_PATCH_PAD*N_HEADS, D_HEAD) → permute → (N_PATCH_PAD*N_HEADS, T, D_HEAD)
+        # → reshape → (N_PATCH_PAD*N_HEADS, 1, T, D_HEAD) for SDPA
+        BATCH = N_PATCH_PAD * N_HEADS
+        q_t = ttnn.reshape(scr["q_roped"], [T, BATCH, D_HEAD])
+        q_t = ttnn.permute(q_t, [1, 0, 2])
+        q_t = ttnn.reshape(q_t, [BATCH, 1, T, D_HEAD])
+        k_t = ttnn.reshape(scr["k_roped"], [T, BATCH, D_HEAD])
+        k_t = ttnn.permute(k_t, [1, 0, 2])
+        k_t = ttnn.reshape(k_t, [BATCH, 1, T, D_HEAD])
+        v_t = ttnn.reshape(v, [T, BATCH, D_HEAD])
+        v_t = ttnn.permute(v_t, [1, 0, 2])
+        v_t = ttnn.reshape(v_t, [BATCH, 1, T, D_HEAD])
 
-        # Reshape to SDPA format: (N_PATCHES, heads, T, d_head)
-        q_sdpa = q_mh.permute(0, 2, 1, 3).to(torch.bfloat16)
-        k_sdpa = k_mh.permute(0, 2, 1, 3).to(torch.bfloat16)
-        v_sdpa = v_mh.permute(0, 2, 1, 3).to(torch.bfloat16)
+        # Device SDPA with causal mask (T=2 internally padded to 32 by tile layout)
+        attn_out = ttnn.transformer.scaled_dot_product_attention(q_t, k_t, v_t, is_causal=True)
 
-        # Pad N_PATCHES -> N_PATCH_PAD in batch dim for tile alignment
-        q_sdpa = F.pad(q_sdpa, [0, 0, 0, 0, 0, 0, 0, N_PATCH_PAD - N_PATCHES])
-        k_sdpa = F.pad(k_sdpa, [0, 0, 0, 0, 0, 0, 0, N_PATCH_PAD - N_PATCHES])
-        v_sdpa = F.pad(v_sdpa, [0, 0, 0, 0, 0, 0, 0, N_PATCH_PAD - N_PATCHES])
-
-        # T=2 is not tile-aligned (needs 32). For small T, do SDPA on host CPU
-        attn_host = F.scaled_dot_product_attention(
-            q_sdpa.float(), k_sdpa.float(), v_sdpa.float(), is_causal=True
-        )  # (N_PATCH_PAD, heads, T, d_head)
-
-        # Reshape back to (SEQ, D_MODEL): permute to (N_PATCH_PAD, T, heads, d_head)
-        attn_host = attn_host.permute(0, 2, 1, 3)  # (N_PATCH_PAD, T, heads, d_head)
-        attn_host = attn_host.reshape(N_PATCH_PAD, T, D_MODEL)
-        # Interleave frames: frame0 rows then frame1 rows
-        attn_2d_host = torch.zeros(SEQ, D_MODEL, dtype=torch.bfloat16)
-        for t_idx in range(T):
-            attn_2d_host[t_idx * N_PATCH_PAD:(t_idx + 1) * N_PATCH_PAD] = \
-                attn_host[:, t_idx].to(torch.bfloat16)
-        attn_2d = to_tt(attn_2d_host, tt_device)
+        # Reshape back: (BATCH, 1, T, D_HEAD) → (BATCH, T, D_HEAD) → (T, BATCH, D_HEAD) → (SEQ, D_MODEL)
+        attn_out = ttnn.reshape(attn_out, [BATCH, T, D_HEAD])
+        attn_out = ttnn.permute(attn_out, [1, 0, 2])
+        attn_2d = ttnn.reshape(attn_out, [SEQ, D_MODEL])
         _timer.mark("sdpa")
 
     # O projection + bias + gated residual
