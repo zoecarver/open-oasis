@@ -1220,23 +1220,20 @@ def run_sub_block(prefix, x_tt, cond_list, dev, scr, tt_device, scaler, mean_sca
         build_per_frame_adaln(cond_list, prefix, dev, scr, tt_device)
     _timer.mark("adaln")
 
-    # Fused LayerNorm + adaLN modulate -> QKV
+    # Fused LayerNorm + adaLN modulate -> combined QKV + QK_swap via ttnn.matmul
     fused_ln_adaln_d1024(x_tt, scaler, mean_scale, shift_msa, scale_msa, scr["modulated"])
     _timer.mark("norm+mod")
-    linear_k32(scr["modulated"], dev["%s.qkv_w" % prefix], scr["qkv"])
+    qkv_full = ttnn.matmul(scr["modulated"], dev["%s.qkv_full_w" % prefix])
     _timer.mark("qkv")
 
-    if attn_type == "spatial":
-        # All-device spatial attention: RoPE + SDPA without host round-trip
-        # Slice Q, K, V from QKV on device
-        q = ttnn.slice(scr["qkv"], [0, 0], [SEQ, D_MODEL])
-        k = ttnn.slice(scr["qkv"], [0, D_MODEL], [SEQ, 2 * D_MODEL])
-        v = ttnn.slice(scr["qkv"], [0, 2 * D_MODEL], [SEQ, 3 * D_MODEL])
+    # Slice Q, K, V, Q_swap, K_swap from combined (SEQ, 5*D_MODEL) output
+    q = ttnn.slice(qkv_full, [0, 0], [SEQ, D_MODEL])
+    k = ttnn.slice(qkv_full, [0, D_MODEL], [SEQ, 2 * D_MODEL])
+    v = ttnn.slice(qkv_full, [0, 2 * D_MODEL], [SEQ, 3 * D_MODEL])
+    q_swap = ttnn.slice(qkv_full, [0, 3 * D_MODEL], [SEQ, 4 * D_MODEL])
+    k_swap = ttnn.slice(qkv_full, [0, 4 * D_MODEL], [SEQ, 5 * D_MODEL])
 
-        # Compute pair-swapped Q/K projections for rotate_half
-        qk_swap = ttnn.matmul(scr["modulated"], dev["%s.qk_swap_w" % prefix])
-        q_swap = ttnn.slice(qk_swap, [0, 0], [SEQ, D_MODEL])
-        k_swap = ttnn.slice(qk_swap, [0, D_MODEL], [SEQ, 2 * D_MODEL])
+    if attn_type == "spatial":
 
         # Apply spatial RoPE: q_roped = q * cos + q_swap * sin_perm
         fused_rope_kernel(q, q_swap, dev["spatial_cos"], dev["spatial_sin_perm"], scr["q_roped"])
