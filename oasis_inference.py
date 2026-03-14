@@ -594,24 +594,32 @@ def gated_residual_kernel(residual, x, gate, out):
 N_PATCH_PAD_TILES = N_PATCH_PAD // TILE  # 5
 D_HEAD_TILES = D_HEAD // TILE  # 2
 
-def make_spatial_sdpa_full_kernel(seq_tiles, head_tiles, n_heads_val, scale_val):
-    """TT-Lang spatial SDPA that reads/writes (SEQ, D_MODEL) layout directly.
-    Q, K, V: (T*N_PATCH_PAD, N_HEADS*D_HEAD) - standard activation format.
-    DM threads extract per-head slices and scatter results back.
-    Eliminates all ttnn reshape/permute around SDPA."""
-    d_tiles = n_heads_val * head_tiles  # total columns in tiles
+def make_rope_sdpa_kernel(seq_tiles, head_tiles, n_heads_val, scale_val):
+    """Fused RoPE + SDPA kernel. Reads raw Q/K/V + cos/sin tables in (SEQ, D_MODEL)
+    layout, applies RoPE to Q and K, then computes spatial SDPA per head.
+    Eliminates separate RoPE kernel calls and all reshape/permute ops."""
     @ttl.kernel(grid="auto")
-    def spatial_sdpa_full(Q, K, V, scaler, out):
+    def rope_sdpa(Q, Q_swap, K, K_swap, V, cos_tab, sin_tab, scaler, out):
         grid_cols, _ = ttl.grid_size(dims=2)
         n_frames = Q.shape[0] // TILE // seq_tiles
         total_heads = n_frames * n_heads_val
         heads_per_core = -(-total_heads // grid_cols)
 
+        # Input DFBs from DRAM
         q_dfb = ttl.make_dataflow_buffer_like(Q, shape=(seq_tiles, head_tiles), buffer_factor=2)
+        qs_dfb = ttl.make_dataflow_buffer_like(Q_swap, shape=(seq_tiles, head_tiles), buffer_factor=2)
         k_dfb = ttl.make_dataflow_buffer_like(K, shape=(seq_tiles, head_tiles), buffer_factor=2)
+        ks_dfb = ttl.make_dataflow_buffer_like(K_swap, shape=(seq_tiles, head_tiles), buffer_factor=2)
         v_dfb = ttl.make_dataflow_buffer_like(V, shape=(seq_tiles, head_tiles), buffer_factor=2)
+        cos_dfb = ttl.make_dataflow_buffer_like(cos_tab, shape=(seq_tiles, head_tiles), buffer_factor=2)
+        sin_dfb = ttl.make_dataflow_buffer_like(sin_tab, shape=(seq_tiles, head_tiles), buffer_factor=2)
         scaler_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
 
+        # RoPE intermediate DFBs
+        qr_dfb = ttl.make_dataflow_buffer_like(Q, shape=(seq_tiles, head_tiles), buffer_factor=2)
+        kr_dfb = ttl.make_dataflow_buffer_like(K, shape=(seq_tiles, head_tiles), buffer_factor=2)
+
+        # SDPA DFBs
         kt_dfb = ttl.make_dataflow_buffer_like(K, shape=(head_tiles, seq_tiles), buffer_factor=2)
         a_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(seq_tiles, seq_tiles), buffer_factor=2)
         b_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(seq_tiles, seq_tiles), buffer_factor=2)
@@ -626,30 +634,37 @@ def make_spatial_sdpa_full_kernel(seq_tiles, head_tiles, n_heads_val, scale_val)
             for local_h in range(heads_per_core):
                 head_idx = core_x * heads_per_core + local_h
                 if head_idx < total_heads:
-                    with q_dfb.wait() as qv, k_dfb.wait() as kv, v_dfb.wait() as vv, scaler_dfb.wait() as sc:
-                        with kt_dfb.reserve() as kt:
-                            kt.store(ttl.transpose(kv))
-                        with kt_dfb.wait() as ktv, a_dfb.reserve() as qk:
-                            qk.store(qv @ ktv)
-                        with a_dfb.wait() as qkv, b_dfb.reserve() as scaled:
-                            scaled.store(qkv * ttl.math.fill(qkv, scale_val))
-                        with b_dfb.wait() as sdv:
-                            with row_dfb.reserve() as mx:
-                                mx.store(ttl.math.reduce_max(sdv, sc, dims=[1]))
-                            with row_dfb.wait() as mxv, row_bc_dfb.reserve() as mxb:
-                                mxb.store(ttl.math.broadcast(mxv, dims=[1]))
-                            with row_bc_dfb.wait() as mxbv:
-                                with a_dfb.reserve() as ex:
-                                    ex.store(ttl.math.exp(sdv - mxbv))
-                            with a_dfb.wait() as exv:
-                                with row_dfb.reserve() as sm:
-                                    sm.store(ttl.math.reduce_sum(exv, sc, dims=[1]))
-                                with row_dfb.wait() as smv, row_bc_dfb.reserve() as smb:
-                                    smb.store(ttl.math.broadcast(smv, dims=[1]))
-                                with row_bc_dfb.wait() as smbv, c_dfb.reserve() as attn:
-                                    attn.store(exv * ttl.math.recip(smbv))
-                        with c_dfb.wait() as av, out_dfb.reserve() as o:
-                            o.store(av @ vv)
+                    with cos_dfb.wait() as cv, sin_dfb.wait() as sv, v_dfb.wait() as vv, scaler_dfb.wait() as sc:
+                        # RoPE: q_roped = q * cos + q_swap * sin
+                        with q_dfb.wait() as q, qs_dfb.wait() as qs, qr_dfb.reserve() as qr:
+                            qr.store(q * cv + qs * sv)
+                        with k_dfb.wait() as k, ks_dfb.wait() as ks, kr_dfb.reserve() as kr:
+                            kr.store(k * cv + ks * sv)
+                        # SDPA on roped Q, K and raw V
+                        with qr_dfb.wait() as qrv, kr_dfb.wait() as krv:
+                            with kt_dfb.reserve() as kt:
+                                kt.store(ttl.transpose(krv))
+                            with kt_dfb.wait() as ktv, a_dfb.reserve() as qk:
+                                qk.store(qrv @ ktv)
+                            with a_dfb.wait() as qkv, b_dfb.reserve() as scaled:
+                                scaled.store(qkv * ttl.math.fill(qkv, scale_val))
+                            with b_dfb.wait() as sdv:
+                                with row_dfb.reserve() as mx:
+                                    mx.store(ttl.math.reduce_max(sdv, sc, dims=[1]))
+                                with row_dfb.wait() as mxv, row_bc_dfb.reserve() as mxb:
+                                    mxb.store(ttl.math.broadcast(mxv, dims=[1]))
+                                with row_bc_dfb.wait() as mxbv:
+                                    with a_dfb.reserve() as ex:
+                                        ex.store(ttl.math.exp(sdv - mxbv))
+                                with a_dfb.wait() as exv:
+                                    with row_dfb.reserve() as sm:
+                                        sm.store(ttl.math.reduce_sum(exv, sc, dims=[1]))
+                                    with row_dfb.wait() as smv, row_bc_dfb.reserve() as smb:
+                                        smb.store(ttl.math.broadcast(smv, dims=[1]))
+                                    with row_bc_dfb.wait() as smbv, c_dfb.reserve() as attn:
+                                        attn.store(exv * ttl.math.recip(smbv))
+                            with c_dfb.wait() as av, out_dfb.reserve() as o:
+                                o.store(av @ vv)
 
         @ttl.datamovement()
         def dm_read():
@@ -663,10 +678,18 @@ def make_spatial_sdpa_full_kernel(seq_tiles, head_tiles, n_heads_val, scale_val)
                     col_start = h * head_tiles
                     with q_dfb.reserve() as blk:
                         tx = ttl.copy(Q[row_start:row_start + seq_tiles, col_start:col_start + head_tiles], blk); tx.wait()
+                    with qs_dfb.reserve() as blk:
+                        tx = ttl.copy(Q_swap[row_start:row_start + seq_tiles, col_start:col_start + head_tiles], blk); tx.wait()
                     with k_dfb.reserve() as blk:
                         tx = ttl.copy(K[row_start:row_start + seq_tiles, col_start:col_start + head_tiles], blk); tx.wait()
+                    with ks_dfb.reserve() as blk:
+                        tx = ttl.copy(K_swap[row_start:row_start + seq_tiles, col_start:col_start + head_tiles], blk); tx.wait()
                     with v_dfb.reserve() as blk:
                         tx = ttl.copy(V[row_start:row_start + seq_tiles, col_start:col_start + head_tiles], blk); tx.wait()
+                    with cos_dfb.reserve() as blk:
+                        tx = ttl.copy(cos_tab[row_start:row_start + seq_tiles, col_start:col_start + head_tiles], blk); tx.wait()
+                    with sin_dfb.reserve() as blk:
+                        tx = ttl.copy(sin_tab[row_start:row_start + seq_tiles, col_start:col_start + head_tiles], blk); tx.wait()
                     with scaler_dfb.reserve() as blk:
                         tx = ttl.copy(scaler[0, 0], blk); tx.wait()
 
@@ -683,9 +706,9 @@ def make_spatial_sdpa_full_kernel(seq_tiles, head_tiles, n_heads_val, scale_val)
                     with out_dfb.wait() as blk:
                         tx = ttl.copy(blk, out[row_start:row_start + seq_tiles, col_start:col_start + head_tiles]); tx.wait()
 
-    return spatial_sdpa_full
+    return rope_sdpa
 
-spatial_sdpa_kernel = make_spatial_sdpa_full_kernel(N_PATCH_PAD_TILES, D_HEAD_TILES, N_HEADS, 0.125)
+rope_sdpa_kernel = make_rope_sdpa_kernel(N_PATCH_PAD_TILES, D_HEAD_TILES, N_HEADS, 0.125)
 
 def make_fused_ln_adaln_kernel(dim_tiles):
     """Fused LayerNorm + adaLN modulate: out = layernorm(x) * (1 + scale) + shift.
@@ -1338,12 +1361,10 @@ def run_sub_block(prefix, x_tt, cond_list, dev, scr, tt_device, scaler, mean_sca
 
     if attn_type == "spatial":
 
-        # Apply spatial RoPE: q_roped = q * cos + q_swap * sin_perm
-        fused_rope_kernel(q, q_swap, dev["spatial_cos"], dev["spatial_sin_perm"], scr["q_roped"])
-        fused_rope_kernel(k, k_swap, dev["spatial_cos"], dev["spatial_sin_perm"], scr["k_roped"])
-
-        # TT-Lang SDPA reads/writes (SEQ, D_MODEL) directly, no reshape needed
-        spatial_sdpa_kernel(scr["q_roped"], scr["k_roped"], v, scaler, scr["sdpa_out"])
+        # Fused RoPE + SDPA: applies RoPE to Q/K then SDPA, all in one kernel
+        rope_sdpa_kernel(q, q_swap, k, k_swap, v,
+                         dev["spatial_cos"], dev["spatial_sin_perm"],
+                         scaler, scr["sdpa_out"])
         attn_2d = scr["sdpa_out"]
         _timer.mark("sdpa")
 
