@@ -1880,6 +1880,10 @@ def prealloc_scratch(tt_device, n_frames=2):
     s["final_adaln"] = zeros_tt((TILE, 2 * D_MODEL), tt_device)
     s["final_out"] = zeros_tt((SEQ, OUT_DIM), tt_device)
     s["n_frames"] = n_frames
+    # DDIM arithmetic scratch (N_PATCH_PAD, OUT_DIM)
+    s["ddim_x_start"] = zeros_tt((N_PATCH_PAD, OUT_DIM), tt_device)
+    s["ddim_x_noise"] = zeros_tt((N_PATCH_PAD, OUT_DIM), tt_device)
+    s["ddim_tmp"] = zeros_tt((N_PATCH_PAD, OUT_DIM), tt_device)
     elapsed = time.time() - t0
     print("Pre-allocated %d scratch tensors (T=%d) in %.1fs" % (len(s) - 1, n_frames, elapsed))
     return s
@@ -1991,6 +1995,9 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
         _t1 = _dt.time(); print("      %s norm+mod: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
 
     # Hybrid: ttnn.matmul for QKV (72-core parallel), TT-Lang for RoPE+SDPA
+    # NOTE: mega_qkv_rope_sdpa fuses QKV+RoPE+SDPA into one kernel but only uses
+    # 32 cores for K-accumulation matmul. ttnn.matmul uses all 72 cores (30x faster).
+    # To restore fused version: mega_qkv_rope_sdpa(scr["modulated"], qkv_w, cos, sin, scaler, out)
     ttnn.matmul(scr["modulated"], dev["%s.qkv_full_w" % prefix],
                 optional_output_tensor=scr["qkv_full"])
     if _do_dev_profile:
@@ -2032,6 +2039,11 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
         _t1 = _dt.time(); print("      %s rope+sdpa: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
 
     # Separate ops: ttnn.matmul for large matmuls, TT-Lang for fused elementwise
+    # NOTE: mega_post_attn_kernel fuses O proj+LN+FC1+GELU+FC2+residual but only uses
+    # 10 cores (per-row). ttnn.matmul on 72 cores is 7x faster for the matmuls.
+    # To restore fused version: mega_post_attn_kernel(attn_2d, x_tt, adaln_packed,
+    #   out_w, out_b, fc1_w, fc1_b, fc2_w, fc2_b, scaler, mean_scale,
+    #   z_scratch, gelu_scratch, z_a)
     # Phase A: O proj + bias + gated residual
     ttnn.matmul(attn_2d, dev["%s.out_w" % prefix], optional_output_tensor=scr["o_proj"])
     ttnn.add(scr["o_proj"], dev["%s.out_b" % prefix], output_tensor=scr["o_proj"])
@@ -2341,15 +2353,18 @@ if __name__ == "__main__":
 
             v_dev = ttnn.slice(final_out, [N_PATCH_PAD, 0], [2 * N_PATCH_PAD, OUT_DIM])
             coeffs = ddim_coeffs[noise_idx]
-            x_start = ttnn.subtract(
-                ttnn.multiply(chunk, coeffs["at_sqrt"]),
-                ttnn.multiply(v_dev, coeffs["1mat_sqrt"]))
-            x_noise = ttnn.multiply(
-                ttnn.subtract(ttnn.multiply(chunk, coeffs["inv_at_sqrt"]), x_start),
-                coeffs["inv_sigma"])
-            chunk = ttnn.add(
-                ttnn.multiply(x_start, coeffs["an_sqrt"]),
-                ttnn.multiply(x_noise, coeffs["1man_sqrt"]))
+            # x_start = at_sqrt * chunk - (1-at)_sqrt * v
+            ttnn.multiply(chunk, coeffs["at_sqrt"], output_tensor=scr["ddim_tmp"])
+            ttnn.multiply(v_dev, coeffs["1mat_sqrt"], output_tensor=scr["ddim_x_start"])
+            ttnn.subtract(scr["ddim_tmp"], scr["ddim_x_start"], output_tensor=scr["ddim_x_start"])
+            # x_noise = (inv_at_sqrt * chunk - x_start) / sigma
+            ttnn.multiply(chunk, coeffs["inv_at_sqrt"], output_tensor=scr["ddim_tmp"])
+            ttnn.subtract(scr["ddim_tmp"], scr["ddim_x_start"], output_tensor=scr["ddim_x_noise"])
+            ttnn.multiply(scr["ddim_x_noise"], coeffs["inv_sigma"], output_tensor=scr["ddim_x_noise"])
+            # chunk = an_sqrt * x_start + (1-an)_sqrt * x_noise
+            ttnn.multiply(scr["ddim_x_start"], coeffs["an_sqrt"], output_tensor=scr["ddim_tmp"])
+            ttnn.multiply(scr["ddim_x_noise"], coeffs["1man_sqrt"], output_tensor=scr["ddim_x_noise"])
+            ttnn.add(scr["ddim_tmp"], scr["ddim_x_noise"], output_tensor=chunk)
 
             if profile:
                 ttnn.synchronize_device(tt_device)
