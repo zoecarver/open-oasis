@@ -2007,16 +2007,44 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
         ttnn.synchronize_device(tt_device)
         _t1 = _dt.time(); print("      %s attn: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
 
-    mega_post_attn_kernel(attn_2d, x_tt, adaln_packed,
-                          dev["%s.out_w" % prefix], dev["%s.out_b" % prefix],
-                          dev["%s.fc1_w" % prefix], dev["%s.fc1_b" % prefix],
-                          dev["%s.fc2_w" % prefix], dev["%s.fc2_b" % prefix],
-                          scaler, mean_scale,
-                          scr["z_scratch"], scr["gelu_scratch"], scr["z_a"])
+    # Separate ops instead of mega_post_attn (ttnn.matmul uses multi-core parallelism)
+    # Phase A: O proj + bias + gated residual
+    o_proj = ttnn.matmul(attn_2d, dev["%s.out_w" % prefix])
+    ttnn.add(o_proj, dev["%s.out_b" % prefix], output_tensor=o_proj)
+    # gate_msa is at columns 2*D_TILES in packed adaln
+    gate_msa = ttnn.slice(adaln_packed, [0, 2 * D_MODEL], [SEQ, 3 * D_MODEL])
+    gated_residual_kernel(x_tt, o_proj, gate_msa, scr["z_scratch"])
+    if _do_dev_profile:
+        ttnn.synchronize_device(tt_device)
+        _t1 = _dt.time(); print("      %s o_proj+res: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
+
+    # Phase B: LN + modulate (separate ops, shift/scale from packed cols 3D-5D)
+    shift_mlp = ttnn.slice(adaln_packed, [0, 3 * D_MODEL], [SEQ, 4 * D_MODEL])
+    scale_mlp = ttnn.slice(adaln_packed, [0, 4 * D_MODEL], [SEQ, 5 * D_MODEL])
+    layernorm_d1024(scr["z_scratch"], dev["ln_w_ones"], dev["ln_b_zeros"], scaler, mean_scale, scr["normed"])
+    adaln_modulate_kernel(scr["normed"], shift_mlp, scale_mlp, scr["modulated"])
+    if _do_dev_profile:
+        ttnn.synchronize_device(tt_device)
+        _t1 = _dt.time(); print("      %s ln+mod: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
+
+    # Phase C: FC1 + bias + GELU (ttnn.matmul for speed)
+    fc1_out = ttnn.matmul(scr["modulated"], dev["%s.fc1_w" % prefix])
+    ttnn.add(fc1_out, dev["%s.fc1_b" % prefix], output_tensor=fc1_out)
+    # GELU approximation via ttnn
+    fc1_gelu = ttnn.gelu(fc1_out)
+    if _do_dev_profile:
+        ttnn.synchronize_device(tt_device)
+        _t1 = _dt.time(); print("      %s fc1+gelu: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
+
+    # Phase D: FC2 + bias + gated residual
+    fc2_out = ttnn.matmul(fc1_gelu, dev["%s.fc2_w" % prefix])
+    ttnn.add(fc2_out, dev["%s.fc2_b" % prefix], output_tensor=fc2_out)
+    gate_mlp = ttnn.slice(adaln_packed, [0, 5 * D_MODEL], [SEQ, 6 * D_MODEL])
+    gated_residual_kernel(scr["z_scratch"], fc2_out, gate_mlp, scr["z_a"])
     _timer.mark("post_attn")
     if _do_dev_profile:
         ttnn.synchronize_device(tt_device)
-        _t1 = _dt.time(); print("      %s post_attn: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
+        _t1 = _dt.time(); print("      %s fc2+res: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
 
     _timer.report(prefix, attn_type)
     return scr["z_a"]
