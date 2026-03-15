@@ -1708,6 +1708,12 @@ fused_gated_res_ln_adaln_d1024 = make_fused_gated_res_ln_adaln_kernel(D_TILES)  
 # Pipe-based version: 40-core (8 D-cores x 5 SEQ-cores) with gather+scatter
 from pipe_fused_ln import make_pipe_fused_gated_res_ln_adaln
 pipe_fused_gated_res_ln_adaln_d1024 = make_pipe_fused_gated_res_ln_adaln(D_TILES, 8, N_PATCH_PAD // TILE)
+# Fused adaLN params: matmul + bias + expand in one kernel (replaces ~10 ttnn ops)
+from adaln_matmul_expand import make_adaln_matmul_expand_kernel
+adaln_matmul_expand_kernel = make_adaln_matmul_expand_kernel(D_TILES, N_PATCH_PAD // TILE)
+# Fused RoPE + layout transform: eliminates 5 slices + 2 RoPE + 9 reshape/permute
+from rope_layout_kernel import make_rope_layout_kernel
+rope_layout_spatial = make_rope_layout_kernel(N_PATCH_PAD // TILE, D_HEAD // TILE, N_HEADS)
 
 # Compute kernel configs (following tt-metal DiT patterns)
 # Initialized lazily after device is opened (need device.arch())
@@ -2047,7 +2053,7 @@ def prealloc_scratch(tt_device, n_frames=2):
     s["t_emb_b"] = zeros_tt((TILE, D_MODEL), tt_device)
     s["cond"] = zeros_tt((TILE, D_MODEL), tt_device)
     # adaLN scratch
-    s["adaln_out"] = zeros_tt((TILE, 6 * D_MODEL), tt_device)
+    s["adaln_out"] = to_tt_l1(torch.zeros(TILE, 6 * D_MODEL, dtype=torch.bfloat16), tt_device)
     s["silu_cond"] = zeros_tt((TILE, D_MODEL), tt_device)
     # Packed adaln: (SEQ, 6*D_MODEL) reused across blocks
     s["adaln_packed"] = zeros_tt((SEQ, 6 * D_MODEL), tt_device)
@@ -2057,6 +2063,12 @@ def prealloc_scratch(tt_device, n_frames=2):
     # RoPE scratch (reused for spatial and temporal)
     s["q_roped"] = zeros_tt((SEQ, D_MODEL), tt_device)
     s["k_roped"] = zeros_tt((SEQ, D_MODEL), tt_device)
+    # SDPA-format scratch for fused RoPE+layout kernel (spatial)
+    # Stored as 2D: (BATCH_S * N_PATCH_PAD, D_HEAD), reshaped to 4D for SDPA
+    BATCH_S = n_frames * N_HEADS
+    s["q_sdpa"] = zeros_tt((BATCH_S * N_PATCH_PAD, D_HEAD), tt_device)
+    s["k_sdpa"] = zeros_tt((BATCH_S * N_PATCH_PAD, D_HEAD), tt_device)
+    s["v_sdpa"] = zeros_tt((BATCH_S * N_PATCH_PAD, D_HEAD), tt_device)
     # Temporal mega kernel scratch (Q/K roped + V)
     s["t_q_scratch"] = zeros_tt((SEQ, D_MODEL), tt_device)
     s["t_k_scratch"] = zeros_tt((SEQ, D_MODEL), tt_device)
@@ -2117,16 +2129,13 @@ def build_per_frame_adaln(silu_cond_list, prefix, dev, scr, tt_device):
 
     per_frame_expanded = []
     for silu_cond in silu_cond_list:
-        # Linear(1024, 6144) -> reuse scratch for matmul+add
         ttnn.matmul(silu_cond, dev["%s.adaln_w" % prefix],
                     optional_output_tensor=scr["adaln_out"])
         ttnn.add(scr["adaln_out"], dev["%s.adaln_b" % prefix],
                  output_tensor=scr["adaln_out"])
-        # Expand to (N_PATCH_PAD, 6*D_MODEL) - concat allocates but matmul/add reuse scratch
         expanded = ttnn.concat([scr["adaln_out"]] * N_REPEAT, dim=0)
         per_frame_expanded.append(expanded)
 
-    # Combine frames: (SEQ, 6*D_MODEL)
     if T == 1:
         return per_frame_expanded[0]
     else:
@@ -2197,41 +2206,31 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
         ttnn.synchronize_device(tt_device)
         _t1 = _dt.time(); print("      %s qkv_matmul: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
 
-    # Slice Q/K/V/Q_swap/K_swap, apply RoPE, then ttnn SDPA (f32 accumulation)
-    # TODO: investigate bf16 accumulation in rope_sdpa_kernel (TT-Lang) - it causes
-    # quality degradation over 320 attention passes. ttnn SDPA uses f32 accumulation.
-    # Replaced: rope_sdpa_kernel(qkv_full, cos, sin, scaler, out)
-    q = ttnn.slice(scr["qkv_full"], [0, 0], [SEQ, D_MODEL])
-    k = ttnn.slice(scr["qkv_full"], [0, D_MODEL], [SEQ, 2 * D_MODEL])
-    v = ttnn.slice(scr["qkv_full"], [0, 2 * D_MODEL], [SEQ, 3 * D_MODEL])
-    q_swap = ttnn.slice(scr["qkv_full"], [0, 3 * D_MODEL], [SEQ, 4 * D_MODEL])
-    k_swap = ttnn.slice(scr["qkv_full"], [0, 4 * D_MODEL], [SEQ, 5 * D_MODEL])
-
     if attn_type == "spatial":
         cos_key, sin_key = "spatial_cos", "spatial_sin_perm"
-    else:
-        cos_key, sin_key = "temporal_cos", "temporal_sin_perm"
-    fused_rope_kernel(q, q_swap, dev[cos_key], dev[sin_key], scr["q_roped"])
-    fused_rope_kernel(k, k_swap, dev[cos_key], dev[sin_key], scr["k_roped"])
-
-    if attn_type == "spatial":
-        # Spatial: each frame attends within itself, batch over (frame, head)
+        # Fused RoPE + layout: reads qkv_full, writes Q,K,V in SDPA format directly
+        rope_layout_spatial(scr["qkv_full"], dev[cos_key], dev[sin_key],
+                           scr["q_sdpa"], scr["k_sdpa"], scr["v_sdpa"])
         BATCH_S = T * N_HEADS
-        q_s = ttnn.reshape(scr["q_roped"], [T, N_PATCH_PAD, N_HEADS, D_HEAD])
-        q_s = ttnn.permute(q_s, [0, 2, 1, 3])
-        q_s = ttnn.reshape(q_s, [BATCH_S, 1, N_PATCH_PAD, D_HEAD])
-        k_s = ttnn.reshape(scr["k_roped"], [T, N_PATCH_PAD, N_HEADS, D_HEAD])
-        k_s = ttnn.permute(k_s, [0, 2, 1, 3])
-        k_s = ttnn.reshape(k_s, [BATCH_S, 1, N_PATCH_PAD, D_HEAD])
-        v_s = ttnn.reshape(v, [T, N_PATCH_PAD, N_HEADS, D_HEAD])
-        v_s = ttnn.permute(v_s, [0, 2, 1, 3])
-        v_s = ttnn.reshape(v_s, [BATCH_S, 1, N_PATCH_PAD, D_HEAD])
+        # Already in (BATCH_S * N_PATCH_PAD, D_HEAD) layout, just reshape for SDPA
+        q_s = ttnn.reshape(scr["q_sdpa"], [BATCH_S, 1, N_PATCH_PAD, D_HEAD])
+        k_s = ttnn.reshape(scr["k_sdpa"], [BATCH_S, 1, N_PATCH_PAD, D_HEAD])
+        v_s = ttnn.reshape(scr["v_sdpa"], [BATCH_S, 1, N_PATCH_PAD, D_HEAD])
         attn_out = ttnn.transformer.scaled_dot_product_attention(q_s, k_s, v_s, is_causal=False)
         attn_out = ttnn.reshape(attn_out, [T, N_HEADS, N_PATCH_PAD, D_HEAD])
         attn_out = ttnn.permute(attn_out, [0, 2, 1, 3])
         attn_2d = ttnn.reshape(attn_out, [SEQ, D_MODEL])
         _timer.mark("qkv+sdpa")
     else:
+        # Temporal: slice + RoPE + reshape (TODO: fuse like spatial)
+        cos_key, sin_key = "temporal_cos", "temporal_sin_perm"
+        q = ttnn.slice(scr["qkv_full"], [0, 0], [SEQ, D_MODEL])
+        k = ttnn.slice(scr["qkv_full"], [0, D_MODEL], [SEQ, 2 * D_MODEL])
+        v = ttnn.slice(scr["qkv_full"], [0, 2 * D_MODEL], [SEQ, 3 * D_MODEL])
+        q_swap = ttnn.slice(scr["qkv_full"], [0, 3 * D_MODEL], [SEQ, 4 * D_MODEL])
+        k_swap = ttnn.slice(scr["qkv_full"], [0, 4 * D_MODEL], [SEQ, 5 * D_MODEL])
+        fused_rope_kernel(q, q_swap, dev[cos_key], dev[sin_key], scr["q_roped"])
+        fused_rope_kernel(k, k_swap, dev[cos_key], dev[sin_key], scr["k_roped"])
         # Temporal: each patch attends across frames, batch over (patch, head)
         BATCH_T = N_PATCH_PAD * N_HEADS
         q_t = ttnn.reshape(scr["q_roped"], [T, BATCH_T, D_HEAD])
