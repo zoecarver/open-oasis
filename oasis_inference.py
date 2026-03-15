@@ -2276,7 +2276,7 @@ if __name__ == "__main__":
 
     # Diffusion schedule
     max_noise_level = 1000
-    ddim_steps = 5
+    ddim_steps = 10
     noise_range = torch.linspace(-1, max_noise_level - 1, ddim_steps + 1)
     noise_abs_max = 20
     stabilization_level = 15
@@ -2403,37 +2403,66 @@ if __name__ == "__main__":
     print("\n=== WARMUP (compiling kernels) ===")
     _ = run_ddim_loop(chunk_dev, "Warmup")
 
-    # Reset chunk for real measurement
-    chunk_dev = to_tt(chunk_pad, tt_device)
+    # === Generate 30-frame video ===
+    # Following reference: autoregressive in latent space. Generated frame's latent
+    # feeds directly as prompt for next frame (no VAE decode/re-encode between frames).
+    # VAE decode happens once at the end for all frames.
+    N_VIDEO_FRAMES = 30
+    print("\n=== GENERATING %d-FRAME VIDEO ===" % N_VIDEO_FRAMES)
+    t_video_start = time.time()
 
-    # Measured frame (no compilation)
-    print("\n=== MEASURED FRAME (no compilation, per-step sync) ===")
-    chunk_dev = run_ddim_loop(chunk_dev, "Measured", profile=True)
+    # Collect all latents for batch VAE decode at the end
+    all_latents = [prompt_latent[0, 0].clone()]  # frame 0 = prompt
 
-    # Speed run (no sync between steps, true throughput)
-    chunk_dev2 = to_tt(chunk_pad, tt_device)
-    print("\n=== SPEED RUN (no per-step sync) ===")
-    _ = run_ddim_loop(chunk_dev2, "Speed")
+    for frame_idx in range(1, N_VIDEO_FRAMES):
+        t_frame = time.time()
 
-    # Final readback
-    chunk_host = ttnn.to_torch(chunk_dev)[:N_PATCHES].float()  # (144, 64)
-    chunk_img = unpatchify_host(chunk_host, PATCH_SIZE, IN_CHANNELS, FRAME_H, FRAME_W)
-    print("Final latent range: [%.2f, %.2f]" % (chunk_img.min().item(), chunk_img.max().item()))
+        # Fresh noise for generated frame (in output space on device)
+        chunk_img = torch.randn(1, IN_CHANNELS, INPUT_H, INPUT_W)
+        chunk_img = torch.clamp(chunk_img, -noise_abs_max, noise_abs_max)
+        chunk_patches = patchify_to_output_space(chunk_img)
+        chunk_pad_f = torch.zeros(N_PATCH_PAD, OUT_DIM, dtype=torch.bfloat16)
+        chunk_pad_f[:N_PATCHES] = chunk_patches.to(torch.bfloat16)
+        chunk_dev = to_tt(chunk_pad_f, tt_device)
 
-    # VAE decode the generated frame
-    print("\nRunning VAE decode...")
+        # DDIM denoise
+        chunk_dev = run_ddim_loop(chunk_dev, "Frame %d" % frame_idx)
+
+        # Readback generated latent (output space -> image space)
+        chunk_host = ttnn.to_torch(chunk_dev)[:N_PATCHES].float()
+        gen_latent = unpatchify_host(chunk_host, PATCH_SIZE, IN_CHANNELS, FRAME_H, FRAME_W)
+        all_latents.append(gen_latent.squeeze(0))  # (C, H, W)
+
+        # Update prompt: patch-embed the generated latent directly (no VAE round-trip)
+        prompt_z_pad_new = torch.zeros(N_PATCH_PAD, D_MODEL, dtype=torch.bfloat16)
+        prompt_z_pad_new[:N_PATCHES] = patch_embed_host(
+            gen_latent, dev["x_emb_conv_w"], dev["x_emb_conv_b"])
+        prompt_z_dev = to_tt(prompt_z_pad_new, tt_device)
+
+        elapsed = time.time() - t_frame
+        print("  Frame %d: %.2fs" % (frame_idx, elapsed))
+
+    total_video = time.time() - t_video_start
+    print("\nDiT generation: %.1fs for %d frames (%.2f FPS)" % (
+        total_video, N_VIDEO_FRAMES - 1, (N_VIDEO_FRAMES - 1) / total_video))
+
+    # Batch VAE decode all frames
+    print("\nVAE decoding %d frames..." % len(all_latents))
     t_vae = time.time()
-    chunk_for_vae = chunk_img.unsqueeze(0)  # (1, 1, C, H, W)
-    frames = vae_decode_cpu(chunk_for_vae, vae)  # (1, 1, 360, 640, 3) in [0, 1]
+    all_latent_tensor = torch.stack(all_latents, dim=0).unsqueeze(0)  # (1, T, C, H, W)
+    all_decoded = vae_decode_cpu(all_latent_tensor, vae)  # (1, T, 360, 640, 3)
     print("VAE decode: %.1fs" % (time.time() - t_vae))
 
-    # Save as PNG
-    frame = frames[0, 0]  # (360, 640, 3)
-    frame = (frame * 255).byte().numpy()
-    img = Image.fromarray(frame)
-    img.save("/tmp/oasis_frame.png")
-    print("Saved frame to /tmp/oasis_frame.png")
-    print("Frame shape:", frame.shape, "range: [%d, %d]" % (frame.min(), frame.max()))
+    # Save as individual PNGs
+    os.makedirs("/tmp/oasis_video", exist_ok=True)
+    for i in range(all_decoded.shape[1]):
+        frame_rgb = (all_decoded[0, i] * 255).byte().numpy()
+        Image.fromarray(frame_rgb).save("/tmp/oasis_video/frame_%04d.png" % i)
+    print("Saved %d frames to /tmp/oasis_video/" % all_decoded.shape[1])
+
+    # Save first generated frame
+    first_gen = (all_decoded[0, 1] * 255).byte().numpy()
+    Image.fromarray(first_gen).save("/tmp/oasis_frame.png")
 
     print("\nDone!")
     ttnn.close_device(tt_device)
