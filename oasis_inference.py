@@ -1761,6 +1761,9 @@ def to_tt_l1(t, device):
 def zeros_tt(shape, device):
     return to_tt(torch.zeros(shape, dtype=torch.bfloat16), device)
 
+def zeros_l1(shape, device):
+    return to_tt_l1(torch.zeros(shape, dtype=torch.bfloat16), device)
+
 def expand_bias(bias_1d, seq_pad):
     return bias_1d.unsqueeze(0).expand(seq_pad, -1).contiguous().to(torch.bfloat16)
 
@@ -2041,16 +2044,18 @@ def prealloc_scratch(tt_device, n_frames=2):
     t0 = time.time()
     s = {}
     SEQ = N_PATCH_PAD * n_frames  # 320 for T=2
-    s["z_a"] = zeros_tt((SEQ, D_MODEL), tt_device)
-    s["z_b"] = zeros_tt((SEQ, D_MODEL), tt_device)
-    s["normed"] = zeros_tt((SEQ, D_MODEL), tt_device)
-    s["modulated"] = zeros_tt((SEQ, D_MODEL), tt_device)
-    s["qkv"] = zeros_tt((SEQ, 3 * D_MODEL), tt_device)
-    s["qkv_full"] = zeros_tt((SEQ, 5 * D_MODEL), tt_device)
-    s["o_proj"] = zeros_tt((SEQ, D_MODEL), tt_device)
-    s["fc1"] = zeros_tt((SEQ, D_MLP), tt_device)
-    s["gelu"] = zeros_tt((SEQ, D_MLP), tt_device)
-    s["fc2"] = zeros_tt((SEQ, D_MODEL), tt_device)
+    # L1 intermediates: eliminates DRAM round-trips between operations
+    # Total ~13MB across 72 cores = ~180KB/core (well within ~1.4MB/core budget)
+    s["z_a"] = zeros_l1((SEQ, D_MODEL), tt_device)
+    s["z_b"] = zeros_l1((SEQ, D_MODEL), tt_device)
+    s["normed"] = zeros_l1((SEQ, D_MODEL), tt_device)
+    s["modulated"] = zeros_l1((SEQ, D_MODEL), tt_device)
+    s["qkv"] = zeros_l1((SEQ, 3 * D_MODEL), tt_device)
+    s["qkv_full"] = zeros_l1((SEQ, 5 * D_MODEL), tt_device)
+    s["o_proj"] = zeros_l1((SEQ, D_MODEL), tt_device)
+    s["fc1"] = zeros_l1((SEQ, D_MLP), tt_device)
+    s["gelu"] = zeros_l1((SEQ, D_MLP), tt_device)
+    s["fc2"] = zeros_l1((SEQ, D_MODEL), tt_device)
     # Conditioning scratch (per-frame, so TILE * n_frames)
     s["t_emb_a"] = zeros_tt((TILE, D_MODEL), tt_device)
     s["t_emb_b"] = zeros_tt((TILE, D_MODEL), tt_device)
@@ -2059,13 +2064,13 @@ def prealloc_scratch(tt_device, n_frames=2):
     s["adaln_out"] = to_tt_l1(torch.zeros(TILE, 6 * D_MODEL, dtype=torch.bfloat16), tt_device)
     s["silu_cond"] = zeros_tt((TILE, D_MODEL), tt_device)
     # Packed adaln: (SEQ, 6*D_MODEL) reused across blocks
-    s["adaln_packed"] = zeros_tt((SEQ, 6 * D_MODEL), tt_device)
+    s["adaln_packed"] = zeros_l1((SEQ, 6 * D_MODEL), tt_device)
     # Per-frame adaln expanded: (N_PATCH_PAD, 6*D_MODEL) for building packed tensor
     for f in range(n_frames):
-        s["adaln_frame_%d" % f] = zeros_tt((N_PATCH_PAD, 6 * D_MODEL), tt_device)
+        s["adaln_frame_%d" % f] = zeros_l1((N_PATCH_PAD, 6 * D_MODEL), tt_device)
     # RoPE scratch (reused for spatial and temporal)
-    s["q_roped"] = zeros_tt((SEQ, D_MODEL), tt_device)
-    s["k_roped"] = zeros_tt((SEQ, D_MODEL), tt_device)
+    s["q_roped"] = zeros_l1((SEQ, D_MODEL), tt_device)
+    s["k_roped"] = zeros_l1((SEQ, D_MODEL), tt_device)
     # SDPA-format scratch for fused RoPE+layout kernel (spatial)
     # Stored as 2D: (BATCH_S * N_PATCH_PAD, D_HEAD), reshaped to 4D for SDPA
     # L1: eliminates DRAM round-trip between RoPE kernel output and SDPA input
@@ -2074,25 +2079,25 @@ def prealloc_scratch(tt_device, n_frames=2):
     s["k_sdpa"] = to_tt_l1(torch.zeros(BATCH_S * N_PATCH_PAD, D_HEAD, dtype=torch.bfloat16), tt_device)
     s["v_sdpa"] = to_tt_l1(torch.zeros(BATCH_S * N_PATCH_PAD, D_HEAD, dtype=torch.bfloat16), tt_device)
     # Temporal mega kernel scratch (Q/K roped + V)
-    s["t_q_scratch"] = zeros_tt((SEQ, D_MODEL), tt_device)
-    s["t_k_scratch"] = zeros_tt((SEQ, D_MODEL), tt_device)
-    s["t_v_scratch"] = zeros_tt((SEQ, D_MODEL), tt_device)
+    s["t_q_scratch"] = zeros_l1((SEQ, D_MODEL), tt_device)
+    s["t_k_scratch"] = zeros_l1((SEQ, D_MODEL), tt_device)
+    s["t_v_scratch"] = zeros_l1((SEQ, D_MODEL), tt_device)
     # SDPA scratch: (SEQ, D_MODEL) for TT-Lang spatial SDPA output
-    s["sdpa_out"] = zeros_tt((SEQ, D_MODEL), tt_device)
+    s["sdpa_out"] = zeros_l1((SEQ, D_MODEL), tt_device)
     # Mega kernel B scratch
-    s["z_scratch"] = zeros_tt((SEQ, D_MODEL), tt_device)
-    s["gelu_scratch"] = zeros_tt((SEQ, D_MLP), tt_device)
+    s["z_scratch"] = zeros_l1((SEQ, D_MODEL), tt_device)
+    s["gelu_scratch"] = zeros_l1((SEQ, D_MLP), tt_device)
     # Final layer
-    s["final_adaln"] = zeros_tt((TILE, 2 * D_MODEL), tt_device)
-    s["final_out"] = zeros_tt((SEQ, OUT_DIM), tt_device)
+    s["final_adaln"] = zeros_l1((TILE, 2 * D_MODEL), tt_device)
+    s["final_out"] = zeros_l1((SEQ, OUT_DIM), tt_device)
     # Pre-allocated SiLU output buffers per frame (L1 for fast access, read 32x/step)
     for f in range(n_frames):
         s["silu_out_%d" % f] = to_tt_l1(torch.zeros(TILE, D_MODEL, dtype=torch.bfloat16), tt_device)
     s["n_frames"] = n_frames
     # DDIM arithmetic scratch (N_PATCH_PAD, OUT_DIM)
-    s["ddim_x_start"] = zeros_tt((N_PATCH_PAD, OUT_DIM), tt_device)
-    s["ddim_x_noise"] = zeros_tt((N_PATCH_PAD, OUT_DIM), tt_device)
-    s["ddim_tmp"] = zeros_tt((N_PATCH_PAD, OUT_DIM), tt_device)
+    s["ddim_x_start"] = zeros_l1((N_PATCH_PAD, OUT_DIM), tt_device)
+    s["ddim_x_noise"] = zeros_l1((N_PATCH_PAD, OUT_DIM), tt_device)
+    s["ddim_tmp"] = zeros_l1((N_PATCH_PAD, OUT_DIM), tt_device)
     elapsed = time.time() - t0
     print("Pre-allocated %d scratch tensors (T=%d) in %.1fs" % (len(s) - 1, n_frames, elapsed))
     return s
