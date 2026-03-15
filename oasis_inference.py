@@ -2004,33 +2004,54 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
         ttnn.synchronize_device(tt_device)
         _t1 = _dt.time(); print("      %s qkv_matmul: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
 
+    # Slice Q/K/V/Q_swap/K_swap, apply RoPE, then ttnn SDPA (f32 accumulation)
+    # TODO: investigate bf16 accumulation in rope_sdpa_kernel (TT-Lang) - it causes
+    # quality degradation over 320 attention passes. ttnn SDPA uses f32 accumulation.
+    # Replaced: rope_sdpa_kernel(qkv_full, cos, sin, scaler, out)
+    q = ttnn.slice(scr["qkv_full"], [0, 0], [SEQ, D_MODEL])
+    k = ttnn.slice(scr["qkv_full"], [0, D_MODEL], [SEQ, 2 * D_MODEL])
+    v = ttnn.slice(scr["qkv_full"], [0, 2 * D_MODEL], [SEQ, 3 * D_MODEL])
+    q_swap = ttnn.slice(scr["qkv_full"], [0, 3 * D_MODEL], [SEQ, 4 * D_MODEL])
+    k_swap = ttnn.slice(scr["qkv_full"], [0, 4 * D_MODEL], [SEQ, 5 * D_MODEL])
+
     if attn_type == "spatial":
-        rope_sdpa_kernel(scr["qkv_full"],
-                         dev["spatial_cos"], dev["spatial_sin_perm"],
-                         scaler, scr["sdpa_out"])
-        attn_2d = scr["sdpa_out"]
+        cos_key, sin_key = "spatial_cos", "spatial_sin_perm"
+    else:
+        cos_key, sin_key = "temporal_cos", "temporal_sin_perm"
+    fused_rope_kernel(q, q_swap, dev[cos_key], dev[sin_key], scr["q_roped"])
+    fused_rope_kernel(k, k_swap, dev[cos_key], dev[sin_key], scr["k_roped"])
+
+    if attn_type == "spatial":
+        # Spatial: each frame attends within itself, batch over (frame, head)
+        BATCH_S = T * N_HEADS
+        q_s = ttnn.reshape(scr["q_roped"], [T, N_PATCH_PAD, N_HEADS, D_HEAD])
+        q_s = ttnn.permute(q_s, [0, 2, 1, 3])
+        q_s = ttnn.reshape(q_s, [BATCH_S, 1, N_PATCH_PAD, D_HEAD])
+        k_s = ttnn.reshape(scr["k_roped"], [T, N_PATCH_PAD, N_HEADS, D_HEAD])
+        k_s = ttnn.permute(k_s, [0, 2, 1, 3])
+        k_s = ttnn.reshape(k_s, [BATCH_S, 1, N_PATCH_PAD, D_HEAD])
+        v_s = ttnn.reshape(v, [T, N_PATCH_PAD, N_HEADS, D_HEAD])
+        v_s = ttnn.permute(v_s, [0, 2, 1, 3])
+        v_s = ttnn.reshape(v_s, [BATCH_S, 1, N_PATCH_PAD, D_HEAD])
+        attn_out = ttnn.transformer.scaled_dot_product_attention(q_s, k_s, v_s, is_causal=False)
+        attn_out = ttnn.reshape(attn_out, [T, N_HEADS, N_PATCH_PAD, D_HEAD])
+        attn_out = ttnn.permute(attn_out, [0, 2, 1, 3])
+        attn_2d = ttnn.reshape(attn_out, [SEQ, D_MODEL])
         _timer.mark("qkv+sdpa")
     else:
-        # Temporal: slice Q/K/V/Qs/Ks, RoPE, reshape, ttnn SDPA
-        q = ttnn.slice(scr["qkv_full"], [0, 0], [SEQ, D_MODEL])
-        k = ttnn.slice(scr["qkv_full"], [0, D_MODEL], [SEQ, 2 * D_MODEL])
-        v = ttnn.slice(scr["qkv_full"], [0, 2 * D_MODEL], [SEQ, 3 * D_MODEL])
-        q_swap = ttnn.slice(scr["qkv_full"], [0, 3 * D_MODEL], [SEQ, 4 * D_MODEL])
-        k_swap = ttnn.slice(scr["qkv_full"], [0, 4 * D_MODEL], [SEQ, 5 * D_MODEL])
-        fused_rope_kernel(q, q_swap, dev["temporal_cos"], dev["temporal_sin_perm"], scr["q_roped"])
-        fused_rope_kernel(k, k_swap, dev["temporal_cos"], dev["temporal_sin_perm"], scr["k_roped"])
-        BATCH = N_PATCH_PAD * N_HEADS
-        q_t = ttnn.reshape(scr["q_roped"], [T, BATCH, D_HEAD])
+        # Temporal: each patch attends across frames, batch over (patch, head)
+        BATCH_T = N_PATCH_PAD * N_HEADS
+        q_t = ttnn.reshape(scr["q_roped"], [T, BATCH_T, D_HEAD])
         q_t = ttnn.permute(q_t, [1, 0, 2])
-        q_t = ttnn.reshape(q_t, [BATCH, 1, T, D_HEAD])
-        k_t = ttnn.reshape(scr["k_roped"], [T, BATCH, D_HEAD])
+        q_t = ttnn.reshape(q_t, [BATCH_T, 1, T, D_HEAD])
+        k_t = ttnn.reshape(scr["k_roped"], [T, BATCH_T, D_HEAD])
         k_t = ttnn.permute(k_t, [1, 0, 2])
-        k_t = ttnn.reshape(k_t, [BATCH, 1, T, D_HEAD])
-        v_t = ttnn.reshape(v, [T, BATCH, D_HEAD])
+        k_t = ttnn.reshape(k_t, [BATCH_T, 1, T, D_HEAD])
+        v_t = ttnn.reshape(v, [T, BATCH_T, D_HEAD])
         v_t = ttnn.permute(v_t, [1, 0, 2])
-        v_t = ttnn.reshape(v_t, [BATCH, 1, T, D_HEAD])
+        v_t = ttnn.reshape(v_t, [BATCH_T, 1, T, D_HEAD])
         attn_out = ttnn.transformer.scaled_dot_product_attention(q_t, k_t, v_t, is_causal=True)
-        attn_out = ttnn.reshape(attn_out, [BATCH, T, D_HEAD])
+        attn_out = ttnn.reshape(attn_out, [BATCH_T, T, D_HEAD])
         attn_out = ttnn.permute(attn_out, [1, 0, 2])
         attn_2d = ttnn.reshape(attn_out, [SEQ, D_MODEL])
         _timer.mark("sdpa")
