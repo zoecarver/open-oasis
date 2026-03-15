@@ -902,13 +902,253 @@ def make_qkv_rope_sdpa_kernel(dim_tiles, seq_tiles, head_tiles, n_heads_val, sca
 
 mega_qkv_rope_sdpa = make_qkv_rope_sdpa_kernel(D_TILES, N_PATCH_PAD_TILES, D_HEAD_TILES, N_HEADS, 0.125)
 
+
+def make_temporal_qkv_rope_sdpa_kernel(dim_tiles, seq_tiles, head_tiles, n_heads_val, scale_val):
+    """Temporal QKV+RoPE+SDPA: fused kernel for T=2 causal temporal attention.
+    Parallelize over heads. Each head processes both frames.
+    For T=2 causal: frame0 output = V0, frame1 output = softmax(Q1@K) @ V.
+    Uses DRAM scratch for Q/K/V between QKV matmul and SDPA phases."""
+    @ttl.kernel(grid="auto")
+    def temporal_qkv_rope_sdpa(modulated, qkv_w, cos_tab, sin_tab, scaler, q_scratch, k_scratch, v_scratch, out):
+        grid_cols, _ = ttl.grid_size(dims=2)
+        heads_per_core = -(-n_heads_val // grid_cols)
+        d_tiles = n_heads_val * head_tiles
+
+        # Phase 1: QKV matmul + RoPE (same DFBs as spatial)
+        mod_dfb = ttl.make_dataflow_buffer_like(modulated, shape=(seq_tiles, 1), buffer_factor=2)
+        w_dfb = ttl.make_dataflow_buffer_like(qkv_w, shape=(1, head_tiles), buffer_factor=2)
+        acc_dfb = ttl.make_dataflow_buffer_like(modulated, shape=(seq_tiles, head_tiles), buffer_factor=2)
+        mm_dfb = ttl.make_dataflow_buffer_like(modulated, shape=(seq_tiles, head_tiles), buffer_factor=2)
+        q_dfb = ttl.make_dataflow_buffer_like(modulated, shape=(seq_tiles, head_tiles), buffer_factor=2)
+        k_dfb = ttl.make_dataflow_buffer_like(modulated, shape=(seq_tiles, head_tiles), buffer_factor=2)
+        v_dfb = ttl.make_dataflow_buffer_like(modulated, shape=(seq_tiles, head_tiles), buffer_factor=2)
+        cos_dfb = ttl.make_dataflow_buffer_like(cos_tab, shape=(seq_tiles, head_tiles), buffer_factor=2)
+        sin_dfb = ttl.make_dataflow_buffer_like(sin_tab, shape=(seq_tiles, head_tiles), buffer_factor=2)
+        qr_dfb = ttl.make_dataflow_buffer_like(modulated, shape=(seq_tiles, head_tiles), buffer_factor=2)
+        kr_dfb = ttl.make_dataflow_buffer_like(modulated, shape=(seq_tiles, head_tiles), buffer_factor=2)
+        # Phase 2: temporal SDPA per tile row
+        # Read Q1, K0, K1, V0, V1 per tile row (1, head_tiles) each
+        tq1_dfb = ttl.make_dataflow_buffer_like(modulated, shape=(1, head_tiles), buffer_factor=2)
+        tk0_dfb = ttl.make_dataflow_buffer_like(modulated, shape=(1, head_tiles), buffer_factor=2)
+        tk1_dfb = ttl.make_dataflow_buffer_like(modulated, shape=(1, head_tiles), buffer_factor=2)
+        tv0_dfb = ttl.make_dataflow_buffer_like(modulated, shape=(1, head_tiles), buffer_factor=2)
+        tv1_dfb = ttl.make_dataflow_buffer_like(modulated, shape=(1, head_tiles), buffer_factor=2)
+        # Intermediates for temporal SDPA
+        prod_dfb = ttl.make_dataflow_buffer_like(modulated, shape=(1, head_tiles), buffer_factor=2)
+        scaler_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        s0_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        s1_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        a_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        a_bc_dfb = ttl.make_dataflow_buffer_like(modulated, shape=(1, head_tiles), buffer_factor=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, head_tiles), buffer_factor=2)
+
+        @ttl.compute()
+        def compute():
+            core_x, _ = ttl.core(dims=2)
+            for local_h in range(heads_per_core):
+                head_idx = core_x * heads_per_core + local_h
+                if head_idx < n_heads_val:
+                    # Phase 1: QKV matmul + RoPE for BOTH frames
+                    for frame in range(2):
+                        # Q matmul (K-accumulation)
+                        with mod_dfb.wait() as m0, w_dfb.wait() as w0, acc_dfb.reserve() as a:
+                            a.store(m0 @ w0)
+                        for k_idx in range(dim_tiles - 1):
+                            with mod_dfb.wait() as mk, w_dfb.wait() as wk, mm_dfb.reserve() as mm:
+                                mm.store(mk @ wk)
+                            with mm_dfb.wait() as mmv, acc_dfb.wait() as prev, acc_dfb.reserve() as a:
+                                a.store(prev + mmv)
+                        with acc_dfb.wait() as qr, q_dfb.reserve() as q:
+                            q.store(qr)
+                        # Qs matmul + RoPE Q
+                        with mod_dfb.wait() as m0, w_dfb.wait() as w0, acc_dfb.reserve() as a:
+                            a.store(m0 @ w0)
+                        for k_idx in range(dim_tiles - 1):
+                            with mod_dfb.wait() as mk, w_dfb.wait() as wk, mm_dfb.reserve() as mm:
+                                mm.store(mk @ wk)
+                            with mm_dfb.wait() as mmv, acc_dfb.wait() as prev, acc_dfb.reserve() as a:
+                                a.store(prev + mmv)
+                        with acc_dfb.wait() as qs, q_dfb.wait() as qv, cos_dfb.wait() as cv, sin_dfb.wait() as sv:
+                            with qr_dfb.reserve() as qr:
+                                qr.store(qv * cv + qs * sv)
+                        # K matmul
+                        with mod_dfb.wait() as m0, w_dfb.wait() as w0, acc_dfb.reserve() as a:
+                            a.store(m0 @ w0)
+                        for k_idx in range(dim_tiles - 1):
+                            with mod_dfb.wait() as mk, w_dfb.wait() as wk, mm_dfb.reserve() as mm:
+                                mm.store(mk @ wk)
+                            with mm_dfb.wait() as mmv, acc_dfb.wait() as prev, acc_dfb.reserve() as a:
+                                a.store(prev + mmv)
+                        with acc_dfb.wait() as kr, k_dfb.reserve() as k:
+                            k.store(kr)
+                        # Ks matmul + RoPE K
+                        with mod_dfb.wait() as m0, w_dfb.wait() as w0, acc_dfb.reserve() as a:
+                            a.store(m0 @ w0)
+                        for k_idx in range(dim_tiles - 1):
+                            with mod_dfb.wait() as mk, w_dfb.wait() as wk, mm_dfb.reserve() as mm:
+                                mm.store(mk @ wk)
+                            with mm_dfb.wait() as mmv, acc_dfb.wait() as prev, acc_dfb.reserve() as a:
+                                a.store(prev + mmv)
+                        with acc_dfb.wait() as ks, k_dfb.wait() as kv, cos_dfb.wait() as cv, sin_dfb.wait() as sv:
+                            with kr_dfb.reserve() as kr:
+                                kr.store(kv * cv + ks * sv)
+                        # V matmul
+                        with mod_dfb.wait() as m0, w_dfb.wait() as w0, acc_dfb.reserve() as a:
+                            a.store(m0 @ w0)
+                        for k_idx in range(dim_tiles - 1):
+                            with mod_dfb.wait() as mk, w_dfb.wait() as wk, mm_dfb.reserve() as mm:
+                                mm.store(mk @ wk)
+                            with mm_dfb.wait() as mmv, acc_dfb.wait() as prev, acc_dfb.reserve() as a:
+                                a.store(prev + mmv)
+                        with acc_dfb.wait() as vr, v_dfb.reserve() as v:
+                            v.store(vr)
+
+                    # Phase 2: temporal SDPA per tile row
+                    # T=2 causal: frame0 out = V0, frame1 out = softmax(Q1@K0/K1) @ V
+                    with scaler_dfb.wait() as sc:
+                        for r in range(seq_tiles):
+                            # Frame 0: output = V0 (causal, only attends to self)
+                            with tv0_dfb.wait() as v0:
+                                with out_dfb.reserve() as o:
+                                    o.store(v0)
+                            # Frame 1: score0 = Q1@K0, score1 = Q1@K1
+                            with tq1_dfb.wait() as q1, tk0_dfb.wait() as k0, tk1_dfb.wait() as k1:
+                                # score0 = scale * reduce_sum(Q1 * K0, dim=1)
+                                with prod_dfb.reserve() as p:
+                                    p.store(q1 * k0 * ttl.math.fill(q1, scale_val))
+                                with prod_dfb.wait() as pv, s0_dfb.reserve() as s0:
+                                    s0.store(ttl.math.reduce_sum(pv, sc, dims=[1]))
+                                # score1 = scale * reduce_sum(Q1 * K1, dim=1)
+                                with prod_dfb.reserve() as p:
+                                    p.store(q1 * k1 * ttl.math.fill(q1, scale_val))
+                                with prod_dfb.wait() as pv, s1_dfb.reserve() as s1:
+                                    s1.store(ttl.math.reduce_sum(pv, sc, dims=[1]))
+                            # Softmax of 2 scores per row
+                            with s0_dfb.wait() as s0v, s1_dfb.wait() as s1v:
+                                mx = ttl.math.max(s0v, s1v)
+                                e0 = ttl.math.exp(s0v - mx)
+                                e1 = ttl.math.exp(s1v - mx)
+                                inv_sum = ttl.math.recip(e0 + e1)
+                                with a_dfb.reserve() as a0:
+                                    a0.store(e0 * inv_sum)
+                            # Broadcast a0 to (1, head_tiles), compute out1
+                            with a_dfb.wait() as a0v, a_bc_dfb.reserve() as a0bc:
+                                a0bc.store(ttl.math.broadcast(a0v, dims=[1]))
+                            with a_bc_dfb.wait() as a0_bc, tv0_dfb.wait() as v0, tv1_dfb.wait() as v1:
+                                # out1 = a0 * V0 + (1 - a0) * V1
+                                with out_dfb.reserve() as o:
+                                    o.store(a0_bc * v0 + (ttl.math.fill(v0, 1.0) - a0_bc) * v1)
+
+        @ttl.datamovement()
+        def dm_read():
+            core_x, _ = ttl.core(dims=2)
+            for local_h in range(heads_per_core):
+                head_idx = core_x * heads_per_core + local_h
+                if head_idx < n_heads_val:
+                    h = head_idx
+                    hc = h * head_tiles
+                    d_t = n_heads_val * head_tiles
+                    # Phase 1: QKV matmul data for each frame
+                    for frame in range(2):
+                        row_start = frame * seq_tiles
+                        # Q weights at column hc
+                        for k in range(dim_tiles):
+                            with mod_dfb.reserve() as blk:
+                                tx = ttl.copy(modulated[row_start:row_start + seq_tiles, k], blk); tx.wait()
+                            with w_dfb.reserve() as blk:
+                                tx = ttl.copy(qkv_w[k, hc:hc + head_tiles], blk); tx.wait()
+                        # Qs weights at 3*d_t+hc
+                        qs_col = 3 * d_t + hc
+                        for k in range(dim_tiles):
+                            with mod_dfb.reserve() as blk:
+                                tx = ttl.copy(modulated[row_start:row_start + seq_tiles, k], blk); tx.wait()
+                            with w_dfb.reserve() as blk:
+                                tx = ttl.copy(qkv_w[k, qs_col:qs_col + head_tiles], blk); tx.wait()
+                        with cos_dfb.reserve() as blk:
+                            tx = ttl.copy(cos_tab[row_start:row_start + seq_tiles, hc:hc + head_tiles], blk); tx.wait()
+                        with sin_dfb.reserve() as blk:
+                            tx = ttl.copy(sin_tab[row_start:row_start + seq_tiles, hc:hc + head_tiles], blk); tx.wait()
+                        # K weights at d_t+hc
+                        k_col = d_t + hc
+                        for k in range(dim_tiles):
+                            with mod_dfb.reserve() as blk:
+                                tx = ttl.copy(modulated[row_start:row_start + seq_tiles, k], blk); tx.wait()
+                            with w_dfb.reserve() as blk:
+                                tx = ttl.copy(qkv_w[k, k_col:k_col + head_tiles], blk); tx.wait()
+                        # Ks weights at 4*d_t+hc
+                        ks_col = 4 * d_t + hc
+                        for k in range(dim_tiles):
+                            with mod_dfb.reserve() as blk:
+                                tx = ttl.copy(modulated[row_start:row_start + seq_tiles, k], blk); tx.wait()
+                            with w_dfb.reserve() as blk:
+                                tx = ttl.copy(qkv_w[k, ks_col:ks_col + head_tiles], blk); tx.wait()
+                        with cos_dfb.reserve() as blk:
+                            tx = ttl.copy(cos_tab[row_start:row_start + seq_tiles, hc:hc + head_tiles], blk); tx.wait()
+                        with sin_dfb.reserve() as blk:
+                            tx = ttl.copy(sin_tab[row_start:row_start + seq_tiles, hc:hc + head_tiles], blk); tx.wait()
+                        # V weights at 2*d_t+hc
+                        v_col = 2 * d_t + hc
+                        for k in range(dim_tiles):
+                            with mod_dfb.reserve() as blk:
+                                tx = ttl.copy(modulated[row_start:row_start + seq_tiles, k], blk); tx.wait()
+                            with w_dfb.reserve() as blk:
+                                tx = ttl.copy(qkv_w[k, v_col:v_col + head_tiles], blk); tx.wait()
+                    # Phase 2: read Q/K/V from scratch for temporal SDPA
+                    with scaler_dfb.reserve() as blk:
+                        tx = ttl.copy(scaler[0, 0], blk); tx.wait()
+                    for r in range(seq_tiles):
+                        # V0 for frame 0 output
+                        with tv0_dfb.reserve() as blk:
+                            tx = ttl.copy(v_scratch[r, hc:hc + head_tiles], blk); tx.wait()
+                        # Q1, K0, K1, V0, V1 for frame 1 attention
+                        with tq1_dfb.reserve() as blk:
+                            tx = ttl.copy(q_scratch[seq_tiles + r, hc:hc + head_tiles], blk); tx.wait()
+                        with tk0_dfb.reserve() as blk:
+                            tx = ttl.copy(k_scratch[r, hc:hc + head_tiles], blk); tx.wait()
+                        with tk1_dfb.reserve() as blk:
+                            tx = ttl.copy(k_scratch[seq_tiles + r, hc:hc + head_tiles], blk); tx.wait()
+                        with tv0_dfb.reserve() as blk:
+                            tx = ttl.copy(v_scratch[r, hc:hc + head_tiles], blk); tx.wait()
+                        with tv1_dfb.reserve() as blk:
+                            tx = ttl.copy(v_scratch[seq_tiles + r, hc:hc + head_tiles], blk); tx.wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            core_x, _ = ttl.core(dims=2)
+            for local_h in range(heads_per_core):
+                head_idx = core_x * heads_per_core + local_h
+                if head_idx < n_heads_val:
+                    h = head_idx
+                    hc = h * head_tiles
+                    # Phase 1: write Q_roped, K_roped, V to scratch
+                    for frame in range(2):
+                        row_start = frame * seq_tiles
+                        with qr_dfb.wait() as blk:
+                            tx = ttl.copy(blk, q_scratch[row_start:row_start + seq_tiles, hc:hc + head_tiles]); tx.wait()
+                        with kr_dfb.wait() as blk:
+                            tx = ttl.copy(blk, k_scratch[row_start:row_start + seq_tiles, hc:hc + head_tiles]); tx.wait()
+                        with v_dfb.wait() as blk:
+                            tx = ttl.copy(blk, v_scratch[row_start:row_start + seq_tiles, hc:hc + head_tiles]); tx.wait()
+                    # Phase 2: write temporal SDPA output
+                    for r in range(seq_tiles):
+                        # Frame 0 output
+                        with out_dfb.wait() as blk:
+                            tx = ttl.copy(blk, out[r, hc:hc + head_tiles]); tx.wait()
+                        # Frame 1 output
+                        with out_dfb.wait() as blk:
+                            tx = ttl.copy(blk, out[seq_tiles + r, hc:hc + head_tiles]); tx.wait()
+
+    return temporal_qkv_rope_sdpa
+
+mega_temporal_qkv_rope_sdpa = make_temporal_qkv_rope_sdpa_kernel(
+    D_TILES, N_PATCH_PAD_TILES, D_HEAD_TILES, N_HEADS, 0.125)
+
 def make_mega_post_attn_kernel(dim_tiles, mlp_dim_tiles):
     """Mega kernel B: O proj + residual + LN + modulate + FC1 + GELU + FC2 + residual.
     Per-row processing. Uses DRAM scratch between phases."""
     @ttl.kernel(grid="auto")
-    def mega_post_attn(attn_out, x_residual, gate_msa,
+    def mega_post_attn(attn_out, x_residual, adaln_packed,
                        out_w, out_b,
-                       shift_mlp, scale_mlp, gate_mlp,
                        fc1_w, fc1_b, fc2_w, fc2_b,
                        scaler, mean_scale,
                        z_scratch, gelu_scratch, final_out):
@@ -1030,7 +1270,7 @@ def make_mega_post_attn_kernel(dim_tiles, mlp_dim_tiles):
                         with p1_dfb.reserve() as blk:
                             tx = ttl.copy(out_b[tile_idx, col], blk); tx.wait()
                         with p2_dfb.reserve() as blk:
-                            tx = ttl.copy(gate_msa[tile_idx, col], blk); tx.wait()
+                            tx = ttl.copy(adaln_packed[tile_idx, 2 * dim_tiles + col], blk); tx.wait()
                         with p3_dfb.reserve() as blk:
                             tx = ttl.copy(x_residual[tile_idx, col], blk); tx.wait()
                     for j in range(dim_tiles):
@@ -1043,9 +1283,9 @@ def make_mega_post_attn_kernel(dim_tiles, mlp_dim_tiles):
                         with x_dfb.reserve() as blk:
                             tx = ttl.copy(z_scratch[tile_idx, j], blk); tx.wait()
                         with p1_dfb.reserve() as blk:
-                            tx = ttl.copy(shift_mlp[tile_idx, j], blk); tx.wait()
+                            tx = ttl.copy(adaln_packed[tile_idx, 3 * dim_tiles + j], blk); tx.wait()
                         with p2_dfb.reserve() as blk:
-                            tx = ttl.copy(scale_mlp[tile_idx, j], blk); tx.wait()
+                            tx = ttl.copy(adaln_packed[tile_idx, 4 * dim_tiles + j], blk); tx.wait()
                     for fc1_col in range(mlp_dim_tiles):
                         for k in range(dim_tiles):
                             with x_dfb.reserve() as blk:
@@ -1063,7 +1303,7 @@ def make_mega_post_attn_kernel(dim_tiles, mlp_dim_tiles):
                         with p1_dfb.reserve() as blk:
                             tx = ttl.copy(fc2_b[tile_idx, col], blk); tx.wait()
                         with p2_dfb.reserve() as blk:
-                            tx = ttl.copy(gate_mlp[tile_idx, col], blk); tx.wait()
+                            tx = ttl.copy(adaln_packed[tile_idx, 5 * dim_tiles + col], blk); tx.wait()
                         with p3_dfb.reserve() as blk:
                             tx = ttl.copy(z_scratch[tile_idx, col], blk); tx.wait()
         @ttl.datamovement()
@@ -1090,17 +1330,18 @@ mega_post_attn_kernel = make_mega_post_attn_kernel(D_TILES, D_MLP_TILES)
 
 def make_fused_ln_adaln_kernel(dim_tiles):
     """Fused LayerNorm + adaLN modulate: out = layernorm(x) * (1 + scale) + shift.
+    adaln_packed: (SEQ, 6*D_MODEL) with shift at cols [0:D], scale at cols [D:2D].
     Eliminates DRAM round-trip for the intermediate normed tensor."""
     @ttl.kernel(grid="auto")
-    def fused_ln_adaln(x, scaler, mean_scale, shift, scale, out):
+    def fused_ln_adaln(x, scaler, mean_scale, adaln_packed, out):
         grid_cols, _ = ttl.grid_size(dims=2)
         seq_tiles = x.shape[0] // TILE
         tiles_per_core = -(-seq_tiles // grid_cols)
         x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), buffer_factor=2)
         sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=1)
         ms_dfb = ttl.make_dataflow_buffer_like(mean_scale, shape=(1, 1), buffer_factor=1)
-        sh_dfb = ttl.make_dataflow_buffer_like(shift, shape=(1, 1), buffer_factor=2)
-        scl_dfb = ttl.make_dataflow_buffer_like(scale, shape=(1, 1), buffer_factor=2)
+        sh_dfb = ttl.make_dataflow_buffer_like(adaln_packed, shape=(1, 1), buffer_factor=2)
+        scl_dfb = ttl.make_dataflow_buffer_like(adaln_packed, shape=(1, 1), buffer_factor=2)
         red_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
         acc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
         bcast_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), buffer_factor=2)
@@ -1178,14 +1419,14 @@ def make_fused_ln_adaln_kernel(dim_tiles):
                     for j in range(dim_tiles):
                         with x_dfb.reserve() as blk:
                             tx = ttl.copy(x[tile_idx, j], blk); tx.wait()
-                    # Pass 3: normalize + modulate
+                    # Pass 3: normalize + modulate (shift at cols 0:D, scale at cols D:2D)
                     for j in range(dim_tiles):
                         with x_dfb.reserve() as blk:
                             tx = ttl.copy(x[tile_idx, j], blk); tx.wait()
                         with sh_dfb.reserve() as blk:
-                            tx = ttl.copy(shift[tile_idx, j], blk); tx.wait()
+                            tx = ttl.copy(adaln_packed[tile_idx, j], blk); tx.wait()
                         with scl_dfb.reserve() as blk:
-                            tx = ttl.copy(scale[tile_idx, j], blk); tx.wait()
+                            tx = ttl.copy(adaln_packed[tile_idx, dim_tiles + j], blk); tx.wait()
         @ttl.datamovement()
         def dm_write():
             core_x, _ = ttl.core(dims=2)
@@ -1617,9 +1858,18 @@ def prealloc_scratch(tt_device, n_frames=2):
     # adaLN scratch
     s["adaln_out"] = zeros_tt((TILE, 6 * D_MODEL), tt_device)
     s["silu_cond"] = zeros_tt((TILE, D_MODEL), tt_device)
+    # Packed adaln: (SEQ, 6*D_MODEL) reused across blocks
+    s["adaln_packed"] = zeros_tt((SEQ, 6 * D_MODEL), tt_device)
+    # Per-frame adaln expanded: (N_PATCH_PAD, 6*D_MODEL) for building packed tensor
+    for f in range(n_frames):
+        s["adaln_frame_%d" % f] = zeros_tt((N_PATCH_PAD, 6 * D_MODEL), tt_device)
     # RoPE scratch (reused for spatial and temporal)
     s["q_roped"] = zeros_tt((SEQ, D_MODEL), tt_device)
     s["k_roped"] = zeros_tt((SEQ, D_MODEL), tt_device)
+    # Temporal mega kernel scratch (Q/K roped + V)
+    s["t_q_scratch"] = zeros_tt((SEQ, D_MODEL), tt_device)
+    s["t_k_scratch"] = zeros_tt((SEQ, D_MODEL), tt_device)
+    s["t_v_scratch"] = zeros_tt((SEQ, D_MODEL), tt_device)
     # SDPA scratch: (SEQ, D_MODEL) for TT-Lang spatial SDPA output
     s["sdpa_out"] = zeros_tt((SEQ, D_MODEL), tt_device)
     # Mega kernel B scratch
@@ -1659,52 +1909,41 @@ def unpatchify_host(x, patch_size, out_channels, h, w):
     x = torch.einsum("nhwpqc->nchpwq", x)
     return x.reshape(1, out_channels, h * patch_size, w * patch_size)
 
-def build_per_frame_adaln(cond_list, prefix, dev, scr, tt_device):
+def build_per_frame_adaln(silu_cond_list, prefix, dev, scr, tt_device):
     """Compute adaLN params on DEVICE using ttnn.matmul.
-    cond_list: list of T conditioning device tensors, each (TILE, D_MODEL) with all rows filled.
-    Returns: [shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp] as device tensors.
+    silu_cond_list: list of T pre-computed SiLU(cond) device tensors, each (TILE, D_MODEL).
+    Returns: packed (SEQ, 6*D_MODEL) device tensor.
     """
-    T = len(cond_list)
-    SEQ = N_PATCH_PAD * T
+    T = len(silu_cond_list)
     N_REPEAT = N_PATCH_PAD // TILE  # 5
 
     per_frame_expanded = []
-    for cond_tt in cond_list:
-        # SiLU on device
-        silu_kernel(cond_tt, scr["silu_cond"])
-        # Linear(1024, 6144) on device via ttnn.matmul
-        adaln_raw = ttnn.matmul(scr["silu_cond"], dev["%s.adaln_w" % prefix])
-        adaln_raw = ttnn.add(adaln_raw, dev["%s.adaln_b" % prefix])
-        # adaln_raw: (TILE, 6*D_MODEL) = (32, 6144), all rows have same values
-        # Expand to (N_PATCH_PAD, 6*D_MODEL) by repeating the tile block
-        expanded = ttnn.concat([adaln_raw] * N_REPEAT, dim=0)
+    for silu_cond in silu_cond_list:
+        # Linear(1024, 6144) -> reuse scratch for matmul+add
+        ttnn.matmul(silu_cond, dev["%s.adaln_w" % prefix],
+                    optional_output_tensor=scr["adaln_out"])
+        ttnn.add(scr["adaln_out"], dev["%s.adaln_b" % prefix],
+                 output_tensor=scr["adaln_out"])
+        # Expand to (N_PATCH_PAD, 6*D_MODEL) - concat allocates but matmul/add reuse scratch
+        expanded = ttnn.concat([scr["adaln_out"]] * N_REPEAT, dim=0)
         per_frame_expanded.append(expanded)
 
     # Combine frames: (SEQ, 6*D_MODEL)
     if T == 1:
-        full = per_frame_expanded[0]
+        return per_frame_expanded[0]
     else:
-        full = ttnn.concat(per_frame_expanded, dim=0)
-
-    # Slice into 6 params of (SEQ, D_MODEL) each
-    results = []
-    for i in range(6):
-        start_col = i * D_MODEL
-        end_col = (i + 1) * D_MODEL
-        param = ttnn.slice(full, [0, start_col], [SEQ, end_col])
-        results.append(param)
-    return results
+        return ttnn.concat(per_frame_expanded, dim=0)
 
 PROFILE_BLOCKS = True  # Set True for timing breakdown
 
-def run_sub_block(prefix, x_tt, cond_list, dev, scr, tt_device, scaler, mean_scale, attn_type="spatial"):
+def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mean_scale, attn_type="spatial"):
     """Run one spatial or temporal sub-block.
     prefix: e.g. "blocks.0.s" or "blocks.0.t"
-    cond_list: list of T conditioning device tensors, each (TILE, D_MODEL)
+    silu_cond_list: list of T pre-computed SiLU(cond) device tensors, each (TILE, D_MODEL)
     attn_type: "spatial" or "temporal"
     x_tt: (N_PATCH_PAD * T, D_MODEL) device tensor
     """
-    T = len(cond_list)
+    T = len(silu_cond_list)
     SEQ = N_PATCH_PAD * T
 
     if PROFILE_BLOCKS:
@@ -1729,13 +1968,12 @@ def run_sub_block(prefix, x_tt, cond_list, dev, scr, tt_device, scaler, mean_sca
             def report(self, prefix, attn_type): pass
         _timer = _DummyTimer()
 
-    # Compute per-frame adaLN params
-    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
-        build_per_frame_adaln(cond_list, prefix, dev, scr, tt_device)
+    # Compute per-frame adaLN params (SiLU already applied to cond) - packed (SEQ, 6*D_MODEL)
+    adaln_packed = build_per_frame_adaln(silu_cond_list, prefix, dev, scr, tt_device)
     _timer.mark("adaln")
 
-    # Fused LayerNorm + adaLN modulate
-    fused_ln_adaln_d1024(x_tt, scaler, mean_scale, shift_msa, scale_msa, scr["modulated"])
+    # Fused LayerNorm + adaLN modulate (reads shift/scale from packed tensor)
+    fused_ln_adaln_d1024(x_tt, scaler, mean_scale, adaln_packed, scr["modulated"])
     _timer.mark("norm+mod")
 
     if attn_type == "spatial":
@@ -1748,46 +1986,18 @@ def run_sub_block(prefix, x_tt, cond_list, dev, scr, tt_device, scaler, mean_sca
         _timer.mark("qkv+sdpa")
 
     else:
-        # Temporal still uses ttnn.matmul + separate RoPE + ttnn SDPA
-        qkv_full = ttnn.matmul(scr["modulated"], dev["%s.qkv_full_w" % prefix])
-        q = ttnn.slice(qkv_full, [0, 0], [SEQ, D_MODEL])
-        k = ttnn.slice(qkv_full, [0, D_MODEL], [SEQ, 2 * D_MODEL])
-        v = ttnn.slice(qkv_full, [0, 2 * D_MODEL], [SEQ, 3 * D_MODEL])
-        q_swap = ttnn.slice(qkv_full, [0, 3 * D_MODEL], [SEQ, 4 * D_MODEL])
-        k_swap = ttnn.slice(qkv_full, [0, 4 * D_MODEL], [SEQ, 5 * D_MODEL])
-
-        # Apply temporal RoPE on device
-        fused_rope_kernel(q, q_swap, dev["temporal_cos"], dev["temporal_sin_perm"], scr["q_roped"])
-        fused_rope_kernel(k, k_swap, dev["temporal_cos"], dev["temporal_sin_perm"], scr["k_roped"])
-
-        # Reshape for temporal SDPA: batch over (patch, head) pairs
-        # (SEQ, D_MODEL) = (T*N_PATCH_PAD, N_HEADS*D_HEAD)
-        # → (T, N_PATCH_PAD*N_HEADS, D_HEAD) → permute → (N_PATCH_PAD*N_HEADS, T, D_HEAD)
-        # → reshape → (N_PATCH_PAD*N_HEADS, 1, T, D_HEAD) for SDPA
-        BATCH = N_PATCH_PAD * N_HEADS
-        q_t = ttnn.reshape(scr["q_roped"], [T, BATCH, D_HEAD])
-        q_t = ttnn.permute(q_t, [1, 0, 2])
-        q_t = ttnn.reshape(q_t, [BATCH, 1, T, D_HEAD])
-        k_t = ttnn.reshape(scr["k_roped"], [T, BATCH, D_HEAD])
-        k_t = ttnn.permute(k_t, [1, 0, 2])
-        k_t = ttnn.reshape(k_t, [BATCH, 1, T, D_HEAD])
-        v_t = ttnn.reshape(v, [T, BATCH, D_HEAD])
-        v_t = ttnn.permute(v_t, [1, 0, 2])
-        v_t = ttnn.reshape(v_t, [BATCH, 1, T, D_HEAD])
-
-        # Device SDPA with causal mask (T=2 internally padded to 32 by tile layout)
-        attn_out = ttnn.transformer.scaled_dot_product_attention(q_t, k_t, v_t, is_causal=True)
-
-        # Reshape back: (BATCH, 1, T, D_HEAD) → (BATCH, T, D_HEAD) → (T, BATCH, D_HEAD) → (SEQ, D_MODEL)
-        attn_out = ttnn.reshape(attn_out, [BATCH, T, D_HEAD])
-        attn_out = ttnn.permute(attn_out, [1, 0, 2])
-        attn_2d = ttnn.reshape(attn_out, [SEQ, D_MODEL])
+        # Temporal mega kernel: fused QKV+RoPE+SDPA (T=2 causal)
+        mega_temporal_qkv_rope_sdpa(
+            scr["modulated"], dev["%s.qkv_full_w" % prefix],
+            dev["temporal_cos"], dev["temporal_sin_perm"],
+            scaler, scr["t_q_scratch"], scr["t_k_scratch"], scr["t_v_scratch"],
+            scr["sdpa_out"])
+        attn_2d = scr["sdpa_out"]
         _timer.mark("sdpa")
 
     # Mega kernel B: O proj + residual + LN + modulate + FC1 + GELU + FC2 + residual
-    mega_post_attn_kernel(attn_2d, x_tt, gate_msa,
+    mega_post_attn_kernel(attn_2d, x_tt, adaln_packed,
                           dev["%s.out_w" % prefix], dev["%s.out_b" % prefix],
-                          shift_mlp, scale_mlp, gate_mlp,
                           dev["%s.fc1_w" % prefix], dev["%s.fc1_b" % prefix],
                           dev["%s.fc2_w" % prefix], dev["%s.fc2_b" % prefix],
                           scaler, mean_scale,
@@ -1829,23 +2039,29 @@ def dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale
     T = len(cond_list)
     SEQ = N_PATCH_PAD * T
 
+    # Pre-compute SiLU(cond) once per step, reuse across all 32 sub-blocks + final layer
+    silu_cond_list = []
+    for t_idx in range(T):
+        silu_out = zeros_tt((TILE, D_MODEL), tt_device)
+        silu_kernel(cond_list[t_idx], silu_out)
+        silu_cond_list.append(silu_out)
+
     # 16 blocks: each has spatial + temporal sub-block
     for block_idx in range(N_BLOCKS):
         z_cur = run_sub_block(
-            "blocks.%d.s" % block_idx, z_cur, cond_list,
+            "blocks.%d.s" % block_idx, z_cur, silu_cond_list,
             dev, scr, tt_device, scaler, mean_scale, attn_type="spatial"
         )
         z_cur = run_sub_block(
-            "blocks.%d.t" % block_idx, z_cur, cond_list,
+            "blocks.%d.t" % block_idx, z_cur, silu_cond_list,
             dev, scr, tt_device, scaler, mean_scale, attn_type="temporal"
         )
 
-    # Final layer: per-frame adaLN (on device)
+    # Final layer: per-frame adaLN (SiLU already computed)
     N_REPEAT = N_PATCH_PAD // TILE  # 5
     per_frame_final = []
     for t_idx in range(T):
-        silu_kernel(cond_list[t_idx], scr["silu_cond"])
-        final_raw = ttnn.matmul(scr["silu_cond"], dev["final_adaln_w"])
+        final_raw = ttnn.matmul(silu_cond_list[t_idx], dev["final_adaln_w"])
         final_raw = ttnn.add(final_raw, dev["final_adaln_b"])
         expanded = ttnn.concat([final_raw] * N_REPEAT, dim=0)
         per_frame_final.append(expanded)
@@ -1935,7 +2151,7 @@ if __name__ == "__main__":
 
     # Diffusion schedule
     max_noise_level = 1000
-    ddim_steps = 10
+    ddim_steps = 5
     noise_range = torch.linspace(-1, max_noise_level - 1, ddim_steps + 1)
     noise_abs_max = 20
     stabilization_level = 15
@@ -1977,6 +2193,34 @@ if __name__ == "__main__":
     chunk_pad[:N_PATCHES] = chunk_patches.to(torch.bfloat16)
     chunk_dev = to_tt(chunk_pad, tt_device)
 
+    # Pre-compute conditioning for ALL DDIM steps (noise levels known ahead of time)
+    print("Pre-computing conditioning for %d steps..." % ddim_steps)
+    t_precond = time.time()
+    gen_cond_per_step = {}
+    for noise_idx in reversed(range(1, ddim_steps + 1)):
+        noise_level = int(noise_range[noise_idx].item())
+        gen_cond_per_step[noise_idx] = compute_cond_for_frame(
+            noise_level, actions[0, 1], dev, scr, tt_device)
+    print("Pre-computed conditioning in %.1fs" % (time.time() - t_precond))
+
+    # Pre-compute DDIM scalar coefficients as device tensors
+    ddim_coeffs = {}
+    for noise_idx in reversed(range(1, ddim_steps + 1)):
+        noise_level = int(noise_range[noise_idx].item())
+        t_next_noise = int(noise_range[noise_idx - 1].item())
+        at = float(alphas_cumprod[noise_level].item())
+        an = float(alphas_cumprod[max(t_next_noise, 0)].item())
+        if noise_idx == 1:
+            an = 1.0
+        ddim_coeffs[noise_idx] = {
+            "at_sqrt": float(at ** 0.5),
+            "1mat_sqrt": float((1 - at) ** 0.5),
+            "inv_at_sqrt": float((1.0 / at) ** 0.5),
+            "inv_sigma": float(1.0 / ((1.0 / at - 1) ** 0.5)),
+            "an_sqrt": float(an ** 0.5),
+            "1man_sqrt": float((1 - an) ** 0.5),
+        }
+
     print("\nRunning DDIM denoising (%d steps, T=%d, all on device)..." % (ddim_steps, N_FRAMES))
     t_total = time.time()
 
@@ -1992,10 +2236,8 @@ if __name__ == "__main__":
         # Concat prompt + generated frame -> z_cur (320, 1024)
         z_cur = ttnn.concat([prompt_z_dev, gen_z], dim=0)
 
-        # Conditioning for generated frame (host MLP, to_tt is non-blocking)
-        gen_cond_dev = compute_cond_for_frame(
-            noise_level, actions[0, 1], dev, scr, tt_device)
-        cond_list = [prompt_cond_dev, gen_cond_dev]
+        # Conditioning (pre-computed, no host compute or to_tt in loop)
+        cond_list = [prompt_cond_dev, gen_cond_per_step[noise_idx]]
 
         # DiT forward (all on device) -> final_out (320, 64)
         final_out = dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale)
@@ -2003,39 +2245,37 @@ if __name__ == "__main__":
         # Extract velocity for generated frame (rows N_PATCH_PAD to 2*N_PATCH_PAD)
         v_dev = ttnn.slice(final_out, [N_PATCH_PAD, 0], [2 * N_PATCH_PAD, OUT_DIM])
 
-        # DDIM update (all elementwise on device, no sync)
-        t_next_noise = int(noise_range[noise_idx - 1].item())
-        at = float(alphas_cumprod[noise_level].item())
-        an = float(alphas_cumprod[max(t_next_noise, 0)].item())
-        if noise_idx == 1:
-            an = 1.0
-
-        c_at_sqrt = float(at ** 0.5)
-        c_1mat_sqrt = float((1 - at) ** 0.5)
-        c_inv_at_sqrt = float((1.0 / at) ** 0.5)
-        c_inv_sigma = float(1.0 / ((1.0 / at - 1) ** 0.5))
-        c_an_sqrt = float(an ** 0.5)
-        c_1man_sqrt = float((1 - an) ** 0.5)
+        # DDIM update (all elementwise on device, coefficients pre-computed)
+        coeffs = ddim_coeffs[noise_idx]
 
         # x_start = at_sqrt * chunk - (1-at)_sqrt * v
         x_start = ttnn.subtract(
-            ttnn.multiply(chunk_dev, c_at_sqrt),
-            ttnn.multiply(v_dev, c_1mat_sqrt))
+            ttnn.multiply(chunk_dev, coeffs["at_sqrt"]),
+            ttnn.multiply(v_dev, coeffs["1mat_sqrt"]))
         # x_noise = (inv_at_sqrt * chunk - x_start) / sigma
         x_noise = ttnn.multiply(
-            ttnn.subtract(ttnn.multiply(chunk_dev, c_inv_at_sqrt), x_start),
-            c_inv_sigma)
+            ttnn.subtract(ttnn.multiply(chunk_dev, coeffs["inv_at_sqrt"]), x_start),
+            coeffs["inv_sigma"])
         # chunk = an_sqrt * x_start + (1-an)_sqrt * x_noise
         chunk_dev = ttnn.add(
-            ttnn.multiply(x_start, c_an_sqrt),
-            ttnn.multiply(x_noise, c_1man_sqrt))
+            ttnn.multiply(x_start, coeffs["an_sqrt"]),
+            ttnn.multiply(x_noise, coeffs["1man_sqrt"]))
 
-        print("  Step time: %.1fs" % (time.time() - t_step))
+        print("  Step dispatch: %.3fs" % (time.time() - t_step))
 
+    # Sync once at end, measure total including device execution
+    t_sync = time.time()
+    ttnn.synchronize_device(tt_device)
+    sync_time = time.time() - t_sync
     total_time = time.time() - t_total
-    print("\nDDIM complete in %.1fs" % total_time)
+    dispatch_time = total_time - sync_time
+    print("\nDDIM complete: %.3fs total (dispatch: %.3fs, device: %.3fs)" % (
+        total_time, dispatch_time, sync_time))
+    print("  Per step: %.0fms avg (%.1f FPS)" % (
+        total_time * 1000 / ddim_steps,
+        ddim_steps / total_time))
 
-    # Final readback: only now do we sync and transfer to host
+    # Final readback
     chunk_host = ttnn.to_torch(chunk_dev)[:N_PATCHES].float()  # (144, 64)
     chunk_img = unpatchify_host(chunk_host, PATCH_SIZE, IN_CHANNELS, FRAME_H, FRAME_W)
     print("Final latent range: [%.2f, %.2f]" % (chunk_img.min().item(), chunk_img.max().item()))
