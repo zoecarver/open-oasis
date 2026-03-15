@@ -191,6 +191,56 @@ KNOWN ISSUES / GOTCHAS
    - Temporal: standard lang freqs (RotaryEmbedding(dim=64))
    Precompute on host, send to device as tensors.
 
+9. PROGRAM SIZE TOO BIG ("kernel config buffer limit"):
+   If a kernel exceeds ~69KB compiled size, reduce worker_l1_size to give
+   more space to the config buffer:
+     import ttnn
+     default_size = ttnn.device.get_max_worker_l1_unreserved_size()
+     device = ttnn.open_device(device_id=0, worker_l1_size=default_size - 8192)
+   This trades 8KB of user L1 (for CBs/buffers) for 8KB more kernel config
+   space (~77KB), comfortably fitting ~72KB programs. The tradeoff is slightly
+   less L1 for tile buffers.
+
+10. PIPE COMMUNICATION RULES:
+   a. ALWAYS use PipeNet with if_src/if_dst callbacks. Direct ttl.copy(pipe, blk)
+      without PipeNet compiles but HANGS on HW.
+   b. Create pipes: pipes = [ttl.Pipe((x, 0), ((x+1), 0)) for x in range(N-1)]
+      Wrap: net = ttl.PipeNet(pipes)
+   c. Send pattern (inside dm_read):
+        with out_dfb.wait() as blk:
+            def send(pipe):
+                xf = ttl.copy(blk, pipe); xf.wait()
+            net.if_src(send)
+   d. Recv pattern (inside dm_read):
+        with in_dfb.reserve() as blk:
+            def recv(pipe):
+                xf = ttl.copy(pipe, blk); xf.wait()
+            net.if_dst(recv)
+   e. dm_read can wait on compute-produced DFBs (e.g. fwd_out_dfb.wait())
+      to relay computed results through pipes.
+   f. For broadcast pipes: ttl.Pipe(src=(N, 0), dst=(slice(0, N), 0))
+      Use a separate PipeNet for broadcast vs forward chain.
+   g. Fast dispatch works fine with pipes.
+   h. Self-cycling DFBs (wait then re-reserve) needed when a value must be
+      both sent via pipe AND kept for later use in compute.
+   i. EACH PIPE IS SINGLE-USE. One send, one receive per pipe. If you need
+      two transfers (e.g., mean gather + variance gather), create TWO
+      separate PipeNets with separate pipes.
+   j. DFB wait/reserve MUST go INSIDE pipe callbacks, not outside. Otherwise
+      cores that aren't src/dst will block on DFBs they never produce/consume.
+      WRONG: with dfb.wait() as blk: net.if_src(lambda p: ttl.copy(blk, p))
+      RIGHT: def cb(pipe): with dfb.wait() as blk: ttl.copy(blk, pipe)
+             net.if_src(cb)
+   k. GATHER+SCATTER is the best pattern for reductions:
+      gather = ttl.PipeNet([ttl.Pipe(src=(cx, 0), dst=(0, 0)) for cx in range(1, N)])
+      scatter = ttl.PipeNet([ttl.Pipe(src=(0, 0), dst=(slice(1, N), 0))])
+      Gather: sequential sends from cores 1..N-1 to core 0. pipe_dst called
+      N-1 times, each pushes into recv_dfb. Compute accumulates.
+      Scatter: multicast from core 0 to all others.
+      recv_dfb needs buffer_factor >= N-1 (to hold all partials before compute drains).
+   l. Verified: 4-core gather+scatter LayerNorm works (test_pipe_layernorm.py).
+   m. Reference: engram_demo_ttlang.py pipe_conv_kernel for proven pattern.
+
 IMPLEMENTATION PHASES
 =====================
 

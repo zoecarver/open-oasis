@@ -1704,7 +1704,10 @@ fused_lbgr_k32 = make_fused_linear_bias_gated_res_kernel(D_TILES)  # O proj + bi
 fused_lbg_k32 = make_fused_linear_bias_gelu_kernel(D_TILES, n_chunk=4)  # FC1 + bias + GELU
 fused_ln_adaln_d1024 = make_fused_ln_adaln_kernel(D_TILES)  # LayerNorm + adaLN modulate
 layernorm_d1024 = make_layernorm_kernel(D_TILES)
-fused_gated_res_ln_adaln_d1024 = make_fused_gated_res_ln_adaln_kernel(D_TILES)  # gated_res + LN + adaLN
+fused_gated_res_ln_adaln_d1024 = make_fused_gated_res_ln_adaln_kernel(D_TILES)  # gated_res + LN + adaLN (5-core seq-only)
+# Pipe-based version: 40-core (8 D-cores x 5 SEQ-cores) with gather+scatter
+from pipe_fused_ln import make_pipe_fused_gated_res_ln_adaln
+pipe_fused_gated_res_ln_adaln_d1024 = make_pipe_fused_gated_res_ln_adaln(D_TILES, 8, N_PATCH_PAD // TILE)
 
 # Compute kernel configs (following tt-metal DiT patterns)
 # Initialized lazily after device is opened (need device.arch())
@@ -2130,7 +2133,7 @@ def build_per_frame_adaln(silu_cond_list, prefix, dev, scr, tt_device):
         return ttnn.concat(per_frame_expanded, dim=0)
 
 PROFILE_BLOCKS = False
-PROFILE_BLOCK_DEVICE = None  # disabled for trace compatibility
+PROFILE_BLOCK_DEVICE = None  # set to "blocks.1.s" for per-phase profiling (breaks trace)
 
 def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mean_scale, attn_type="spatial"):
     """Run one spatial or temporal sub-block.
@@ -2263,7 +2266,7 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
     # Phase B: Fused gated_residual + LN + adaLN modulate (single TT-Lang kernel)
     # Replaces 3 separate kernels: gated_residual_kernel + layernorm_d1024 + adaln_modulate_kernel
     # Eliminates 2 DRAM intermediates (z_scratch: 640KB, normed: 640KB) = 1.28MB saved per call
-    fused_gated_res_ln_adaln_d1024(
+    pipe_fused_gated_res_ln_adaln_d1024(
         x_tt, scr["o_proj"], gate_msa, scaler, mean_scale, adaln_packed,
         scr["z_scratch"], scr["modulated"])
     if _do_dev_profile:
@@ -2428,7 +2431,10 @@ def vae_decode_cpu(z_latent, vae):
 # ============================================================
 
 if __name__ == "__main__":
-    tt_device = ttnn.open_device(device_id=0, trace_region_size=100000000)
+    # Increase config buffer for pipe-fused kernels (~85KB compiled)
+    default_l1 = ttnn.device.get_max_worker_l1_unreserved_size()
+    tt_device = ttnn.open_device(device_id=0, trace_region_size=100000000,
+                                  worker_l1_size=default_l1 - 90112)
     init_compute_configs(tt_device)
     torch.manual_seed(42)
 
@@ -2666,7 +2672,7 @@ if __name__ == "__main__":
     # Following reference: autoregressive in latent space. Generated frame's latent
     # feeds directly as prompt for next frame (no VAE decode/re-encode between frames).
     # VAE decode happens once at the end for all frames.
-    N_VIDEO_FRAMES = 3  # reduced for faster iteration (set to 30 for full video)
+    N_VIDEO_FRAMES = 2  # reduced for faster iteration (set to 30 for full video)
     print("\n=== GENERATING %d-FRAME VIDEO ===" % N_VIDEO_FRAMES)
     t_video_start = time.time()
 
