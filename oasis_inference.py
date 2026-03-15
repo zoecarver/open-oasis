@@ -1712,8 +1712,10 @@ pipe_fused_gated_res_ln_adaln_d1024 = make_pipe_fused_gated_res_ln_adaln(D_TILES
 from adaln_matmul_expand import make_adaln_matmul_expand_kernel
 adaln_matmul_expand_kernel = make_adaln_matmul_expand_kernel(D_TILES, N_PATCH_PAD // TILE)
 # Fused RoPE + layout transform: eliminates 5 slices + 2 RoPE + 9 reshape/permute
-from rope_layout_kernel import make_rope_layout_kernel
+from rope_layout_kernel import make_rope_layout_kernel, make_rope_temporal_kernel
 rope_layout_spatial = make_rope_layout_kernel(N_PATCH_PAD // TILE, D_HEAD // TILE, N_HEADS)
+# Fused temporal RoPE: eliminates 5 slices + 2 RoPE kernels
+rope_temporal = make_rope_temporal_kernel(D_HEAD // TILE, N_HEADS)
 
 # Compute kernel configs (following tt-metal DiT patterns)
 # Initialized lazily after device is opened (need device.arch())
@@ -1864,9 +1866,10 @@ def build_rope_device_tables(freqs_per_position, n_positions, n_patch_pad, n_hea
     sin_full = torch.zeros(SEQ, d_model, dtype=torch.bfloat16)
     for t in range(n_frames):
         start = t * n_patch_pad
-        n = min(n_positions, n_patch_pad)
-        cos_full[start:start + n] = cos_expanded[:n].to(torch.bfloat16)
-        sin_full[start:start + n] = sin_expanded[:n].to(torch.bfloat16)
+        src_start = t * n_patch_pad
+        n = min(n_positions - src_start, n_patch_pad)
+        cos_full[start:start + n] = cos_expanded[src_start:src_start + n].to(torch.bfloat16)
+        sin_full[start:start + n] = sin_expanded[src_start:src_start + n].to(torch.bfloat16)
 
     # L1 for RoPE tables: read 16x per step by each spatial/temporal sub-block
     return to_tt_l1(cos_full, tt_device), to_tt_l1(sin_full, tt_device)
@@ -2023,7 +2026,7 @@ def preload_dit_weights(tt_device, n_frames=2):
             n_frames * N_PATCH_PAD, TEMPORAL_ROPE_DIM)  # (SEQ, 64)
         dev["temporal_cos"], dev["temporal_sin_perm"] = \
             build_rope_device_tables(temporal_expanded, n_frames * N_PATCH_PAD,
-                                     N_PATCH_PAD, N_HEADS, 1, tt_device)
+                                     N_PATCH_PAD, N_HEADS, n_frames, tt_device)
 
     elapsed = time.time() - t0
     print("Preloaded %d tensors in %.1fs" % (len(dev), elapsed))
@@ -2065,10 +2068,11 @@ def prealloc_scratch(tt_device, n_frames=2):
     s["k_roped"] = zeros_tt((SEQ, D_MODEL), tt_device)
     # SDPA-format scratch for fused RoPE+layout kernel (spatial)
     # Stored as 2D: (BATCH_S * N_PATCH_PAD, D_HEAD), reshaped to 4D for SDPA
+    # L1: eliminates DRAM round-trip between RoPE kernel output and SDPA input
     BATCH_S = n_frames * N_HEADS
-    s["q_sdpa"] = zeros_tt((BATCH_S * N_PATCH_PAD, D_HEAD), tt_device)
-    s["k_sdpa"] = zeros_tt((BATCH_S * N_PATCH_PAD, D_HEAD), tt_device)
-    s["v_sdpa"] = zeros_tt((BATCH_S * N_PATCH_PAD, D_HEAD), tt_device)
+    s["q_sdpa"] = to_tt_l1(torch.zeros(BATCH_S * N_PATCH_PAD, D_HEAD, dtype=torch.bfloat16), tt_device)
+    s["k_sdpa"] = to_tt_l1(torch.zeros(BATCH_S * N_PATCH_PAD, D_HEAD, dtype=torch.bfloat16), tt_device)
+    s["v_sdpa"] = to_tt_l1(torch.zeros(BATCH_S * N_PATCH_PAD, D_HEAD, dtype=torch.bfloat16), tt_device)
     # Temporal mega kernel scratch (Q/K roped + V)
     s["t_q_scratch"] = zeros_tt((SEQ, D_MODEL), tt_device)
     s["t_k_scratch"] = zeros_tt((SEQ, D_MODEL), tt_device)
@@ -2222,15 +2226,10 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
         attn_2d = ttnn.reshape(attn_out, [SEQ, D_MODEL])
         _timer.mark("qkv+sdpa")
     else:
-        # Temporal: slice + RoPE + reshape (TODO: fuse like spatial)
+        # Fused temporal RoPE: reads qkv_full, writes q/k/v in (SEQ, D_MODEL)
         cos_key, sin_key = "temporal_cos", "temporal_sin_perm"
-        q = ttnn.slice(scr["qkv_full"], [0, 0], [SEQ, D_MODEL])
-        k = ttnn.slice(scr["qkv_full"], [0, D_MODEL], [SEQ, 2 * D_MODEL])
-        v = ttnn.slice(scr["qkv_full"], [0, 2 * D_MODEL], [SEQ, 3 * D_MODEL])
-        q_swap = ttnn.slice(scr["qkv_full"], [0, 3 * D_MODEL], [SEQ, 4 * D_MODEL])
-        k_swap = ttnn.slice(scr["qkv_full"], [0, 4 * D_MODEL], [SEQ, 5 * D_MODEL])
-        fused_rope_kernel(q, q_swap, dev[cos_key], dev[sin_key], scr["q_roped"])
-        fused_rope_kernel(k, k_swap, dev[cos_key], dev[sin_key], scr["k_roped"])
+        rope_temporal(scr["qkv_full"], dev[cos_key], dev[sin_key],
+                      scr["q_roped"], scr["k_roped"], scr["t_v_scratch"])
         # Temporal: each patch attends across frames, batch over (patch, head)
         BATCH_T = N_PATCH_PAD * N_HEADS
         q_t = ttnn.reshape(scr["q_roped"], [T, BATCH_T, D_HEAD])
@@ -2239,7 +2238,7 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
         k_t = ttnn.reshape(scr["k_roped"], [T, BATCH_T, D_HEAD])
         k_t = ttnn.permute(k_t, [1, 0, 2])
         k_t = ttnn.reshape(k_t, [BATCH_T, 1, T, D_HEAD])
-        v_t = ttnn.reshape(v, [T, BATCH_T, D_HEAD])
+        v_t = ttnn.reshape(scr["t_v_scratch"], [T, BATCH_T, D_HEAD])
         v_t = ttnn.permute(v_t, [1, 0, 2])
         v_t = ttnn.reshape(v_t, [BATCH_T, 1, T, D_HEAD])
         attn_out = ttnn.transformer.scaled_dot_product_attention(q_t, k_t, v_t, is_causal=True)

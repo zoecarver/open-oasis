@@ -93,3 +93,86 @@ def make_rope_layout_kernel(seq_tiles, head_tiles, n_heads_val):
                         tx = ttl.copy(blk, v_out[out_row:out_row + seq_tiles, 0:head_tiles]); tx.wait()
 
     return rope_layout
+
+
+def make_rope_temporal_kernel(head_tiles, n_heads_val):
+    """Fused RoPE for temporal attention (no layout transform).
+    Reads qkv_full (SEQ, 5*D_MODEL), applies RoPE to Q and K,
+    writes q_out/k_out/v_out in (SEQ, D_MODEL) format.
+    Eliminates: 5 slices + 2 RoPE kernels.
+    Parallelizes over (row_tile, head) pairs.
+    """
+    @ttl.kernel(grid="auto")
+    def rope_temporal(qkv_full, cos_tab, sin_tab, q_out, k_out, v_out):
+        grid_cols, _ = ttl.grid_size(dims=2)
+        row_tiles = qkv_full.shape[0] // TILE
+        total_units = row_tiles * n_heads_val
+        units_per_core = -(-total_units // grid_cols)
+
+        q_dfb = ttl.make_dataflow_buffer_like(qkv_full, shape=(1, head_tiles), buffer_factor=2)
+        qs_dfb = ttl.make_dataflow_buffer_like(qkv_full, shape=(1, head_tiles), buffer_factor=2)
+        k_dfb = ttl.make_dataflow_buffer_like(qkv_full, shape=(1, head_tiles), buffer_factor=2)
+        ks_dfb = ttl.make_dataflow_buffer_like(qkv_full, shape=(1, head_tiles), buffer_factor=2)
+        v_dfb = ttl.make_dataflow_buffer_like(qkv_full, shape=(1, head_tiles), buffer_factor=2)
+        cos_dfb = ttl.make_dataflow_buffer_like(cos_tab, shape=(1, head_tiles), buffer_factor=2)
+        sin_dfb = ttl.make_dataflow_buffer_like(sin_tab, shape=(1, head_tiles), buffer_factor=2)
+        qr_dfb = ttl.make_dataflow_buffer_like(qkv_full, shape=(1, head_tiles), buffer_factor=2)
+        kr_dfb = ttl.make_dataflow_buffer_like(qkv_full, shape=(1, head_tiles), buffer_factor=2)
+        vo_dfb = ttl.make_dataflow_buffer_like(qkv_full, shape=(1, head_tiles), buffer_factor=2)
+
+        @ttl.compute()
+        def compute():
+            core_x, _ = ttl.core(dims=2)
+            for local_u in range(units_per_core):
+                uid = core_x * units_per_core + local_u
+                if uid < total_units:
+                    with cos_dfb.wait() as cv, sin_dfb.wait() as sv:
+                        with q_dfb.wait() as q, qs_dfb.wait() as qs, qr_dfb.reserve() as qr:
+                            qr.store(q * cv + qs * sv)
+                        with k_dfb.wait() as k, ks_dfb.wait() as ks, kr_dfb.reserve() as kr:
+                            kr.store(k * cv + ks * sv)
+                    with v_dfb.wait() as vv, vo_dfb.reserve() as vo:
+                        vo.store(vv)
+
+        @ttl.datamovement()
+        def dm_read():
+            core_x, _ = ttl.core(dims=2)
+            d_tiles = n_heads_val * head_tiles
+            for local_u in range(units_per_core):
+                uid = core_x * units_per_core + local_u
+                if uid < total_units:
+                    row = uid // n_heads_val
+                    h = uid % n_heads_val
+                    hc = h * head_tiles
+                    with q_dfb.reserve() as blk:
+                        tx = ttl.copy(qkv_full[row, hc:hc + head_tiles], blk); tx.wait()
+                    with qs_dfb.reserve() as blk:
+                        tx = ttl.copy(qkv_full[row, 3 * d_tiles + hc:3 * d_tiles + hc + head_tiles], blk); tx.wait()
+                    with k_dfb.reserve() as blk:
+                        tx = ttl.copy(qkv_full[row, d_tiles + hc:d_tiles + hc + head_tiles], blk); tx.wait()
+                    with ks_dfb.reserve() as blk:
+                        tx = ttl.copy(qkv_full[row, 4 * d_tiles + hc:4 * d_tiles + hc + head_tiles], blk); tx.wait()
+                    with v_dfb.reserve() as blk:
+                        tx = ttl.copy(qkv_full[row, 2 * d_tiles + hc:2 * d_tiles + hc + head_tiles], blk); tx.wait()
+                    with cos_dfb.reserve() as blk:
+                        tx = ttl.copy(cos_tab[row, hc:hc + head_tiles], blk); tx.wait()
+                    with sin_dfb.reserve() as blk:
+                        tx = ttl.copy(sin_tab[row, hc:hc + head_tiles], blk); tx.wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            core_x, _ = ttl.core(dims=2)
+            for local_u in range(units_per_core):
+                uid = core_x * units_per_core + local_u
+                if uid < total_units:
+                    row = uid // n_heads_val
+                    h = uid % n_heads_val
+                    hc = h * head_tiles
+                    with qr_dfb.wait() as blk:
+                        tx = ttl.copy(blk, q_out[row, hc:hc + head_tiles]); tx.wait()
+                    with kr_dfb.wait() as blk:
+                        tx = ttl.copy(blk, k_out[row, hc:hc + head_tiles]); tx.wait()
+                    with vo_dfb.wait() as blk:
+                        tx = ttl.copy(blk, v_out[row, hc:hc + head_tiles]); tx.wait()
+
+    return rope_temporal

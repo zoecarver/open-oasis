@@ -287,10 +287,17 @@ PHASE 4: DDIM Sampling + VAE
   - Prompt loading and action conditioning
   - PNG output
 
-PHASE 5: Optimization
-  - Fuse LayerNorm + modulate
-  - Fuse linear + bias + gated residual
-  - Batch adaLN modulation across blocks
+PHASE 5: Optimization [IN PROGRESS]
+  Completed:
+  - [DONE] Trace execution (5 DDIM steps): 61ms/step
+  - [DONE] Pipe-fused gated_residual + LN + adaLN modulate (40-core, 8x5 grid): 54ms/step
+  - [DONE] L1 adaln_out: 53ms/step
+  - [DONE] Fused spatial RoPE+layout kernel (eliminates 16 ops): 50ms/step
+  - [DONE] Fused temporal RoPE + cos/sin table fix: 49ms/step (20.3 FPS)
+  Remaining:
+  - Per-head L1 SDPA: process SDPA one head at a time with Q/K/V in L1 (~60KB/head)
+  - Mega kernel LN+QKV+RoPE+SDPA with worker_l1_size trick
+  Future:
   - Multi-frame sliding window
   - Multi-chip distribution
 
