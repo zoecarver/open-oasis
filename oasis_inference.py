@@ -1847,6 +1847,7 @@ def prealloc_scratch(tt_device, n_frames=2):
     s["normed"] = zeros_tt((SEQ, D_MODEL), tt_device)
     s["modulated"] = zeros_tt((SEQ, D_MODEL), tt_device)
     s["qkv"] = zeros_tt((SEQ, 3 * D_MODEL), tt_device)
+    s["qkv_full"] = zeros_tt((SEQ, 5 * D_MODEL), tt_device)
     s["o_proj"] = zeros_tt((SEQ, D_MODEL), tt_device)
     s["fc1"] = zeros_tt((SEQ, D_MLP), tt_device)
     s["gelu"] = zeros_tt((SEQ, D_MLP), tt_device)
@@ -1989,36 +1990,58 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
         ttnn.synchronize_device(tt_device)
         _t1 = _dt.time(); print("      %s norm+mod: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
 
+    # Hybrid: ttnn.matmul for QKV (72-core parallel), TT-Lang for RoPE+SDPA
+    ttnn.matmul(scr["modulated"], dev["%s.qkv_full_w" % prefix],
+                optional_output_tensor=scr["qkv_full"])
+    if _do_dev_profile:
+        ttnn.synchronize_device(tt_device)
+        _t1 = _dt.time(); print("      %s qkv_matmul: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
+
     if attn_type == "spatial":
-        mega_qkv_rope_sdpa(scr["modulated"], dev["%s.qkv_full_w" % prefix],
-                           dev["spatial_cos"], dev["spatial_sin_perm"],
-                           scaler, scr["sdpa_out"])
+        rope_sdpa_kernel(scr["qkv_full"],
+                         dev["spatial_cos"], dev["spatial_sin_perm"],
+                         scaler, scr["sdpa_out"])
         attn_2d = scr["sdpa_out"]
         _timer.mark("qkv+sdpa")
     else:
-        mega_temporal_qkv_rope_sdpa(
-            scr["modulated"], dev["%s.qkv_full_w" % prefix],
-            dev["temporal_cos"], dev["temporal_sin_perm"],
-            scaler, scr["t_q_scratch"], scr["t_k_scratch"], scr["t_v_scratch"],
-            scr["sdpa_out"])
-        attn_2d = scr["sdpa_out"]
+        # Temporal: slice Q/K/V/Qs/Ks, RoPE, reshape, ttnn SDPA
+        q = ttnn.slice(scr["qkv_full"], [0, 0], [SEQ, D_MODEL])
+        k = ttnn.slice(scr["qkv_full"], [0, D_MODEL], [SEQ, 2 * D_MODEL])
+        v = ttnn.slice(scr["qkv_full"], [0, 2 * D_MODEL], [SEQ, 3 * D_MODEL])
+        q_swap = ttnn.slice(scr["qkv_full"], [0, 3 * D_MODEL], [SEQ, 4 * D_MODEL])
+        k_swap = ttnn.slice(scr["qkv_full"], [0, 4 * D_MODEL], [SEQ, 5 * D_MODEL])
+        fused_rope_kernel(q, q_swap, dev["temporal_cos"], dev["temporal_sin_perm"], scr["q_roped"])
+        fused_rope_kernel(k, k_swap, dev["temporal_cos"], dev["temporal_sin_perm"], scr["k_roped"])
+        BATCH = N_PATCH_PAD * N_HEADS
+        q_t = ttnn.reshape(scr["q_roped"], [T, BATCH, D_HEAD])
+        q_t = ttnn.permute(q_t, [1, 0, 2])
+        q_t = ttnn.reshape(q_t, [BATCH, 1, T, D_HEAD])
+        k_t = ttnn.reshape(scr["k_roped"], [T, BATCH, D_HEAD])
+        k_t = ttnn.permute(k_t, [1, 0, 2])
+        k_t = ttnn.reshape(k_t, [BATCH, 1, T, D_HEAD])
+        v_t = ttnn.reshape(v, [T, BATCH, D_HEAD])
+        v_t = ttnn.permute(v_t, [1, 0, 2])
+        v_t = ttnn.reshape(v_t, [BATCH, 1, T, D_HEAD])
+        attn_out = ttnn.transformer.scaled_dot_product_attention(q_t, k_t, v_t, is_causal=True)
+        attn_out = ttnn.reshape(attn_out, [BATCH, T, D_HEAD])
+        attn_out = ttnn.permute(attn_out, [1, 0, 2])
+        attn_2d = ttnn.reshape(attn_out, [SEQ, D_MODEL])
         _timer.mark("sdpa")
     if _do_dev_profile:
         ttnn.synchronize_device(tt_device)
-        _t1 = _dt.time(); print("      %s attn: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
+        _t1 = _dt.time(); print("      %s rope+sdpa: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
 
-    # Separate ops instead of mega_post_attn (ttnn.matmul uses multi-core parallelism)
+    # Separate ops: ttnn.matmul for large matmuls, TT-Lang for fused elementwise
     # Phase A: O proj + bias + gated residual
-    o_proj = ttnn.matmul(attn_2d, dev["%s.out_w" % prefix])
-    ttnn.add(o_proj, dev["%s.out_b" % prefix], output_tensor=o_proj)
-    # gate_msa is at columns 2*D_TILES in packed adaln
+    ttnn.matmul(attn_2d, dev["%s.out_w" % prefix], optional_output_tensor=scr["o_proj"])
+    ttnn.add(scr["o_proj"], dev["%s.out_b" % prefix], output_tensor=scr["o_proj"])
     gate_msa = ttnn.slice(adaln_packed, [0, 2 * D_MODEL], [SEQ, 3 * D_MODEL])
-    gated_residual_kernel(x_tt, o_proj, gate_msa, scr["z_scratch"])
+    gated_residual_kernel(x_tt, scr["o_proj"], gate_msa, scr["z_scratch"])
     if _do_dev_profile:
         ttnn.synchronize_device(tt_device)
         _t1 = _dt.time(); print("      %s o_proj+res: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
 
-    # Phase B: LN + modulate (separate ops, shift/scale from packed cols 3D-5D)
+    # Phase B: LN + modulate
     shift_mlp = ttnn.slice(adaln_packed, [0, 3 * D_MODEL], [SEQ, 4 * D_MODEL])
     scale_mlp = ttnn.slice(adaln_packed, [0, 4 * D_MODEL], [SEQ, 5 * D_MODEL])
     layernorm_d1024(scr["z_scratch"], dev["ln_w_ones"], dev["ln_b_zeros"], scaler, mean_scale, scr["normed"])
@@ -2027,20 +2050,19 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
         ttnn.synchronize_device(tt_device)
         _t1 = _dt.time(); print("      %s ln+mod: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
 
-    # Phase C: FC1 + bias + GELU (ttnn.matmul for speed)
-    fc1_out = ttnn.matmul(scr["modulated"], dev["%s.fc1_w" % prefix])
-    ttnn.add(fc1_out, dev["%s.fc1_b" % prefix], output_tensor=fc1_out)
-    # GELU approximation via ttnn
-    fc1_gelu = ttnn.gelu(fc1_out)
+    # Phase C: FC1 + bias + GELU
+    ttnn.matmul(scr["modulated"], dev["%s.fc1_w" % prefix], optional_output_tensor=scr["fc1"])
+    ttnn.add(scr["fc1"], dev["%s.fc1_b" % prefix], output_tensor=scr["fc1"])
+    ttnn.gelu(scr["fc1"], output_tensor=scr["gelu"])
     if _do_dev_profile:
         ttnn.synchronize_device(tt_device)
         _t1 = _dt.time(); print("      %s fc1+gelu: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
 
     # Phase D: FC2 + bias + gated residual
-    fc2_out = ttnn.matmul(fc1_gelu, dev["%s.fc2_w" % prefix])
-    ttnn.add(fc2_out, dev["%s.fc2_b" % prefix], output_tensor=fc2_out)
+    ttnn.matmul(scr["gelu"], dev["%s.fc2_w" % prefix], optional_output_tensor=scr["fc2"])
+    ttnn.add(scr["fc2"], dev["%s.fc2_b" % prefix], output_tensor=scr["fc2"])
     gate_mlp = ttnn.slice(adaln_packed, [0, 5 * D_MODEL], [SEQ, 6 * D_MODEL])
-    gated_residual_kernel(scr["z_scratch"], fc2_out, gate_mlp, scr["z_a"])
+    gated_residual_kernel(scr["z_scratch"], scr["fc2"], gate_mlp, scr["z_a"])
     _timer.mark("post_attn")
     if _do_dev_profile:
         ttnn.synchronize_device(tt_device)
