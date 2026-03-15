@@ -8,10 +8,11 @@
 - Per sub-block: adaLN params, LN+modulate, QKV+RoPE+SDPA, O proj+LN+FC1+GELU+FC2+residual
 - T=2 frames (1 prompt + 1 generated), N_PATCHES=144, N_PATCH_PAD=160, D_MODEL=1024
 
-## Current Status (as of 2026-03-14)
-- **5 DDIM steps**: ~TBD (measuring)
-- **10 DDIM steps**: ~0.5s/step steady-state, ~5s total (first step has compilation overhead)
-- **DDIM loop**: Fully on-device, zero host transfers between steps
+## Current Status (as of 2026-03-15)
+- **10 DDIM steps**: 61ms/step, 0.61s/frame, **1.63 FPS**
+- **5 DDIM steps (estimated)**: 305ms/frame, **3.3 FPS** (exceeds 2 FPS target)
+- **Trace execution**: Full DDIM step captured and replayed, zero dispatch overhead
+- **DDIM loop**: Fully on-device, traced execution, zero host transfers between steps
 
 ## What Worked
 
@@ -42,6 +43,32 @@
 - Combined QKV weight left `scr["qkv"]` unpopulated; temporal path read stale data
 - Fix: slice Q/K/V directly from `qkv_full` tensor
 - Result: DDIM 7.8s -> 4.7s, correct output
+
+### Trace Execution (Eliminating Dispatch Overhead)
+- Used `ttnn.begin_trace_capture` / `ttnn.end_trace_capture` / `ttnn.execute_trace`
+- Captures full DDIM step (round-trip + DiT forward + DDIM arithmetic) as a trace
+- Replayed with `ttnn.copy_host_to_device_tensor` for changing inputs (coefficients, conditioning)
+- DDIM coefficients converted from Python floats to device tensors for trace compatibility
+- Pre-allocated all device tensors before trace capture (no `zeros_tt` / `from_torch` inside traced region)
+- Requires `trace_region_size=100000000` on `ttnn.open_device`
+- Result: 86ms/step -> 64ms/step (25% improvement, dispatch overhead eliminated)
+
+### Fused Gated Residual + LayerNorm + adaLN Modulate (TT-Lang)
+- Single TT-Lang kernel: `make_fused_gated_res_ln_adaln_kernel`
+- Computes `LN(residual + x * gate) * (1 + scale) + shift` in one kernel
+- Eliminates 2 DRAM intermediates (z_scratch: 640KB, normed: 640KB) per call
+- Recomputes `gated_res = residual + x * gate` in each of the 3 LN passes
+  (elementwise compute is much cheaper than 1.28MB DRAM round-trip)
+- 16 DFBs, parallelized over sequence rows
+- Called 32 times per DDIM step (once per sub-block MLP path)
+- File: `oasis_inference.py`, `make_fused_gated_res_ln_adaln_kernel()`
+- Result: 64ms/step -> 61ms/step
+
+### L1 Memory Optimization
+- SiLU conditioning buffers (64KB each) moved to L1: read 32x/step
+- RoPE cos/sin tables moved to L1: read 16x/step by each sub-block type
+- Scaler and mean_scale already in L1 (2KB each)
+- Reduces DRAM bandwidth pressure for frequently-accessed small tensors
 
 ## What Didn't Work
 

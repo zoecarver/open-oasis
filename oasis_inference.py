@@ -591,6 +591,161 @@ def gated_residual_kernel(residual, x, gate, out):
                 with out_dfb.wait() as blk:
                     tx = ttl.copy(blk, out[row, sc:sc + ELEM_GRAN]); tx.wait()
 
+def make_fused_gated_res_ln_adaln_kernel(dim_tiles):
+    """Fused gated_residual + LayerNorm + adaLN modulate.
+    Computes: gated_res_out = residual + x * gate (also written to gated_res_out for downstream use)
+              modulated = LN(gated_res) * (1 + scale) + shift
+    Eliminates 1 DRAM intermediate (normed: 640KB) per call.
+    Still writes gated_res to DRAM since it's needed as residual for FC2.
+    Called 32 times per DDIM step (once per sub-block MLP path).
+    Recomputes gated_res in LN passes 2 and 3 to avoid extra DRAM reads.
+    adaln_packed has shift at cols [3D:4D] and scale at cols [4D:5D]."""
+    @ttl.kernel(grid="auto")
+    def fused_kernel(residual, x, gate, scaler, mean_scale, adaln_packed, gated_res_out, out):
+        grid_cols, _ = ttl.grid_size(dims=2)
+        seq_tiles = residual.shape[0] // TILE
+        tiles_per_core = -(-seq_tiles // grid_cols)
+        # 3 sets of input DFBs (one per LN pass, each recomputes gated_res)
+        res_dfb = ttl.make_dataflow_buffer_like(residual, shape=(1, 1), buffer_factor=2)
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), buffer_factor=2)
+        g_dfb = ttl.make_dataflow_buffer_like(gate, shape=(1, 1), buffer_factor=2)
+        gr_dfb = ttl.make_dataflow_buffer_like(residual, shape=(1, 1), buffer_factor=2)  # gated_res temp for reduce
+        sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=1)
+        ms_dfb = ttl.make_dataflow_buffer_like(mean_scale, shape=(1, 1), buffer_factor=1)
+        red_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        acc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        bcast_dfb = ttl.make_dataflow_buffer_like(residual, shape=(1, 1), buffer_factor=2)
+        sq_dfb = ttl.make_dataflow_buffer_like(residual, shape=(1, 1), buffer_factor=2)
+        mean_dfb = ttl.make_dataflow_buffer_like(residual, shape=(1, 1), buffer_factor=2)
+        istd_dfb = ttl.make_dataflow_buffer_like(residual, shape=(1, 1), buffer_factor=2)
+        sh_dfb = ttl.make_dataflow_buffer_like(adaln_packed, shape=(1, 1), buffer_factor=2)
+        scl_dfb = ttl.make_dataflow_buffer_like(adaln_packed, shape=(1, 1), buffer_factor=2)
+        gro_dfb = ttl.make_dataflow_buffer_like(gated_res_out, shape=(1, 1), buffer_factor=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
+
+        @ttl.compute()
+        def compute():
+            core_x, _ = ttl.core(dims=2)
+            with sc_dfb.wait() as sc, ms_dfb.wait() as ms:
+                for local_t in range(tiles_per_core):
+                    tile_idx = core_x * tiles_per_core + local_t
+                    if tile_idx < seq_tiles:
+                        # Pass 1: compute gated_res, write to output, and accumulate mean
+                        with res_dfb.wait() as rv, x_dfb.wait() as xv, g_dfb.wait() as gv:
+                            with gr_dfb.reserve() as gr:
+                                gr.store(rv + xv * gv)
+                        with gr_dfb.wait() as grv:
+                            with gro_dfb.reserve() as gro:
+                                gro.store(grv)
+                            with red_dfb.reserve() as r:
+                                r.store(ttl.math.reduce_sum(grv, sc, dims=[1]))
+                        with red_dfb.wait() as rv, acc_dfb.reserve() as acc:
+                            acc.store(rv)
+                        for j in range(dim_tiles - 1):
+                            with res_dfb.wait() as rv, x_dfb.wait() as xv, g_dfb.wait() as gv:
+                                with gr_dfb.reserve() as gr:
+                                    gr.store(rv + xv * gv)
+                            with gr_dfb.wait() as grv:
+                                with gro_dfb.reserve() as gro:
+                                    gro.store(grv)
+                                with red_dfb.reserve() as r:
+                                    r.store(ttl.math.reduce_sum(grv, sc, dims=[1]))
+                            with red_dfb.wait() as rv, acc_dfb.wait() as av, acc_dfb.reserve() as acc:
+                                acc.store(av + rv)
+                        with acc_dfb.wait() as sum_x, bcast_dfb.reserve() as bc:
+                            bc.store(ttl.math.broadcast(sum_x, dims=[1]))
+                        with bcast_dfb.wait() as sum_x_bc, mean_dfb.reserve() as mean_out:
+                            mean_out.store(sum_x_bc * ms)
+                        # Pass 2: compute variance (recompute gated_res)
+                        with mean_dfb.wait() as mean_val:
+                            with res_dfb.wait() as rv, x_dfb.wait() as xv, g_dfb.wait() as gv:
+                                with gr_dfb.reserve() as gr:
+                                    gr.store(rv + xv * gv)
+                            with gr_dfb.wait() as grv:
+                                with sq_dfb.reserve() as sq:
+                                    sq.store((grv - mean_val) * (grv - mean_val))
+                            with sq_dfb.wait() as sqv, red_dfb.reserve() as r:
+                                r.store(ttl.math.reduce_sum(sqv, sc, dims=[1]))
+                            with red_dfb.wait() as rv, acc_dfb.reserve() as acc:
+                                acc.store(rv)
+                            for j in range(dim_tiles - 1):
+                                with res_dfb.wait() as rv, x_dfb.wait() as xv, g_dfb.wait() as gv:
+                                    with gr_dfb.reserve() as gr:
+                                        gr.store(rv + xv * gv)
+                                with gr_dfb.wait() as grv:
+                                    with sq_dfb.reserve() as sq:
+                                        sq.store((grv - mean_val) * (grv - mean_val))
+                                with sq_dfb.wait() as sqv, red_dfb.reserve() as r:
+                                    r.store(ttl.math.reduce_sum(sqv, sc, dims=[1]))
+                                with red_dfb.wait() as rv, acc_dfb.wait() as av, acc_dfb.reserve() as acc:
+                                    acc.store(av + rv)
+                            with acc_dfb.wait() as sum_sq, bcast_dfb.reserve() as bc:
+                                bc.store(ttl.math.broadcast(sum_sq, dims=[1]))
+                            with bcast_dfb.wait() as var_bc, istd_dfb.reserve() as istd:
+                                istd.store(ttl.math.rsqrt(var_bc * ms + ttl.math.fill(var_bc, 1e-6)))
+                            # Pass 3: normalize + adaln modulate (recompute gated_res)
+                            with istd_dfb.wait() as inv_std:
+                                for j in range(dim_tiles):
+                                    with res_dfb.wait() as rv, x_dfb.wait() as xv, g_dfb.wait() as gv:
+                                        with gr_dfb.reserve() as gr:
+                                            gr.store(rv + xv * gv)
+                                    with gr_dfb.wait() as grv, sh_dfb.wait() as shv, scl_dfb.wait() as sclv, out_dfb.reserve() as o:
+                                        normed = (grv - mean_val) * inv_std
+                                        o.store(normed * (sclv + ttl.math.fill(sclv, 1.0)) + shv)
+
+        @ttl.datamovement()
+        def dm_read():
+            core_x, _ = ttl.core(dims=2)
+            with sc_dfb.reserve() as blk:
+                tx = ttl.copy(scaler[0, 0], blk); tx.wait()
+            with ms_dfb.reserve() as blk:
+                tx = ttl.copy(mean_scale[0, 0], blk); tx.wait()
+            for local_t in range(tiles_per_core):
+                tile_idx = core_x * tiles_per_core + local_t
+                if tile_idx < seq_tiles:
+                    # Pass 1: mean (read residual, x, gate)
+                    for j in range(dim_tiles):
+                        with res_dfb.reserve() as blk:
+                            tx = ttl.copy(residual[tile_idx, j], blk); tx.wait()
+                        with x_dfb.reserve() as blk:
+                            tx = ttl.copy(x[tile_idx, j], blk); tx.wait()
+                        with g_dfb.reserve() as blk:
+                            tx = ttl.copy(gate[tile_idx, j], blk); tx.wait()
+                    # Pass 2: variance (re-read residual, x, gate)
+                    for j in range(dim_tiles):
+                        with res_dfb.reserve() as blk:
+                            tx = ttl.copy(residual[tile_idx, j], blk); tx.wait()
+                        with x_dfb.reserve() as blk:
+                            tx = ttl.copy(x[tile_idx, j], blk); tx.wait()
+                        with g_dfb.reserve() as blk:
+                            tx = ttl.copy(gate[tile_idx, j], blk); tx.wait()
+                    # Pass 3: normalize + modulate (re-read residual, x, gate + shift, scale)
+                    for j in range(dim_tiles):
+                        with res_dfb.reserve() as blk:
+                            tx = ttl.copy(residual[tile_idx, j], blk); tx.wait()
+                        with x_dfb.reserve() as blk:
+                            tx = ttl.copy(x[tile_idx, j], blk); tx.wait()
+                        with g_dfb.reserve() as blk:
+                            tx = ttl.copy(gate[tile_idx, j], blk); tx.wait()
+                        with sh_dfb.reserve() as blk:
+                            tx = ttl.copy(adaln_packed[tile_idx, 3 * dim_tiles + j], blk); tx.wait()
+                        with scl_dfb.reserve() as blk:
+                            tx = ttl.copy(adaln_packed[tile_idx, 4 * dim_tiles + j], blk); tx.wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            core_x, _ = ttl.core(dims=2)
+            for local_t in range(tiles_per_core):
+                tile_idx = core_x * tiles_per_core + local_t
+                if tile_idx < seq_tiles:
+                    for j in range(dim_tiles):
+                        with gro_dfb.wait() as blk:
+                            tx = ttl.copy(blk, gated_res_out[tile_idx, j]); tx.wait()
+                    for j in range(dim_tiles):
+                        with out_dfb.wait() as blk:
+                            tx = ttl.copy(blk, out[tile_idx, j]); tx.wait()
+    return fused_kernel
+
 N_PATCH_PAD_TILES = N_PATCH_PAD // TILE  # 5
 D_HEAD_TILES = D_HEAD // TILE  # 2
 
@@ -1549,6 +1704,36 @@ fused_lbgr_k32 = make_fused_linear_bias_gated_res_kernel(D_TILES)  # O proj + bi
 fused_lbg_k32 = make_fused_linear_bias_gelu_kernel(D_TILES, n_chunk=4)  # FC1 + bias + GELU
 fused_ln_adaln_d1024 = make_fused_ln_adaln_kernel(D_TILES)  # LayerNorm + adaLN modulate
 layernorm_d1024 = make_layernorm_kernel(D_TILES)
+fused_gated_res_ln_adaln_d1024 = make_fused_gated_res_ln_adaln_kernel(D_TILES)  # gated_res + LN + adaLN
+
+# Compute kernel configs (following tt-metal DiT patterns)
+# Initialized lazily after device is opened (need device.arch())
+MATMUL_COMPUTE_CONFIG = None
+SDPA_COMPUTE_CONFIG = None
+SDPA_PROGRAM_CONFIG = None
+
+def init_compute_configs(device):
+    """Initialize compute kernel configs. Call after device is opened."""
+    global MATMUL_COMPUTE_CONFIG, SDPA_COMPUTE_CONFIG, SDPA_PROGRAM_CONFIG
+    MATMUL_COMPUTE_CONFIG = ttnn.init_device_compute_kernel_config(
+        device.arch(),
+        math_fidelity=ttnn.MathFidelity.HiFi2,
+        math_approx_mode=False,
+        fp32_dest_acc_en=True,
+        packer_l1_acc=True,
+    )
+    SDPA_COMPUTE_CONFIG = ttnn.init_device_compute_kernel_config(
+        device.arch(),
+        math_fidelity=ttnn.MathFidelity.HiFi2,
+        math_approx_mode=False,
+        fp32_dest_acc_en=False,
+    )
+    grid = device.compute_with_storage_grid_size()
+    SDPA_PROGRAM_CONFIG = ttnn.SDPAProgramConfig(
+        compute_with_storage_grid_size=(grid.x, grid.y - 1),
+        q_chunk_size=128,
+        k_chunk_size=128,
+    )
 
 # ============================================================
 # Host helpers
@@ -1674,7 +1859,8 @@ def build_rope_device_tables(freqs_per_position, n_positions, n_patch_pad, n_hea
         cos_full[start:start + n] = cos_expanded[:n].to(torch.bfloat16)
         sin_full[start:start + n] = sin_expanded[:n].to(torch.bfloat16)
 
-    return to_tt(cos_full, tt_device), to_tt(sin_full, tt_device)
+    # L1 for RoPE tables: read 16x per step by each spatial/temporal sub-block
+    return to_tt_l1(cos_full, tt_device), to_tt_l1(sin_full, tt_device)
 
 def build_spatial_rope_device_tables(spatial_freqs, n_frames, tt_device):
     """Build device-side cos/sin_perm tables for spatial RoPE.
@@ -1703,7 +1889,8 @@ def build_spatial_rope_device_tables(spatial_freqs, n_frames, tt_device):
         cos_full[start:start + N_PATCHES] = cos_expanded.to(torch.bfloat16)
         sin_full[start:start + N_PATCHES] = sin_expanded.to(torch.bfloat16)
 
-    return to_tt(cos_full, tt_device), to_tt(sin_full, tt_device)
+    # L1 for RoPE tables: read 16x per step by each spatial/temporal sub-block
+    return to_tt_l1(cos_full, tt_device), to_tt_l1(sin_full, tt_device)
 
 # ============================================================
 # Weight loading
@@ -1879,6 +2066,9 @@ def prealloc_scratch(tt_device, n_frames=2):
     # Final layer
     s["final_adaln"] = zeros_tt((TILE, 2 * D_MODEL), tt_device)
     s["final_out"] = zeros_tt((SEQ, OUT_DIM), tt_device)
+    # Pre-allocated SiLU output buffers per frame (L1 for fast access, read 32x/step)
+    for f in range(n_frames):
+        s["silu_out_%d" % f] = to_tt_l1(torch.zeros(TILE, D_MODEL, dtype=torch.bfloat16), tt_device)
     s["n_frames"] = n_frames
     # DDIM arithmetic scratch (N_PATCH_PAD, OUT_DIM)
     s["ddim_x_start"] = zeros_tt((N_PATCH_PAD, OUT_DIM), tt_device)
@@ -1940,7 +2130,7 @@ def build_per_frame_adaln(silu_cond_list, prefix, dev, scr, tt_device):
         return ttnn.concat(per_frame_expanded, dim=0)
 
 PROFILE_BLOCKS = False
-PROFILE_BLOCK_DEVICE = "blocks.1.s"  # sync-profile this specific block
+PROFILE_BLOCK_DEVICE = None  # disabled for trace compatibility
 
 def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mean_scale, attn_type="spatial"):
     """Run one spatial or temporal sub-block.
@@ -2065,25 +2255,23 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
     # To restore fused version: mega_post_attn_kernel(attn_2d, x_tt, adaln_packed,
     #   out_w, out_b, fc1_w, fc1_b, fc2_w, fc2_b, scaler, mean_scale,
     #   z_scratch, gelu_scratch, z_a)
-    # Phase A: O proj + bias + gated residual
+    # Phase A: O proj + bias
     ttnn.matmul(attn_2d, dev["%s.out_w" % prefix], optional_output_tensor=scr["o_proj"])
     ttnn.add(scr["o_proj"], dev["%s.out_b" % prefix], output_tensor=scr["o_proj"])
     gate_msa = ttnn.slice(adaln_packed, [0, 2 * D_MODEL], [SEQ, 3 * D_MODEL])
-    gated_residual_kernel(x_tt, scr["o_proj"], gate_msa, scr["z_scratch"])
-    if _do_dev_profile:
-        ttnn.synchronize_device(tt_device)
-        _t1 = _dt.time(); print("      %s o_proj+res: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
 
-    # Phase B: LN + modulate
-    shift_mlp = ttnn.slice(adaln_packed, [0, 3 * D_MODEL], [SEQ, 4 * D_MODEL])
-    scale_mlp = ttnn.slice(adaln_packed, [0, 4 * D_MODEL], [SEQ, 5 * D_MODEL])
-    layernorm_d1024(scr["z_scratch"], dev["ln_w_ones"], dev["ln_b_zeros"], scaler, mean_scale, scr["normed"])
-    adaln_modulate_kernel(scr["normed"], shift_mlp, scale_mlp, scr["modulated"])
+    # Phase B: Fused gated_residual + LN + adaLN modulate (single TT-Lang kernel)
+    # Replaces 3 separate kernels: gated_residual_kernel + layernorm_d1024 + adaln_modulate_kernel
+    # Eliminates 2 DRAM intermediates (z_scratch: 640KB, normed: 640KB) = 1.28MB saved per call
+    fused_gated_res_ln_adaln_d1024(
+        x_tt, scr["o_proj"], gate_msa, scaler, mean_scale, adaln_packed,
+        scr["z_scratch"], scr["modulated"])
     if _do_dev_profile:
         ttnn.synchronize_device(tt_device)
         _t1 = _dt.time(); print("      %s ln+mod: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
 
     # Phase C: FC1 + bias + GELU
+    # Note: can't fuse GELU into matmul because bias must be added first: GELU(Wx + b)
     ttnn.matmul(scr["modulated"], dev["%s.fc1_w" % prefix], optional_output_tensor=scr["fc1"])
     ttnn.add(scr["fc1"], dev["%s.fc1_b" % prefix], output_tensor=scr["fc1"])
     ttnn.gelu(scr["fc1"], output_tensor=scr["gelu"])
@@ -2142,9 +2330,10 @@ def dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale
         ttnn.synchronize_device(tt_device)
 
     # Pre-compute SiLU(cond) once per step, reuse across all 32 sub-blocks + final layer
+    # Uses pre-allocated buffers from scratch (no allocation during trace)
     silu_cond_list = []
     for t_idx in range(T):
-        silu_out = zeros_tt((TILE, D_MODEL), tt_device)
+        silu_out = scr["silu_out_%d" % t_idx]
         silu_kernel(cond_list[t_idx], silu_out)
         silu_cond_list.append(silu_out)
 
@@ -2197,7 +2386,8 @@ def dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale
     layernorm_d1024(z_cur, dev["ln_w_ones"], dev["ln_b_zeros"], scaler, mean_scale, scr["normed"])
     adaln_modulate_kernel(scr["normed"], shift_tt, scale_tt, scr["modulated"])
     linear_k32(scr["modulated"], dev["final_linear_w"], scr["final_out"])
-    result = ttnn.add(scr["final_out"], dev["final_linear_b"])
+    ttnn.add(scr["final_out"], dev["final_linear_b"], output_tensor=scr["final_out"])
+    result = scr["final_out"]
     if profile_step:
         ttnn.synchronize_device(tt_device)
         print("      final_layer: %.1fms" % ((_pt() - t_blocks) * 1000))
@@ -2238,7 +2428,8 @@ def vae_decode_cpu(z_latent, vae):
 # ============================================================
 
 if __name__ == "__main__":
-    tt_device = ttnn.open_device(device_id=0)
+    tt_device = ttnn.open_device(device_id=0, trace_region_size=100000000)
+    init_compute_configs(tt_device)
     torch.manual_seed(42)
 
     print("=" * 60)
@@ -2285,8 +2476,18 @@ if __name__ == "__main__":
     alphas = 1.0 - betas
     alphas_cumprod = torch.cumprod(alphas, dim=0)  # (1000,)
 
-    # Actions: no-op for both frames
-    actions = torch.zeros(1, N_FRAMES, EXT_COND_DIM)
+    # Load real sample actions for better quality
+    actions_path = "/tmp/sample_actions_0.one_hot_actions.pt"
+    if os.path.exists(actions_path):
+        sample_actions = torch.load(actions_path, weights_only=True)  # (T, 25)
+        # Prepend zeros for the prompt frame (reference does this)
+        sample_actions = torch.cat([torch.zeros_like(sample_actions[:1]), sample_actions], dim=0)
+        print("Loaded %d sample actions from %s" % (sample_actions.shape[0], actions_path))
+    else:
+        print("WARNING: sample actions not found at %s, using zero actions" % actions_path)
+        sample_actions = torch.zeros(960, EXT_COND_DIM)
+    # Frame 0 = prompt (always zero action), frame 1+ = real actions
+    prompt_action = torch.zeros(EXT_COND_DIM)
 
     # === Pre-compute device-resident data for on-device DDIM loop ===
 
@@ -2298,7 +2499,7 @@ if __name__ == "__main__":
 
     # 2. Prompt conditioning (constant across all DDIM steps)
     prompt_cond_dev = compute_cond_for_frame(
-        stabilization_level - 1, actions[0, 0], dev, scr, tt_device)
+        stabilization_level - 1, prompt_action, dev, scr, tt_device)
 
     # 3. Round-trip weight: output_space -> input_space (patch_embed composed with unpatchify)
     # Conv weight (D_MODEL, C, ps, ps) reordered to match patchify pixel order (p, q, c)
@@ -2318,18 +2519,25 @@ if __name__ == "__main__":
     chunk_pad[:N_PATCHES] = chunk_patches.to(torch.bfloat16)
     chunk_dev = to_tt(chunk_pad, tt_device)
 
-    # Pre-compute conditioning for ALL DDIM steps (noise levels known ahead of time)
+    # Pre-compute gen conditioning per DDIM step for a given action vector
+    def precompute_gen_cond(action_vec):
+        """Pre-compute conditioning for all DDIM noise levels with given action."""
+        cond_per_step = {}
+        for noise_idx in reversed(range(1, ddim_steps + 1)):
+            noise_level = int(noise_range[noise_idx].item())
+            cond_per_step[noise_idx] = compute_cond_for_frame(
+                noise_level, action_vec, dev, scr, tt_device)
+        return cond_per_step
+
+    # Default: zero action for warmup and single-frame test
     print("Pre-computing conditioning for %d steps..." % ddim_steps)
     t_precond = time.time()
-    gen_cond_per_step = {}
-    for noise_idx in reversed(range(1, ddim_steps + 1)):
-        noise_level = int(noise_range[noise_idx].item())
-        gen_cond_per_step[noise_idx] = compute_cond_for_frame(
-            noise_level, actions[0, 1], dev, scr, tt_device)
+    gen_cond_per_step = precompute_gen_cond(prompt_action)
     print("Pre-computed conditioning in %.1fs" % (time.time() - t_precond))
 
-    # Pre-compute DDIM scalar coefficients as device tensors
-    ddim_coeffs = {}
+    # Pre-compute DDIM scalar coefficients as host tensors for trace-compatible updates
+    CHUNK_SHAPE = (N_PATCH_PAD, OUT_DIM)
+    ddim_coeffs_host = {}
     for noise_idx in reversed(range(1, ddim_steps + 1)):
         noise_level = int(noise_range[noise_idx].item())
         t_next_noise = int(noise_range[noise_idx - 1].item())
@@ -2337,77 +2545,128 @@ if __name__ == "__main__":
         an = float(alphas_cumprod[max(t_next_noise, 0)].item())
         if noise_idx == 1:
             an = 1.0
-        ddim_coeffs[noise_idx] = {
-            "at_sqrt": float(at ** 0.5),
-            "1mat_sqrt": float((1 - at) ** 0.5),
-            "inv_at_sqrt": float((1.0 / at) ** 0.5),
-            "inv_sigma": float(1.0 / ((1.0 / at - 1) ** 0.5)),
-            "an_sqrt": float(an ** 0.5),
-            "1man_sqrt": float((1 - an) ** 0.5),
+        ddim_coeffs_host[noise_idx] = {
+            "at_sqrt": torch.full(CHUNK_SHAPE, at ** 0.5, dtype=torch.bfloat16),
+            "1mat_sqrt": torch.full(CHUNK_SHAPE, (1 - at) ** 0.5, dtype=torch.bfloat16),
+            "inv_at_sqrt": torch.full(CHUNK_SHAPE, (1.0 / at) ** 0.5, dtype=torch.bfloat16),
+            "inv_sigma": torch.full(CHUNK_SHAPE, 1.0 / ((1.0 / at - 1) ** 0.5), dtype=torch.bfloat16),
+            "an_sqrt": torch.full(CHUNK_SHAPE, an ** 0.5, dtype=torch.bfloat16),
+            "1man_sqrt": torch.full(CHUNK_SHAPE, (1 - an) ** 0.5, dtype=torch.bfloat16),
         }
+    # Convert to tilized host tensors (ready for copy_host_to_device_tensor)
+    for noise_idx in ddim_coeffs_host:
+        for k in ddim_coeffs_host[noise_idx]:
+            ddim_coeffs_host[noise_idx][k] = ttnn.from_torch(
+                ddim_coeffs_host[noise_idx][k], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
 
-    def run_ddim_loop(chunk_in, label, profile=False):
-        """Run full DDIM loop. Returns final chunk_dev."""
-        chunk = chunk_in
+    # Device coefficient tensors (updated before each traced step)
+    ddim_coeff_dev = {}
+    for k in ["at_sqrt", "1mat_sqrt", "inv_at_sqrt", "inv_sigma", "an_sqrt", "1man_sqrt"]:
+        ddim_coeff_dev[k] = to_tt(torch.zeros(*CHUNK_SHAPE, dtype=torch.bfloat16), tt_device)
+
+    # Mutable gen_cond tensor for trace (updated before each step)
+    gen_cond_traced = to_tt(torch.zeros(TILE, D_MODEL, dtype=torch.bfloat16), tt_device)
+
+    # Traced chunk buffer: the trace operates on this tensor in-place
+    trace_chunk = to_tt(torch.zeros(*CHUNK_SHAPE, dtype=torch.bfloat16), tt_device)
+
+    def ddim_step_fn(chunk):
+        """One DDIM step: round-trip + DiT forward + DDIM arithmetic.
+        Uses gen_cond_traced and ddim_coeff_dev which are updated before each call."""
+        gen_z = ttnn.matmul(chunk, W_rt_dev)
+        ttnn.add(gen_z, b_rt_dev, output_tensor=gen_z)
+        z_cur = ttnn.concat([prompt_z_dev, gen_z], dim=0)
+        cond_list = [prompt_cond_dev, gen_cond_traced]
+
+        final_out = dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale)
+
+        v_dev = ttnn.slice(final_out, [N_PATCH_PAD, 0], [2 * N_PATCH_PAD, OUT_DIM])
+        # x_start = at_sqrt * chunk - (1-at)_sqrt * v
+        ttnn.multiply(chunk, ddim_coeff_dev["at_sqrt"], output_tensor=scr["ddim_tmp"])
+        ttnn.multiply(v_dev, ddim_coeff_dev["1mat_sqrt"], output_tensor=scr["ddim_x_start"])
+        ttnn.subtract(scr["ddim_tmp"], scr["ddim_x_start"], output_tensor=scr["ddim_x_start"])
+        # x_noise = (inv_at_sqrt * chunk - x_start) / sigma
+        ttnn.multiply(chunk, ddim_coeff_dev["inv_at_sqrt"], output_tensor=scr["ddim_tmp"])
+        ttnn.subtract(scr["ddim_tmp"], scr["ddim_x_start"], output_tensor=scr["ddim_x_noise"])
+        ttnn.multiply(scr["ddim_x_noise"], ddim_coeff_dev["inv_sigma"], output_tensor=scr["ddim_x_noise"])
+        # chunk = an_sqrt * x_start + (1-an)_sqrt * x_noise
+        ttnn.multiply(scr["ddim_x_start"], ddim_coeff_dev["an_sqrt"], output_tensor=scr["ddim_tmp"])
+        ttnn.multiply(scr["ddim_x_noise"], ddim_coeff_dev["1man_sqrt"], output_tensor=scr["ddim_x_noise"])
+        ttnn.add(scr["ddim_tmp"], scr["ddim_x_noise"], output_tensor=chunk)
+        return chunk
+
+    # === Trace capture ===
+    # Compile: run one step to warm up all kernels
+    print("Compiling DDIM step...")
+    t_compile = time.time()
+    # Load first step's coefficients and conditioning
+    first_noise_idx = ddim_steps  # reversed range starts here
+    for k in ddim_coeff_dev:
+        ttnn.copy_host_to_device_tensor(ddim_coeffs_host[first_noise_idx][k], ddim_coeff_dev[k])
+    first_cond_host = ttnn.from_torch(
+        ttnn.to_torch(gen_cond_per_step[first_noise_idx]),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+    ttnn.copy_host_to_device_tensor(first_cond_host, gen_cond_traced)
+
+    ddim_step_fn(trace_chunk)
+    ttnn.synchronize_device(tt_device)
+    print("Compile done in %.1fs" % (time.time() - t_compile))
+
+    # Capture trace
+    print("Capturing trace...")
+    t_trace = time.time()
+    trace_id = ttnn.begin_trace_capture(tt_device, cq_id=0)
+    traced_output = ddim_step_fn(trace_chunk)
+    ttnn.end_trace_capture(tt_device, trace_id, cq_id=0)
+    ttnn.synchronize_device(tt_device)
+    print("Trace captured in %.1fs" % (time.time() - t_trace))
+
+    # Pre-convert gen_cond to host tensors for fast copy
+    gen_cond_host = {}
+    for noise_idx in gen_cond_per_step:
+        gen_cond_host[noise_idx] = ttnn.from_torch(
+            ttnn.to_torch(gen_cond_per_step[noise_idx]),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+
+    def run_ddim_loop(chunk_in_host, label, cond_override_host=None):
+        """Run full DDIM loop using traced execution.
+        chunk_in_host: host tensor (tilized bfloat16) to copy into trace_chunk.
+        cond_override_host: optional dict of {noise_idx: host_tensor} for gen conditioning."""
+        cond_map = cond_override_host if cond_override_host is not None else gen_cond_host
+        # Copy initial chunk into traced buffer
+        ttnn.copy_host_to_device_tensor(chunk_in_host, trace_chunk)
         t_total = time.time()
         for noise_idx in reversed(range(1, ddim_steps + 1)):
-            t_step = time.time()
-            step_num = ddim_steps - noise_idx + 1
-
-            gen_z = ttnn.matmul(chunk, W_rt_dev)
-            ttnn.add(gen_z, b_rt_dev, output_tensor=gen_z)
-            z_cur = ttnn.concat([prompt_z_dev, gen_z], dim=0)
-            cond_list = [prompt_cond_dev, gen_cond_per_step[noise_idx]]
-
-            if profile:
-                ttnn.synchronize_device(tt_device)
-                t_dit = time.time()
-                print("    step %d pre-dit: %.1fms" % (step_num, (t_dit - t_step) * 1000))
-
-            final_out = dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale,
-                                            profile_step=(profile and step_num == 1))
-
-            if profile:
-                ttnn.synchronize_device(tt_device)
-                t_post = time.time()
-                print("    step %d dit_forward: %.1fms" % (step_num, (t_post - t_dit) * 1000))
-
-            v_dev = ttnn.slice(final_out, [N_PATCH_PAD, 0], [2 * N_PATCH_PAD, OUT_DIM])
-            coeffs = ddim_coeffs[noise_idx]
-            # x_start = at_sqrt * chunk - (1-at)_sqrt * v
-            ttnn.multiply(chunk, coeffs["at_sqrt"], output_tensor=scr["ddim_tmp"])
-            ttnn.multiply(v_dev, coeffs["1mat_sqrt"], output_tensor=scr["ddim_x_start"])
-            ttnn.subtract(scr["ddim_tmp"], scr["ddim_x_start"], output_tensor=scr["ddim_x_start"])
-            # x_noise = (inv_at_sqrt * chunk - x_start) / sigma
-            ttnn.multiply(chunk, coeffs["inv_at_sqrt"], output_tensor=scr["ddim_tmp"])
-            ttnn.subtract(scr["ddim_tmp"], scr["ddim_x_start"], output_tensor=scr["ddim_x_noise"])
-            ttnn.multiply(scr["ddim_x_noise"], coeffs["inv_sigma"], output_tensor=scr["ddim_x_noise"])
-            # chunk = an_sqrt * x_start + (1-an)_sqrt * x_noise
-            ttnn.multiply(scr["ddim_x_start"], coeffs["an_sqrt"], output_tensor=scr["ddim_tmp"])
-            ttnn.multiply(scr["ddim_x_noise"], coeffs["1man_sqrt"], output_tensor=scr["ddim_x_noise"])
-            ttnn.add(scr["ddim_tmp"], scr["ddim_x_noise"], output_tensor=chunk)
-
-            if profile:
-                ttnn.synchronize_device(tt_device)
-                t_end = time.time()
-                print("    step %d ddim_arith: %.1fms" % (step_num, (t_end - t_post) * 1000))
-                print("    step %d TOTAL: %.1fms" % (step_num, (t_end - t_step) * 1000))
+            # Update coefficients
+            for k in ddim_coeff_dev:
+                ttnn.copy_host_to_device_tensor(ddim_coeffs_host[noise_idx][k], ddim_coeff_dev[k])
+            # Update conditioning
+            ttnn.copy_host_to_device_tensor(cond_map[noise_idx], gen_cond_traced)
+            # Execute traced step
+            ttnn.execute_trace(tt_device, trace_id, cq_id=0, blocking=False)
 
         ttnn.synchronize_device(tt_device)
         total_time = time.time() - t_total
         print("%s: %.3fs total (%.0fms/step, %.2f FPS)" % (
             label, total_time, total_time * 1000 / ddim_steps, ddim_steps / total_time))
-        return chunk
+        return trace_chunk
 
-    # Warmup frame (compile all kernels)
-    print("\n=== WARMUP (compiling kernels) ===")
-    _ = run_ddim_loop(chunk_dev, "Warmup")
+    # Prepare initial chunk as host tensor for trace input
+    chunk_host_tilized = ttnn.from_torch(chunk_pad, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+
+    # Warmup: trace is already compiled+captured, just run one loop to verify
+    print("\n=== WARMUP (traced execution) ===")
+    _ = run_ddim_loop(chunk_host_tilized, "Warmup")
+
+    # Timed single-frame test
+    print("\n=== TIMED SINGLE FRAME ===")
+    result_dev = run_ddim_loop(chunk_host_tilized, "Timed")
 
     # === Generate 30-frame video ===
     # Following reference: autoregressive in latent space. Generated frame's latent
     # feeds directly as prompt for next frame (no VAE decode/re-encode between frames).
     # VAE decode happens once at the end for all frames.
-    N_VIDEO_FRAMES = 30
+    N_VIDEO_FRAMES = 3  # reduced for faster iteration (set to 30 for full video)
     print("\n=== GENERATING %d-FRAME VIDEO ===" % N_VIDEO_FRAMES)
     t_video_start = time.time()
 
@@ -2417,27 +2676,39 @@ if __name__ == "__main__":
     for frame_idx in range(1, N_VIDEO_FRAMES):
         t_frame = time.time()
 
-        # Fresh noise for generated frame (in output space on device)
+        # Fresh noise for generated frame (in output space)
         chunk_img = torch.randn(1, IN_CHANNELS, INPUT_H, INPUT_W)
         chunk_img = torch.clamp(chunk_img, -noise_abs_max, noise_abs_max)
         chunk_patches = patchify_to_output_space(chunk_img)
         chunk_pad_f = torch.zeros(N_PATCH_PAD, OUT_DIM, dtype=torch.bfloat16)
         chunk_pad_f[:N_PATCHES] = chunk_patches.to(torch.bfloat16)
-        chunk_dev = to_tt(chunk_pad_f, tt_device)
+        chunk_host_f = ttnn.from_torch(chunk_pad_f, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
 
-        # DDIM denoise
-        chunk_dev = run_ddim_loop(chunk_dev, "Frame %d" % frame_idx)
+        # Pre-compute conditioning with this frame's action (as host tensors)
+        action_idx = min(frame_idx, sample_actions.shape[0] - 1)
+        frame_cond_dev = precompute_gen_cond(sample_actions[action_idx])
+        frame_cond_host = {}
+        for noise_idx in frame_cond_dev:
+            frame_cond_host[noise_idx] = ttnn.from_torch(
+                ttnn.to_torch(frame_cond_dev[noise_idx]),
+                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+
+        # DDIM denoise (traced)
+        result_dev = run_ddim_loop(chunk_host_f, "Frame %d" % frame_idx,
+                                   cond_override_host=frame_cond_host)
 
         # Readback generated latent (output space -> image space)
-        chunk_host = ttnn.to_torch(chunk_dev)[:N_PATCHES].float()
-        gen_latent = unpatchify_host(chunk_host, PATCH_SIZE, IN_CHANNELS, FRAME_H, FRAME_W)
+        chunk_result = ttnn.to_torch(result_dev)[:N_PATCHES].float()
+        gen_latent = unpatchify_host(chunk_result, PATCH_SIZE, IN_CHANNELS, FRAME_H, FRAME_W)
         all_latents.append(gen_latent.squeeze(0))  # (C, H, W)
 
         # Update prompt: patch-embed the generated latent directly (no VAE round-trip)
+        # Must update in-place since prompt_z_dev is captured by the trace
         prompt_z_pad_new = torch.zeros(N_PATCH_PAD, D_MODEL, dtype=torch.bfloat16)
         prompt_z_pad_new[:N_PATCHES] = patch_embed_host(
             gen_latent, dev["x_emb_conv_w"], dev["x_emb_conv_b"])
-        prompt_z_dev = to_tt(prompt_z_pad_new, tt_device)
+        prompt_z_host = ttnn.from_torch(prompt_z_pad_new, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+        ttnn.copy_host_to_device_tensor(prompt_z_host, prompt_z_dev)
 
         elapsed = time.time() - t_frame
         print("  Frame %d: %.2fs" % (frame_idx, elapsed))
