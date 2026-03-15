@@ -1934,7 +1934,8 @@ def build_per_frame_adaln(silu_cond_list, prefix, dev, scr, tt_device):
     else:
         return ttnn.concat(per_frame_expanded, dim=0)
 
-PROFILE_BLOCKS = True  # Set True for timing breakdown
+PROFILE_BLOCKS = False
+PROFILE_BLOCK_DEVICE = "blocks.1.s"  # sync-profile this specific block
 
 def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mean_scale, attn_type="spatial"):
     """Run one spatial or temporal sub-block.
@@ -1968,25 +1969,33 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
             def report(self, prefix, attn_type): pass
         _timer = _DummyTimer()
 
+    _do_dev_profile = (prefix == PROFILE_BLOCK_DEVICE)
+    if _do_dev_profile:
+        import time as _dt
+        ttnn.synchronize_device(tt_device)
+        _t0 = _dt.time()
+
     # Compute per-frame adaLN params (SiLU already applied to cond) - packed (SEQ, 6*D_MODEL)
     adaln_packed = build_per_frame_adaln(silu_cond_list, prefix, dev, scr, tt_device)
     _timer.mark("adaln")
+    if _do_dev_profile:
+        ttnn.synchronize_device(tt_device)
+        _t1 = _dt.time(); print("      %s adaln: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
 
     # Fused LayerNorm + adaLN modulate (reads shift/scale from packed tensor)
     fused_ln_adaln_d1024(x_tt, scaler, mean_scale, adaln_packed, scr["modulated"])
     _timer.mark("norm+mod")
+    if _do_dev_profile:
+        ttnn.synchronize_device(tt_device)
+        _t1 = _dt.time(); print("      %s norm+mod: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
 
     if attn_type == "spatial":
-
-        # Mega-fused: QKV matmul + RoPE + SDPA in one kernel
         mega_qkv_rope_sdpa(scr["modulated"], dev["%s.qkv_full_w" % prefix],
                            dev["spatial_cos"], dev["spatial_sin_perm"],
                            scaler, scr["sdpa_out"])
         attn_2d = scr["sdpa_out"]
         _timer.mark("qkv+sdpa")
-
     else:
-        # Temporal mega kernel: fused QKV+RoPE+SDPA (T=2 causal)
         mega_temporal_qkv_rope_sdpa(
             scr["modulated"], dev["%s.qkv_full_w" % prefix],
             dev["temporal_cos"], dev["temporal_sin_perm"],
@@ -1994,8 +2003,10 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
             scr["sdpa_out"])
         attn_2d = scr["sdpa_out"]
         _timer.mark("sdpa")
+    if _do_dev_profile:
+        ttnn.synchronize_device(tt_device)
+        _t1 = _dt.time(); print("      %s attn: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
 
-    # Mega kernel B: O proj + residual + LN + modulate + FC1 + GELU + FC2 + residual
     mega_post_attn_kernel(attn_2d, x_tt, adaln_packed,
                           dev["%s.out_w" % prefix], dev["%s.out_b" % prefix],
                           dev["%s.fc1_w" % prefix], dev["%s.fc1_b" % prefix],
@@ -2003,6 +2014,9 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
                           scaler, mean_scale,
                           scr["z_scratch"], scr["gelu_scratch"], scr["z_a"])
     _timer.mark("post_attn")
+    if _do_dev_profile:
+        ttnn.synchronize_device(tt_device)
+        _t1 = _dt.time(); print("      %s post_attn: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
 
     _timer.report(prefix, attn_type)
     return scr["z_a"]
@@ -2030,7 +2044,7 @@ def compute_cond_for_frame(t_scalar, action_vec, dev, scr, tt_device):
     cond_pad = cond_bf16.unsqueeze(0).expand(TILE, -1).contiguous()
     return to_tt(cond_pad, tt_device)
 
-def dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale):
+def dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale, profile_step=False):
     """DiT forward pass, all on device. Returns final_out as device tensor.
     z_cur: (SEQ, D_MODEL) device tensor
     cond_list: list of T device tensors for conditioning
@@ -2039,6 +2053,11 @@ def dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale
     T = len(cond_list)
     SEQ = N_PATCH_PAD * T
 
+    if profile_step:
+        import time as _t
+        _pt = _t.time
+        ttnn.synchronize_device(tt_device)
+
     # Pre-compute SiLU(cond) once per step, reuse across all 32 sub-blocks + final layer
     silu_cond_list = []
     for t_idx in range(T):
@@ -2046,17 +2065,36 @@ def dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale
         silu_kernel(cond_list[t_idx], silu_out)
         silu_cond_list.append(silu_out)
 
+    if profile_step:
+        ttnn.synchronize_device(tt_device)
+        print("  [PROFILE] silu: %.1fms" % ((_pt() - _pt.__self__) if False else 0))
+
     # 16 blocks: each has spatial + temporal sub-block
+    if profile_step:
+        t_blocks = _pt()
     for block_idx in range(N_BLOCKS):
         z_cur = run_sub_block(
             "blocks.%d.s" % block_idx, z_cur, silu_cond_list,
             dev, scr, tt_device, scaler, mean_scale, attn_type="spatial"
         )
+        if profile_step:
+            ttnn.synchronize_device(tt_device)
+            t1 = _pt()
+            print("      block %d.s: %.1fms" % (block_idx, (t1 - t_blocks) * 1000))
+            t_blocks = t1
         z_cur = run_sub_block(
             "blocks.%d.t" % block_idx, z_cur, silu_cond_list,
             dev, scr, tt_device, scaler, mean_scale, attn_type="temporal"
         )
+        if profile_step:
+            ttnn.synchronize_device(tt_device)
+            t1 = _pt()
+            print("      block %d.t: %.1fms" % (block_idx, (t1 - t_blocks) * 1000))
+            t_blocks = t1
 
+    if profile_step:
+        print("      === final layer ===")
+        t_blocks = _pt()
     # Final layer: per-frame adaLN (SiLU already computed)
     N_REPEAT = N_PATCH_PAD // TILE  # 5
     per_frame_final = []
@@ -2076,7 +2114,11 @@ def dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale
     layernorm_d1024(z_cur, dev["ln_w_ones"], dev["ln_b_zeros"], scaler, mean_scale, scr["normed"])
     adaln_modulate_kernel(scr["normed"], shift_tt, scale_tt, scr["modulated"])
     linear_k32(scr["modulated"], dev["final_linear_w"], scr["final_out"])
-    return ttnn.add(scr["final_out"], dev["final_linear_b"])
+    result = ttnn.add(scr["final_out"], dev["final_linear_b"])
+    if profile_step:
+        ttnn.synchronize_device(tt_device)
+        print("      final_layer: %.1fms" % ((_pt() - t_blocks) * 1000))
+    return result
 
 # ============================================================
 # VAE (CPU only)
@@ -2221,59 +2263,71 @@ if __name__ == "__main__":
             "1man_sqrt": float((1 - an) ** 0.5),
         }
 
-    print("\nRunning DDIM denoising (%d steps, T=%d, all on device)..." % (ddim_steps, N_FRAMES))
-    t_total = time.time()
+    def run_ddim_loop(chunk_in, label, profile=False):
+        """Run full DDIM loop. Returns final chunk_dev."""
+        chunk = chunk_in
+        t_total = time.time()
+        for noise_idx in reversed(range(1, ddim_steps + 1)):
+            t_step = time.time()
+            step_num = ddim_steps - noise_idx + 1
 
-    for noise_idx in reversed(range(1, ddim_steps + 1)):
-        t_step = time.time()
-        noise_level = int(noise_range[noise_idx].item())
-        print("Step %d/%d (noise_level=%d)..." % (ddim_steps - noise_idx + 1, ddim_steps, noise_level))
+            gen_z = ttnn.matmul(chunk, W_rt_dev)
+            ttnn.add(gen_z, b_rt_dev, output_tensor=gen_z)
+            z_cur = ttnn.concat([prompt_z_dev, gen_z], dim=0)
+            cond_list = [prompt_cond_dev, gen_cond_per_step[noise_idx]]
 
-        # Generated frame: output_space -> input_space via round-trip matmul
-        gen_z = ttnn.matmul(chunk_dev, W_rt_dev)  # (160, 64) @ (64, 1024) -> (160, 1024)
-        gen_z = ttnn.add(gen_z, b_rt_dev)
+            if profile:
+                ttnn.synchronize_device(tt_device)
+                t_dit = time.time()
+                print("    step %d pre-dit: %.1fms" % (step_num, (t_dit - t_step) * 1000))
 
-        # Concat prompt + generated frame -> z_cur (320, 1024)
-        z_cur = ttnn.concat([prompt_z_dev, gen_z], dim=0)
+            final_out = dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale,
+                                            profile_step=(profile and step_num == 1))
 
-        # Conditioning (pre-computed, no host compute or to_tt in loop)
-        cond_list = [prompt_cond_dev, gen_cond_per_step[noise_idx]]
+            if profile:
+                ttnn.synchronize_device(tt_device)
+                t_post = time.time()
+                print("    step %d dit_forward: %.1fms" % (step_num, (t_post - t_dit) * 1000))
 
-        # DiT forward (all on device) -> final_out (320, 64)
-        final_out = dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale)
+            v_dev = ttnn.slice(final_out, [N_PATCH_PAD, 0], [2 * N_PATCH_PAD, OUT_DIM])
+            coeffs = ddim_coeffs[noise_idx]
+            x_start = ttnn.subtract(
+                ttnn.multiply(chunk, coeffs["at_sqrt"]),
+                ttnn.multiply(v_dev, coeffs["1mat_sqrt"]))
+            x_noise = ttnn.multiply(
+                ttnn.subtract(ttnn.multiply(chunk, coeffs["inv_at_sqrt"]), x_start),
+                coeffs["inv_sigma"])
+            chunk = ttnn.add(
+                ttnn.multiply(x_start, coeffs["an_sqrt"]),
+                ttnn.multiply(x_noise, coeffs["1man_sqrt"]))
 
-        # Extract velocity for generated frame (rows N_PATCH_PAD to 2*N_PATCH_PAD)
-        v_dev = ttnn.slice(final_out, [N_PATCH_PAD, 0], [2 * N_PATCH_PAD, OUT_DIM])
+            if profile:
+                ttnn.synchronize_device(tt_device)
+                t_end = time.time()
+                print("    step %d ddim_arith: %.1fms" % (step_num, (t_end - t_post) * 1000))
+                print("    step %d TOTAL: %.1fms" % (step_num, (t_end - t_step) * 1000))
 
-        # DDIM update (all elementwise on device, coefficients pre-computed)
-        coeffs = ddim_coeffs[noise_idx]
+        ttnn.synchronize_device(tt_device)
+        total_time = time.time() - t_total
+        print("%s: %.3fs total (%.0fms/step, %.2f FPS)" % (
+            label, total_time, total_time * 1000 / ddim_steps, ddim_steps / total_time))
+        return chunk
 
-        # x_start = at_sqrt * chunk - (1-at)_sqrt * v
-        x_start = ttnn.subtract(
-            ttnn.multiply(chunk_dev, coeffs["at_sqrt"]),
-            ttnn.multiply(v_dev, coeffs["1mat_sqrt"]))
-        # x_noise = (inv_at_sqrt * chunk - x_start) / sigma
-        x_noise = ttnn.multiply(
-            ttnn.subtract(ttnn.multiply(chunk_dev, coeffs["inv_at_sqrt"]), x_start),
-            coeffs["inv_sigma"])
-        # chunk = an_sqrt * x_start + (1-an)_sqrt * x_noise
-        chunk_dev = ttnn.add(
-            ttnn.multiply(x_start, coeffs["an_sqrt"]),
-            ttnn.multiply(x_noise, coeffs["1man_sqrt"]))
+    # Warmup frame (compile all kernels)
+    print("\n=== WARMUP (compiling kernels) ===")
+    _ = run_ddim_loop(chunk_dev, "Warmup")
 
-        print("  Step dispatch: %.3fs" % (time.time() - t_step))
+    # Reset chunk for real measurement
+    chunk_dev = to_tt(chunk_pad, tt_device)
 
-    # Sync once at end, measure total including device execution
-    t_sync = time.time()
-    ttnn.synchronize_device(tt_device)
-    sync_time = time.time() - t_sync
-    total_time = time.time() - t_total
-    dispatch_time = total_time - sync_time
-    print("\nDDIM complete: %.3fs total (dispatch: %.3fs, device: %.3fs)" % (
-        total_time, dispatch_time, sync_time))
-    print("  Per step: %.0fms avg (%.1f FPS)" % (
-        total_time * 1000 / ddim_steps,
-        ddim_steps / total_time))
+    # Measured frame (no compilation)
+    print("\n=== MEASURED FRAME (no compilation, per-step sync) ===")
+    chunk_dev = run_ddim_loop(chunk_dev, "Measured", profile=True)
+
+    # Speed run (no sync between steps, true throughput)
+    chunk_dev2 = to_tt(chunk_pad, tt_device)
+    print("\n=== SPEED RUN (no per-step sync) ===")
+    _ = run_ddim_loop(chunk_dev2, "Speed")
 
     # Final readback
     chunk_host = ttnn.to_torch(chunk_dev)[:N_PATCHES].float()  # (144, 64)
