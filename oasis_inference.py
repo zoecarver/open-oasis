@@ -2860,6 +2860,69 @@ def vae_unpatchify(patches):
     return x.reshape(1, 3, 360, 640)
 
 # ============================================================
+# On-device unpatchify bridge: DiT output (160, 64) -> VAE input (576, 32)
+# ============================================================
+
+def build_bridge_matrices(tt_device):
+    """Precompute the three matrices for on-device unpatchify.
+
+    The DiT output (N_PATCH_PAD=160, OUT_DIM=64) contains patches in
+    (h, w, p, q, c) layout where h=9, w=16, p=q=2, c=16.
+    The VAE input needs (576, 32) with data in cols 0-15 and zeros in 16-31,
+    scaled by 1/SCALING_FACTOR.
+
+    This is done as: R @ input -> tmp; tmp *= mask; tmp @ C -> output
+    """
+    # Row permutation: (576, 160) maps each output row to the correct input row
+    R = torch.zeros(VAE_SEQ_LEN, N_PATCH_PAD, dtype=torch.bfloat16)
+    for r in range(VAE_SEQ_LEN):
+        hp = r // 32  # h*2+p index, in [0, 18)
+        wq = r % 32   # w*2+q index, in [0, 32)
+        h = hp // PATCH_SIZE
+        w = wq // PATCH_SIZE
+        in_row = h * FRAME_W + w
+        if in_row < N_PATCHES:
+            R[r, in_row] = 1.0
+
+    # Column mask: (576, 64) selects the right 16 channels per row, with scaling
+    inv_scale = 1.0 / SCALING_FACTOR
+    mask = torch.zeros(VAE_SEQ_LEN, OUT_DIM, dtype=torch.bfloat16)
+    for r in range(VAE_SEQ_LEN):
+        hp = r // 32
+        wq = r % 32
+        p = hp % PATCH_SIZE
+        q = wq % PATCH_SIZE
+        col_start = p * 32 + q * IN_CHANNELS
+        mask[r, col_start:col_start + IN_CHANNELS] = inv_scale
+
+    # Column collapse: (64, 32) maps 4 col ranges into cols 0-15, zeros in 16-31
+    C = torch.zeros(OUT_DIM, TILE, dtype=torch.bfloat16)
+    for k in range(OUT_DIM):
+        c = k % IN_CHANNELS
+        C[k, c] = 1.0
+
+    bridge = {
+        "R": to_tt(R, tt_device),
+        "mask": to_tt(mask, tt_device),
+        "C": to_tt(C, tt_device),
+    }
+    return bridge
+
+
+def bridge_unpatchify(dit_output, bridge, bridge_tmp, vae_input):
+    """On-device unpatchify: (160, 64) -> (576, 32) via 3 ops.
+
+    dit_output: (N_PATCH_PAD, OUT_DIM) device tensor
+    bridge: dict with R, mask, C device tensors
+    bridge_tmp: (VAE_SEQ_LEN, OUT_DIM) scratch device tensor
+    vae_input: (VAE_SEQ_LEN, 32) output device tensor
+    """
+    ttnn.matmul(bridge["R"], dit_output, optional_output_tensor=bridge_tmp)
+    ttnn.multiply(bridge_tmp, bridge["mask"], output_tensor=bridge_tmp)
+    ttnn.matmul(bridge_tmp, bridge["C"], optional_output_tensor=vae_input)
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -2995,15 +3058,30 @@ if __name__ == "__main__":
             ddim_coeffs_host[noise_idx][k] = ttnn.from_torch(
                 ddim_coeffs_host[noise_idx][k], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
 
-    # Device coefficient tensors (updated before each traced step)
-    ddim_coeff_dev = {}
-    for k in ["at_sqrt", "1mat_sqrt", "inv_at_sqrt", "inv_sigma", "an_sqrt", "1man_sqrt"]:
-        ddim_coeff_dev[k] = to_tt(torch.zeros(*CHUNK_SHAPE, dtype=torch.bfloat16), tt_device)
+    COEFF_KEYS = ["at_sqrt", "1mat_sqrt", "inv_at_sqrt", "inv_sigma", "an_sqrt", "1man_sqrt"]
 
-    # Mutable conditioning tensors for trace (one per frame in window, updated before each step)
-    cond_traced = []
-    for f in range(N_FRAMES):
-        cond_traced.append(to_tt(torch.zeros(TILE, D_MODEL, dtype=torch.bfloat16), tt_device))
+    # Per-step device coefficient tensors (4 sets, one per DDIM step in the trace)
+    ddim_coeff_per_step = []
+    for _ in range(ddim_steps):
+        step_coeffs = {}
+        for k in COEFF_KEYS:
+            step_coeffs[k] = to_tt(torch.zeros(*CHUNK_SHAPE, dtype=torch.bfloat16), tt_device)
+        ddim_coeff_per_step.append(step_coeffs)
+
+    # Shared context conditioning (same across all DDIM steps within a frame)
+    cond_context = []
+    for f in range(N_FRAMES - 1):
+        cond_context.append(to_tt(torch.zeros(TILE, D_MODEL, dtype=torch.bfloat16), tt_device))
+
+    # Per-step gen-frame conditioning (different per DDIM step)
+    gen_cond_step_dev = []
+    for _ in range(ddim_steps):
+        gen_cond_step_dev.append(to_tt(torch.zeros(TILE, D_MODEL, dtype=torch.bfloat16), tt_device))
+
+    # Build per-step cond_traced lists: shared context + step-specific gen cond
+    cond_traced_per_step = []
+    for step_idx in range(ddim_steps):
+        cond_traced_per_step.append(cond_context + [gen_cond_step_dev[step_idx]])
 
     # Context frames: T-1 frames of patch-embedded latents (updated between frames)
     context_z_dev = to_tt(torch.zeros((N_FRAMES - 1) * N_PATCH_PAD, D_MODEL, dtype=torch.bfloat16), tt_device)
@@ -3011,120 +3089,169 @@ if __name__ == "__main__":
     # Traced chunk buffer: the trace operates on this tensor in-place
     trace_chunk = to_tt(torch.zeros(*CHUNK_SHAPE, dtype=torch.bfloat16), tt_device)
 
-    def ddim_step_fn(chunk):
-        """One DDIM step: round-trip + DiT forward + DDIM arithmetic.
-        Uses cond_traced and ddim_coeff_dev which are updated before each call."""
+    # Bridge matrices for on-device unpatchify
+    print("Building bridge matrices...")
+    bridge = build_bridge_matrices(tt_device)
+    bridge_tmp = zeros_tt((VAE_SEQ_LEN, OUT_DIM), tt_device)
+
+    def ddim_step_fn(chunk, step_coeffs, cond_list):
+        """One DDIM step with explicit per-step coefficients and conditioning."""
         gen_z = ttnn.linear(chunk, W_rt_dev, bias=b_rt_dev)
         z_cur = ttnn.concat([context_z_dev, gen_z], dim=0)
 
-        final_out = dit_forward_device(z_cur, cond_traced, dev, scr, tt_device, scaler, mean_scale)
+        final_out = dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale)
 
-        # Extract velocity for the last frame (the one being generated)
         gen_start = (N_FRAMES - 1) * N_PATCH_PAD
         v_dev = ttnn.slice(final_out, [gen_start, 0], [gen_start + N_PATCH_PAD, OUT_DIM])
         # x_start = at_sqrt * chunk - (1-at)_sqrt * v
-        ttnn.multiply(chunk, ddim_coeff_dev["at_sqrt"], output_tensor=scr["ddim_tmp"])
-        ttnn.multiply(v_dev, ddim_coeff_dev["1mat_sqrt"], output_tensor=scr["ddim_x_start"])
+        ttnn.multiply(chunk, step_coeffs["at_sqrt"], output_tensor=scr["ddim_tmp"])
+        ttnn.multiply(v_dev, step_coeffs["1mat_sqrt"], output_tensor=scr["ddim_x_start"])
         ttnn.subtract(scr["ddim_tmp"], scr["ddim_x_start"], output_tensor=scr["ddim_x_start"])
         # x_noise = (inv_at_sqrt * chunk - x_start) / sigma
-        ttnn.multiply(chunk, ddim_coeff_dev["inv_at_sqrt"], output_tensor=scr["ddim_tmp"])
+        ttnn.multiply(chunk, step_coeffs["inv_at_sqrt"], output_tensor=scr["ddim_tmp"])
         ttnn.subtract(scr["ddim_tmp"], scr["ddim_x_start"], output_tensor=scr["ddim_x_noise"])
-        ttnn.multiply(scr["ddim_x_noise"], ddim_coeff_dev["inv_sigma"], output_tensor=scr["ddim_x_noise"])
+        ttnn.multiply(scr["ddim_x_noise"], step_coeffs["inv_sigma"], output_tensor=scr["ddim_x_noise"])
         # chunk = an_sqrt * x_start + (1-an)_sqrt * x_noise
-        ttnn.multiply(scr["ddim_x_start"], ddim_coeff_dev["an_sqrt"], output_tensor=scr["ddim_tmp"])
-        ttnn.multiply(scr["ddim_x_noise"], ddim_coeff_dev["1man_sqrt"], output_tensor=scr["ddim_x_noise"])
+        ttnn.multiply(scr["ddim_x_start"], step_coeffs["an_sqrt"], output_tensor=scr["ddim_tmp"])
+        ttnn.multiply(scr["ddim_x_noise"], step_coeffs["1man_sqrt"], output_tensor=scr["ddim_x_noise"])
         ttnn.add(scr["ddim_tmp"], scr["ddim_x_noise"], output_tensor=chunk)
         return chunk
 
-    # === Trace capture ===
-    print("Compiling DDIM step...")
+    # === Compile: run full pipeline once to warm up (no trace yet) ===
+    print("Compiling full pipeline (4 DDIM steps + bridge + VAE)...")
     t_compile = time.time()
-    first_noise_idx = ddim_steps
-    for k in ddim_coeff_dev:
-        ttnn.copy_host_to_device_tensor(ddim_coeffs_host[first_noise_idx][k], ddim_coeff_dev[k])
-    for f in range(N_FRAMES - 1):
-        prompt_cond_host = ttnn.from_torch(
-            readback_torch(prompt_cond_dev),
-            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
-        ttnn.copy_host_to_device_tensor(prompt_cond_host, cond_traced[f])
-    first_cond_host = ttnn.from_torch(
-        readback_torch(gen_cond_per_step[first_noise_idx]),
+    # Fill device tensors with valid data for compilation
+    prompt_cond_host_til = ttnn.from_torch(
+        readback_torch(prompt_cond_dev),
         dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
-    ttnn.copy_host_to_device_tensor(first_cond_host, cond_traced[N_FRAMES - 1])
     context_host = ttnn.from_torch(
         torch.cat([readback_torch(prompt_z_dev)] * (N_FRAMES - 1), dim=0),
         dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
     ttnn.copy_host_to_device_tensor(context_host, context_z_dev)
-    ddim_step_fn(trace_chunk)
-    ttnn.synchronize_device(tt_device)
-    print("Compile done in %.1fs" % (time.time() - t_compile))
-    print("Capturing trace...")
-    t_trace = time.time()
-    trace_id = ttnn.begin_trace_capture(tt_device, cq_id=0)
-    traced_output = ddim_step_fn(trace_chunk)
-    ttnn.end_trace_capture(tt_device, trace_id, cq_id=0)
-    ttnn.synchronize_device(tt_device)
-    print("Trace captured in %.1fs" % (time.time() - t_trace))
-    gen_cond_host = {}
-    for noise_idx in gen_cond_per_step:
-        gen_cond_host[noise_idx] = ttnn.from_torch(
+    for f in range(N_FRAMES - 1):
+        ttnn.copy_host_to_device_tensor(prompt_cond_host_til, cond_context[f])
+    for step_idx in range(ddim_steps):
+        noise_idx = ddim_steps - step_idx  # reversed: step 0 = highest noise
+        for k in COEFF_KEYS:
+            ttnn.copy_host_to_device_tensor(ddim_coeffs_host[noise_idx][k],
+                                            ddim_coeff_per_step[step_idx][k])
+        gen_cond_til = ttnn.from_torch(
             readback_torch(gen_cond_per_step[noise_idx]),
             dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+        ttnn.copy_host_to_device_tensor(gen_cond_til, gen_cond_step_dev[step_idx])
+    # Run the full pipeline once (compilation pass)
+    for step_idx in range(ddim_steps):
+        ddim_step_fn(trace_chunk, ddim_coeff_per_step[step_idx],
+                     cond_traced_per_step[step_idx])
+    bridge_unpatchify(trace_chunk, bridge, bridge_tmp, vae_scr["vae_input"])
+    vae_decode_forward(vae_dev, vae_scr, scaler, mean_scale)
+    ttnn.synchronize_device(tt_device)
+    print("Compile done in %.1fs" % (time.time() - t_compile))
+
+    # === Decode prompt frame (untraced, before trace capture) ===
+    prompt_lat = prompt_latent[0, 0]  # (C, H, W)
+    z_flat = rearrange(prompt_lat.float(), "c h w -> (h w) c") / SCALING_FACTOR
+    z_padded = torch.zeros(VAE_SEQ_LEN, 32, dtype=torch.bfloat16)
+    z_padded[:, :VAE_LATENT_DIM] = z_flat.to(torch.bfloat16)
+    z_host = ttnn.from_torch(z_padded, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+    ttnn.copy_host_to_device_tensor(z_host, vae_scr["vae_input"])
+    vae_decode_forward(vae_dev, vae_scr, scaler, mean_scale)
+    ttnn.synchronize_device(tt_device)
+    prompt_vae_result = readback_torch(vae_scr["pred_out"]).float()
+    prompt_patches = prompt_vae_result[:, :VAE_PATCH_DIM]
+    prompt_image = vae_unpatchify(prompt_patches)
+    prompt_decoded = torch.clamp((prompt_image + 1) / 2, 0, 1).squeeze(0).permute(1, 2, 0)
+    print("Prompt frame decoded via VAE")
+
+    # === Capture single trace: 4 DDIM steps + bridge + VAE decode ===
+    print("Capturing single trace...")
+    t_trace = time.time()
+    trace_id = ttnn.begin_trace_capture(tt_device, cq_id=0)
+    for step_idx in range(ddim_steps):
+        ddim_step_fn(trace_chunk, ddim_coeff_per_step[step_idx],
+                     cond_traced_per_step[step_idx])
+    bridge_unpatchify(trace_chunk, bridge, bridge_tmp, vae_scr["vae_input"])
+    vae_decode_forward(vae_dev, vae_scr, scaler, mean_scale)
+    ttnn.end_trace_capture(tt_device, trace_id, cq_id=0)
+    ttnn.synchronize_device(tt_device)
+    print("Single trace captured in %.1fs" % (time.time() - t_trace))
+
+    # Host-only conditioning helper (no device allocation, safe with active traces)
+    def compute_cond_host(t_scalar, action_vec):
+        t_freq = timestep_embedding(torch.tensor([t_scalar]), FREQ_DIM)
+        h = (t_freq[0].float() @ dev["t_emb_w0_host"]) + dev["t_emb_b0_host"]
+        h = h * torch.sigmoid(h)
+        cond = (h @ dev["t_emb_w2_host"]) + dev["t_emb_b2_host"]
+        if action_vec is not None:
+            ext = (action_vec.float() @ dev["ext_cond_w_host"]) + dev["ext_cond_b_host"]
+            cond = cond + ext
+        cond_pad = cond.to(torch.bfloat16).unsqueeze(0).expand(TILE, -1).contiguous()
+        return ttnn.from_torch(cond_pad, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+
+    def precompute_gen_cond_host(action_vec):
+        """Returns dict {noise_idx: host_tilized_tensor} for all DDIM steps."""
+        cond_per_step = {}
+        for noise_idx in reversed(range(1, ddim_steps + 1)):
+            noise_level = int(noise_range[noise_idx].item())
+            cond_per_step[noise_idx] = compute_cond_host(noise_level, action_vec)
+        return cond_per_step
+
+    # Prepare host-side prompt conditioning (reusable across frames)
     prompt_cond_host = ttnn.from_torch(
         readback_torch(prompt_cond_dev),
         dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
 
-    def run_ddim_loop(chunk_in_host, label, context_cond_hosts=None, gen_cond_map=None):
+    def run_full_frame(chunk_in_host, label, context_cond_hosts=None, gen_cond_map=None):
+        """Execute single trace: copy all inputs, run 4 DDIM + bridge + VAE, return."""
         if gen_cond_map is None:
-            gen_cond_map = gen_cond_host
+            gen_cond_map = precompute_gen_cond_host(prompt_action)
         if context_cond_hosts is None:
             context_cond_hosts = [prompt_cond_host] * (N_FRAMES - 1)
+        # Copy noise chunk
         ttnn.copy_host_to_device_tensor(chunk_in_host, trace_chunk)
+        # Copy context conditioning
         for f in range(N_FRAMES - 1):
-            ttnn.copy_host_to_device_tensor(context_cond_hosts[f], cond_traced[f])
-        t_total = time.time()
-        for noise_idx in reversed(range(1, ddim_steps + 1)):
-            for k in ddim_coeff_dev:
-                ttnn.copy_host_to_device_tensor(ddim_coeffs_host[noise_idx][k], ddim_coeff_dev[k])
-            ttnn.copy_host_to_device_tensor(gen_cond_map[noise_idx], cond_traced[N_FRAMES - 1])
-            ttnn.execute_trace(tt_device, trace_id, cq_id=0, blocking=False)
+            ttnn.copy_host_to_device_tensor(context_cond_hosts[f], cond_context[f])
+        # Copy per-step coefficients and gen conditioning
+        for step_idx in range(ddim_steps):
+            noise_idx = ddim_steps - step_idx  # reversed: step 0 = highest noise
+            for k in COEFF_KEYS:
+                ttnn.copy_host_to_device_tensor(ddim_coeffs_host[noise_idx][k],
+                                                ddim_coeff_per_step[step_idx][k])
+            ttnn.copy_host_to_device_tensor(gen_cond_map[noise_idx],
+                                            gen_cond_step_dev[step_idx])
+        # Single trace execution: 4 DDIM steps + bridge + VAE
+        t_exec = time.time()
+        ttnn.execute_trace(tt_device, trace_id, cq_id=0, blocking=False)
         ttnn.synchronize_device(tt_device)
-        total_time = time.time() - t_total
-        print("%s: %.3fs total (%.0fms/step, %.2f FPS)" % (
-            label, total_time, total_time * 1000 / ddim_steps, ddim_steps / total_time))
-        return trace_chunk
+        exec_time = time.time() - t_exec
+        print("%s: %.3fs (%.1f FPS)" % (label, exec_time, 1.0 / exec_time))
+        return vae_scr["pred_out"]
 
     chunk_host_tilized = ttnn.from_torch(chunk_pad, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
-    print("\n=== WARMUP (traced execution, %d chips) ===" % N_CHIPS)
-    _ = run_ddim_loop(chunk_host_tilized, "Warmup")
+    print("\n=== WARMUP (single trace: 4xDDIM + bridge + VAE) ===")
+    _ = run_full_frame(chunk_host_tilized, "Warmup")
     print("\n=== TIMED SINGLE FRAME ===")
-    result_dev = run_ddim_loop(chunk_host_tilized, "Timed")
+    _ = run_full_frame(chunk_host_tilized, "Timed")
 
     # === Generate video ===
-    # Sliding window: T-1 context frames + 1 generated frame.
-    # Generated frame's latent feeds into context window for next frame.
-    # VAE decode happens once at the end for all frames.
     N_VIDEO_FRAMES = 30
-    print("\n=== GENERATING %d-FRAME VIDEO (T=%d window) ===" % (N_VIDEO_FRAMES, N_FRAMES))
+    print("\n=== GENERATING %d-FRAME VIDEO (single trace) ===" % N_VIDEO_FRAMES)
     t_video_start = time.time()
 
-    # Collect all latents for batch VAE decode at the end
-    all_latents = [prompt_latent[0, 0].clone()]  # frame 0 = prompt
+    all_decoded_frames = [prompt_decoded]
 
-    # Sliding window of patch-embedded frames (host tensors, each (N_PATCH_PAD, D_MODEL))
-    # Start with prompt replicated to fill T-1 context slots
+    # Sliding window
     prompt_z_torch = torch.zeros(N_PATCH_PAD, D_MODEL, dtype=torch.bfloat16)
     prompt_z_torch[:N_PATCHES] = patch_embed_host(
         prompt_latent[0, 0].unsqueeze(0), dev["x_emb_conv_w"], dev["x_emb_conv_b"])
     context_window_z = [prompt_z_torch.clone() for _ in range(N_FRAMES - 1)]
-
-    # Sliding window of per-frame conditioning (host tensors for trace updates)
     context_cond_window = [prompt_cond_host] * (N_FRAMES - 1)
 
     for frame_idx in range(1, N_VIDEO_FRAMES):
         t_frame = time.time()
 
-        # Fresh noise for generated frame (in output space)
+        # Fresh noise
         chunk_img = torch.randn(1, IN_CHANNELS, INPUT_H, INPUT_W)
         chunk_img = torch.clamp(chunk_img, -noise_abs_max, noise_abs_max)
         chunk_patches = patchify_to_output_space(chunk_img)
@@ -3132,43 +3259,40 @@ if __name__ == "__main__":
         chunk_pad_f[:N_PATCHES] = chunk_patches.to(torch.bfloat16)
         chunk_host_f = ttnn.from_torch(chunk_pad_f, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
 
-        # Update context_z_dev with current sliding window
-        context_cat = torch.cat(context_window_z, dim=0)  # ((T-1)*N_PATCH_PAD, D_MODEL)
+        # Update context (host-only, no device alloc)
+        context_cat = torch.cat(context_window_z, dim=0)
         context_host = ttnn.from_torch(context_cat, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
         ttnn.copy_host_to_device_tensor(context_host, context_z_dev)
 
-        # Pre-compute gen conditioning with this frame's action
+        # Conditioning (host-only, no device alloc)
         action_idx = min(frame_idx, sample_actions.shape[0] - 1)
-        frame_cond_dev = precompute_gen_cond(sample_actions[action_idx], ddim_steps, noise_range, dev, scr, tt_device)
+        frame_cond_host = precompute_gen_cond_host(sample_actions[action_idx])
 
-        frame_cond_host = {}
-        for noise_idx in frame_cond_dev:
-            frame_cond_host[noise_idx] = ttnn.from_torch(
-                readback_torch(frame_cond_dev[noise_idx]),
-                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
-        result_dev = run_ddim_loop(chunk_host_f, "Frame %d" % frame_idx,
-                                   context_cond_hosts=context_cond_window,
-                                   gen_cond_map=frame_cond_host)
+        # Run single trace: 4 DDIM + bridge + VAE
+        pred_out = run_full_frame(chunk_host_f, "Frame %d" % frame_idx,
+                                  context_cond_hosts=context_cond_window,
+                                  gen_cond_map=frame_cond_host)
 
-        # Readback generated latent (output space -> image space)
-        chunk_result = readback_torch(result_dev)[:N_PATCHES].float()
+        # Readback VAE output directly (no host bridge needed!)
+        result = readback_torch(pred_out).float()
+        patches = result[:, :VAE_PATCH_DIM]
+        image = vae_unpatchify(patches)
+        decoded = torch.clamp((image + 1) / 2, 0, 1)
+        all_decoded_frames.append(decoded.squeeze(0).permute(1, 2, 0))
+
+        # Update context window: need DiT output for patch embedding
+        # The DiT output is in trace_chunk after the 4 DDIM steps (before bridge overwrites it)
+        # But bridge reads trace_chunk, doesn't modify it. So trace_chunk still has the
+        # denoised DiT output after bridge_unpatchify.
+        chunk_result = readback_torch(trace_chunk)[:N_PATCHES].float()
         gen_latent = unpatchify_host(chunk_result, PATCH_SIZE, IN_CHANNELS, FRAME_H, FRAME_W)
-        all_latents.append(gen_latent.squeeze(0))  # (C, H, W)
-
-        # Patch-embed generated frame for context window
         new_z = torch.zeros(N_PATCH_PAD, D_MODEL, dtype=torch.bfloat16)
         new_z[:N_PATCHES] = patch_embed_host(
             gen_latent, dev["x_emb_conv_w"], dev["x_emb_conv_b"])
-
-        # Slide window: drop oldest, append newest
         context_window_z.pop(0)
         context_window_z.append(new_z)
 
-        # Slide conditioning: context frames all use stabilization_level
-        new_context_cond = compute_cond_for_frame(
-            stabilization_level - 1, sample_actions[action_idx], dev, scr, tt_device)
-        new_cond_entry = ttnn.from_torch(
-            readback_torch(new_context_cond), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+        new_cond_entry = compute_cond_host(stabilization_level - 1, sample_actions[action_idx])
         context_cond_window.pop(0)
         context_cond_window.append(new_cond_entry)
 
@@ -3176,49 +3300,8 @@ if __name__ == "__main__":
         print("  Frame %d: %.2fs" % (frame_idx, elapsed))
 
     total_video = time.time() - t_video_start
-    print("\nDiT generation: %.1fs for %d frames (%.2f FPS)" % (
+    print("\nDiT+VAE generation: %.1fs for %d frames (%.2f FPS)" % (
         total_video, N_VIDEO_FRAMES - 1, (N_VIDEO_FRAMES - 1) / total_video))
-
-    # VAE decode all frames on device (traced)
-    print("\nVAE: compiling forward pass...")
-    t_vae_compile = time.time()
-    # Warmup compile with dummy input
-    dummy_z = torch.zeros(VAE_SEQ_LEN, 32, dtype=torch.bfloat16)
-    dummy_host = ttnn.from_torch(dummy_z, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
-    ttnn.copy_host_to_device_tensor(dummy_host, vae_scr["vae_input"])
-    vae_decode_forward(vae_dev, vae_scr, scaler, mean_scale)
-    ttnn.synchronize_device(tt_device)
-    print("VAE compile: %.1fs" % (time.time() - t_vae_compile))
-
-    # Capture VAE trace
-    print("VAE: capturing trace...")
-    t_vae_trace = time.time()
-    vae_trace_id = ttnn.begin_trace_capture(tt_device, cq_id=0)
-    vae_decode_forward(vae_dev, vae_scr, scaler, mean_scale)
-    ttnn.end_trace_capture(tt_device, vae_trace_id, cq_id=0)
-    ttnn.synchronize_device(tt_device)
-    print("VAE trace captured in %.1fs" % (time.time() - t_vae_trace))
-
-    print("\nVAE decoding %d frames on device (traced)..." % len(all_latents))
-    t_vae = time.time()
-    all_decoded_frames = []
-    for fi, lat in enumerate(all_latents):
-        # lat: (C, H, W) = (16, 18, 32) -> flatten to (576, 16)
-        z_flat = rearrange(lat.float(), "c h w -> (h w) c") / SCALING_FACTOR
-        z_padded = torch.zeros(VAE_SEQ_LEN, 32, dtype=torch.bfloat16)
-        z_padded[:, :VAE_LATENT_DIM] = z_flat.to(torch.bfloat16)
-        z_host = ttnn.from_torch(z_padded, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
-        ttnn.copy_host_to_device_tensor(z_host, vae_scr["vae_input"])
-        ttnn.execute_trace(tt_device, vae_trace_id, cq_id=0, blocking=False)
-        ttnn.synchronize_device(tt_device)
-        result = readback_torch(vae_scr["pred_out"]).float()
-        patches = result[:, :VAE_PATCH_DIM]
-        image = vae_unpatchify(patches)  # (1, 3, 360, 640) in [-1, 1]
-        decoded = torch.clamp((image + 1) / 2, 0, 1)  # [0, 1]
-        # (1, 3, H, W) -> (H, W, 3)
-        all_decoded_frames.append(decoded.squeeze(0).permute(1, 2, 0))
-    vae_time = time.time() - t_vae
-    print("VAE decode: %.2fs (%.0fms/frame)" % (vae_time, vae_time * 1000 / len(all_latents)))
 
     # Save as individual PNGs
     video_dir = "/tmp/oasis_video_%dstep_T%d" % (ddim_steps, N_FRAMES)
