@@ -2953,125 +2953,69 @@ if __name__ == "__main__":
         ttnn.add(scr["ddim_tmp"], scr["ddim_x_noise"], output_tensor=chunk)
         return chunk
 
-    # === DDIM Execution ===
-    def run_ddim_loop_direct(chunk_dev, label, context_cond_list, gen_cond_per_step_dev):
-        """Run DDIM loop with direct (non-traced) execution.
-        chunk_dev: device tensor (N_PATCH_PAD, OUT_DIM) in output space.
-        context_cond_list: list of T-1 device conditioning tensors.
-        gen_cond_per_step_dev: dict {noise_idx: device_tensor} conditioning per step."""
+    # === Trace capture ===
+    print("Compiling DDIM step...")
+    t_compile = time.time()
+    first_noise_idx = ddim_steps
+    for k in ddim_coeff_dev:
+        ttnn.copy_host_to_device_tensor(ddim_coeffs_host[first_noise_idx][k], ddim_coeff_dev[k])
+    for f in range(N_FRAMES - 1):
+        prompt_cond_host = ttnn.from_torch(
+            readback_torch(prompt_cond_dev),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+        ttnn.copy_host_to_device_tensor(prompt_cond_host, cond_traced[f])
+    first_cond_host = ttnn.from_torch(
+        readback_torch(gen_cond_per_step[first_noise_idx]),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+    ttnn.copy_host_to_device_tensor(first_cond_host, cond_traced[N_FRAMES - 1])
+    context_host = ttnn.from_torch(
+        torch.cat([readback_torch(prompt_z_dev)] * (N_FRAMES - 1), dim=0),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+    ttnn.copy_host_to_device_tensor(context_host, context_z_dev)
+    ddim_step_fn(trace_chunk)
+    ttnn.synchronize_device(tt_device)
+    print("Compile done in %.1fs" % (time.time() - t_compile))
+    print("Capturing trace...")
+    t_trace = time.time()
+    trace_id = ttnn.begin_trace_capture(tt_device, cq_id=0)
+    traced_output = ddim_step_fn(trace_chunk)
+    ttnn.end_trace_capture(tt_device, trace_id, cq_id=0)
+    ttnn.synchronize_device(tt_device)
+    print("Trace captured in %.1fs" % (time.time() - t_trace))
+    gen_cond_host = {}
+    for noise_idx in gen_cond_per_step:
+        gen_cond_host[noise_idx] = ttnn.from_torch(
+            readback_torch(gen_cond_per_step[noise_idx]),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+    prompt_cond_host = ttnn.from_torch(
+        readback_torch(prompt_cond_dev),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+
+    def run_ddim_loop(chunk_in_host, label, context_cond_hosts=None, gen_cond_map=None):
+        if gen_cond_map is None:
+            gen_cond_map = gen_cond_host
+        if context_cond_hosts is None:
+            context_cond_hosts = [prompt_cond_host] * (N_FRAMES - 1)
+        ttnn.copy_host_to_device_tensor(chunk_in_host, trace_chunk)
+        for f in range(N_FRAMES - 1):
+            ttnn.copy_host_to_device_tensor(context_cond_hosts[f], cond_traced[f])
         t_total = time.time()
         for noise_idx in reversed(range(1, ddim_steps + 1)):
-            # Update coefficients
             for k in ddim_coeff_dev:
                 ttnn.copy_host_to_device_tensor(ddim_coeffs_host[noise_idx][k], ddim_coeff_dev[k])
-            # Set conditioning BEFORE calling ddim_step_fn (it captures cond_traced)
-            for f in range(N_FRAMES - 1):
-                cond_traced[f] = context_cond_list[f]
-            cond_traced[N_FRAMES - 1] = gen_cond_per_step_dev[noise_idx]
-            chunk_dev = ddim_step_fn(chunk_dev)
-
+            ttnn.copy_host_to_device_tensor(gen_cond_map[noise_idx], cond_traced[N_FRAMES - 1])
+            ttnn.execute_trace(tt_device, trace_id, cq_id=0, blocking=False)
         ttnn.synchronize_device(tt_device)
         total_time = time.time() - t_total
         print("%s: %.3fs total (%.0fms/step, %.2f FPS)" % (
             label, total_time, total_time * 1000 / ddim_steps, ddim_steps / total_time))
-        return chunk_dev
+        return trace_chunk
 
-    USE_TRACE = True
-
-    if USE_TRACE:
-        # === Trace capture (single-chip only) ===
-        print("Compiling DDIM step...")
-        t_compile = time.time()
-        first_noise_idx = ddim_steps
-        for k in ddim_coeff_dev:
-            ttnn.copy_host_to_device_tensor(ddim_coeffs_host[first_noise_idx][k], ddim_coeff_dev[k])
-        for f in range(N_FRAMES - 1):
-            prompt_cond_host = ttnn.from_torch(
-                readback_torch(prompt_cond_dev),
-                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
-            ttnn.copy_host_to_device_tensor(prompt_cond_host, cond_traced[f])
-        first_cond_host = ttnn.from_torch(
-            readback_torch(gen_cond_per_step[first_noise_idx]),
-            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
-        ttnn.copy_host_to_device_tensor(first_cond_host, cond_traced[N_FRAMES - 1])
-        prompt_z_host_tile = ttnn.from_torch(
-            readback_torch(prompt_z_dev), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
-        context_tiles = [prompt_z_host_tile] * (N_FRAMES - 1)
-        context_host = ttnn.from_torch(
-            torch.cat([readback_torch(prompt_z_dev)] * (N_FRAMES - 1), dim=0),
-            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
-        ttnn.copy_host_to_device_tensor(context_host, context_z_dev)
-        ddim_step_fn(trace_chunk)
-        ttnn.synchronize_device(tt_device)
-        print("Compile done in %.1fs" % (time.time() - t_compile))
-        print("Capturing trace...")
-        t_trace = time.time()
-        trace_id = ttnn.begin_trace_capture(tt_device, cq_id=0)
-        traced_output = ddim_step_fn(trace_chunk)
-        ttnn.end_trace_capture(tt_device, trace_id, cq_id=0)
-        ttnn.synchronize_device(tt_device)
-        print("Trace captured in %.1fs" % (time.time() - t_trace))
-        gen_cond_host = {}
-        for noise_idx in gen_cond_per_step:
-            gen_cond_host[noise_idx] = ttnn.from_torch(
-                readback_torch(gen_cond_per_step[noise_idx]),
-                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
-        prompt_cond_host = ttnn.from_torch(
-            readback_torch(prompt_cond_dev),
-            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
-
-        def run_ddim_loop(chunk_in_host, label, context_cond_hosts=None, gen_cond_map=None):
-            if gen_cond_map is None:
-                gen_cond_map = gen_cond_host
-            if context_cond_hosts is None:
-                context_cond_hosts = [prompt_cond_host] * (N_FRAMES - 1)
-            ttnn.copy_host_to_device_tensor(chunk_in_host, trace_chunk)
-            for f in range(N_FRAMES - 1):
-                ttnn.copy_host_to_device_tensor(context_cond_hosts[f], cond_traced[f])
-            t_total = time.time()
-            for noise_idx in reversed(range(1, ddim_steps + 1)):
-                for k in ddim_coeff_dev:
-                    ttnn.copy_host_to_device_tensor(ddim_coeffs_host[noise_idx][k], ddim_coeff_dev[k])
-                ttnn.copy_host_to_device_tensor(gen_cond_map[noise_idx], cond_traced[N_FRAMES - 1])
-                ttnn.execute_trace(tt_device, trace_id, cq_id=0, blocking=False)
-            ttnn.synchronize_device(tt_device)
-            total_time = time.time() - t_total
-            print("%s: %.3fs total (%.0fms/step, %.2f FPS)" % (
-                label, total_time, total_time * 1000 / ddim_steps, ddim_steps / total_time))
-            return trace_chunk
-
-        chunk_host_tilized = ttnn.from_torch(chunk_pad, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
-        print("\n=== WARMUP (traced execution) ===")
-        _ = run_ddim_loop(chunk_host_tilized, "Warmup")
-        print("\n=== TIMED SINGLE FRAME ===")
-        result_dev = run_ddim_loop(chunk_host_tilized, "Timed")
-    else:
-        # === Direct execution (multi-chip) ===
-        print("\n=== WARMUP (direct execution, %d chips) ===" % N_CHIPS)
-        # Set up conditioning for ddim_step_fn
-        for f in range(N_FRAMES - 1):
-            cond_traced[f] = prompt_cond_dev
-        first_noise_idx = ddim_steps
-        cond_traced[N_FRAMES - 1] = gen_cond_per_step[first_noise_idx]
-        # Initialize context
-        context_host = torch.cat([readback_torch(prompt_z_dev)] * (N_FRAMES - 1), dim=0)
-        context_z_dev_new = to_tt(context_host.to(torch.bfloat16), tt_device)
-        ttnn.copy_host_to_device_tensor(
-            ttnn.from_torch(context_host.to(torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT),
-            context_z_dev)
-        # Warmup
-        for k in ddim_coeff_dev:
-            ttnn.copy_host_to_device_tensor(ddim_coeffs_host[first_noise_idx][k], ddim_coeff_dev[k])
-        ddim_step_fn(trace_chunk)
-        ttnn.synchronize_device(tt_device)
-        print("Warmup done")
-        # Timed run
-        print("\n=== TIMED SINGLE FRAME (%d chips) ===" % N_CHIPS)
-        # Reset chunk
-        ttnn.copy_host_to_device_tensor(
-            ttnn.from_torch(chunk_pad, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT), trace_chunk)
-        context_cond_list = [prompt_cond_dev] * (N_FRAMES - 1)
-        result_dev = run_ddim_loop_direct(trace_chunk, "Timed", context_cond_list, gen_cond_per_step)
+    chunk_host_tilized = ttnn.from_torch(chunk_pad, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+    print("\n=== WARMUP (traced execution, %d chips) ===" % N_CHIPS)
+    _ = run_ddim_loop(chunk_host_tilized, "Warmup")
+    print("\n=== TIMED SINGLE FRAME ===")
+    result_dev = run_ddim_loop(chunk_host_tilized, "Timed")
 
     # === Generate video ===
     # Sliding window: T-1 context frames + 1 generated frame.
@@ -3091,12 +3035,8 @@ if __name__ == "__main__":
         prompt_latent[0, 0].unsqueeze(0), dev["x_emb_conv_w"], dev["x_emb_conv_b"])
     context_window_z = [prompt_z_torch.clone() for _ in range(N_FRAMES - 1)]
 
-    # Sliding window of per-frame conditioning
-    # For multi-chip: keep device tensors directly; for trace: keep host tensors
-    if USE_TRACE:
-        context_cond_window = [prompt_cond_host] * (N_FRAMES - 1)
-    else:
-        context_cond_window = [prompt_cond_dev] * (N_FRAMES - 1)
+    # Sliding window of per-frame conditioning (host tensors for trace updates)
+    context_cond_window = [prompt_cond_host] * (N_FRAMES - 1)
 
     for frame_idx in range(1, N_VIDEO_FRAMES):
         t_frame = time.time()
@@ -3118,20 +3058,14 @@ if __name__ == "__main__":
         action_idx = min(frame_idx, sample_actions.shape[0] - 1)
         frame_cond_dev = precompute_gen_cond(sample_actions[action_idx])
 
-        if USE_TRACE:
-            frame_cond_host = {}
-            for noise_idx in frame_cond_dev:
-                frame_cond_host[noise_idx] = ttnn.from_torch(
-                    readback_torch(frame_cond_dev[noise_idx]),
-                    dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
-            result_dev = run_ddim_loop(chunk_host_f, "Frame %d" % frame_idx,
-                                       context_cond_hosts=context_cond_window,
-                                       gen_cond_map=frame_cond_host)
-        else:
-            # Direct execution for multi-chip
-            ttnn.copy_host_to_device_tensor(chunk_host_f, trace_chunk)
-            result_dev = run_ddim_loop_direct(trace_chunk, "Frame %d" % frame_idx,
-                                              context_cond_window, frame_cond_dev)
+        frame_cond_host = {}
+        for noise_idx in frame_cond_dev:
+            frame_cond_host[noise_idx] = ttnn.from_torch(
+                readback_torch(frame_cond_dev[noise_idx]),
+                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+        result_dev = run_ddim_loop(chunk_host_f, "Frame %d" % frame_idx,
+                                   context_cond_hosts=context_cond_window,
+                                   gen_cond_map=frame_cond_host)
 
         # Readback generated latent (output space -> image space)
         chunk_result = readback_torch(result_dev)[:N_PATCHES].float()
@@ -3150,11 +3084,8 @@ if __name__ == "__main__":
         # Slide conditioning: context frames all use stabilization_level
         new_context_cond = compute_cond_for_frame(
             stabilization_level - 1, sample_actions[action_idx], dev, scr, tt_device)
-        if USE_TRACE:
-            new_cond_entry = ttnn.from_torch(
-                readback_torch(new_context_cond), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
-        else:
-            new_cond_entry = new_context_cond
+        new_cond_entry = ttnn.from_torch(
+            readback_torch(new_context_cond), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
         context_cond_window.pop(0)
         context_cond_window.append(new_cond_entry)
 

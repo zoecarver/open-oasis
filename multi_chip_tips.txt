@@ -95,9 +95,8 @@ CLOSING
 
 TRACE + COLLECTIVES
 ====================
-Basic trace (matmul only) works on mesh. Trace with all_reduce inside
-hits shape mismatch during replay (needs investigation). For now, test
-correctness without trace first, add trace later.
+Trace with all_reduce and all_gather WORKS on mesh. The earlier test
+failure was a bug in the test (wrong shard dimensions), not a runtime issue.
 
 The existing oasis code pre-allocates all tensors before trace capture.
 With mesh, ensure all shard/replicate tensors are also pre-allocated.
@@ -114,7 +113,13 @@ The all_gather is exact (no computation, just data movement).
 
 PERFORMANCE NOTES
 ==================
-(To be updated as we profile)
-- All-reduce on 2 chips: ~640KB payload, expected ~0.01ms per collective
-- Weight reads per chip: 1/N of single chip (the main win)
-- 96 collectives per DDIM step (32 sub-blocks x 3 collectives each)
+Results on Oasis-500M DiT (4 DDIM steps, T=2):
+- 1 chip + trace: 49ms/step (20.3 FPS)
+- 2 chips + trace: 38ms/step (26.0 FPS) -- 22% speedup
+- 2 chips, no trace: 80ms/step (dispatch overhead dominates)
+
+Key: trace is essential for multi-chip perf. Without trace, the 660+
+dispatches per step (now 2x for collectives) overwhelm any compute savings.
+
+TT-Lang kernels required ZERO code changes for multi-chip. Only the
+n_heads_val factory parameter changed (16 -> 16/N_CHIPS).
