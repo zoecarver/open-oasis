@@ -96,6 +96,21 @@ D_MLP_TILES = D_MLP // TILE  # 128
 
 ELEM_GRAN = 8  # divides 32 (D_MODEL tiles) and 16 (128/8 for D_MLP)
 
+# VAE decoder constants
+VAE_DEC_DEPTH = 12
+VAE_DEC_DIM = 1024
+VAE_DEC_HEADS = 16
+VAE_LATENT_DIM = 16
+VAE_PATCH_SIZE_VAE = 20
+VAE_PATCH_DIM = 3 * VAE_PATCH_SIZE_VAE ** 2  # 1200
+VAE_SEQ_H = 18   # 360 / 20
+VAE_SEQ_W = 32   # 640 / 20
+VAE_SEQ_LEN = VAE_SEQ_H * VAE_SEQ_W  # 576
+VAE_SEQ_TILES = VAE_SEQ_LEN // TILE  # 18
+VAE_D_HEAD = VAE_DEC_DIM // VAE_DEC_HEADS  # 64
+VAE_D_MLP = VAE_DEC_DIM * 4  # 4096
+VAE_ROPE_DIM = VAE_D_HEAD // 2  # 32 (first 32 dims of each head rotated)
+
 # ============================================================
 # TT-Lang Kernels
 # ============================================================
@@ -1717,6 +1732,8 @@ from rope_layout_kernel import make_rope_layout_kernel, make_rope_temporal_kerne
 rope_layout_spatial = make_rope_layout_kernel(N_PATCH_PAD // TILE, D_HEAD // TILE, N_HEADS)
 # Fused temporal RoPE: eliminates 5 slices + 2 RoPE kernels
 rope_temporal = make_rope_temporal_kernel(D_HEAD // TILE, N_HEADS)
+# VAE decoder RoPE + layout (2D pixel-based, seq=576 tokens)
+vae_rope_layout = make_rope_layout_kernel(VAE_SEQ_TILES, VAE_D_HEAD // TILE, VAE_DEC_HEADS)
 
 # Compute kernel configs (following tt-metal DiT patterns)
 # Initialized lazily after device is opened (need device.arch())
@@ -1848,6 +1865,13 @@ def swap_adjacent_columns(w):
     w_swap[:, 1::2] = w[:, 0::2]
     return w_swap
 
+def swap_adjacent_elements(b):
+    """1D version of swap_adjacent_columns for bias vectors."""
+    b_swap = b.clone()
+    b_swap[0::2] = b[1::2]
+    b_swap[1::2] = b[0::2]
+    return b_swap
+
 def build_rope_device_tables(freqs_per_position, n_positions, n_patch_pad, n_heads, n_frames, tt_device):
     """Build cos/sin_perm device tables from per-position freq table.
     freqs_per_position: (n_positions, freq_dim) float tensor.
@@ -1907,6 +1931,43 @@ def build_spatial_rope_device_tables(spatial_freqs, n_frames, tt_device):
 
     # L1 for RoPE tables: read 16x per step by each spatial/temporal sub-block
     return to_tt_l1(cos_full, tt_device), to_tt_l1(sin_full, tt_device)
+
+def precompute_vae_rope(tt_device):
+    """Compute 2D pixel-based RoPE tables for VAE decoder attention.
+    Returns cos_tt, sin_perm_tt each (VAE_SEQ_LEN, VAE_DEC_DIM) on device L1."""
+    # RotaryEmbedding(dim=head_dim//4=16) uses dim//2=8 frequencies per axis
+    n_freqs = VAE_D_HEAD // 4 // 2  # 8
+    pixel_freqs = torch.linspace(1.0, (VAE_SEQ_H * VAE_SEQ_W) / 2, n_freqs)
+
+    h_pos = torch.arange(VAE_SEQ_H, dtype=torch.float32)
+    w_pos = torch.arange(VAE_SEQ_W, dtype=torch.float32)
+
+    h_freqs = torch.einsum("i, f -> i f", h_pos, pixel_freqs)
+    h_freqs = h_freqs.repeat_interleave(2, dim=-1)  # (18, 16)
+    w_freqs = torch.einsum("i, f -> i f", w_pos, pixel_freqs)
+    w_freqs = w_freqs.repeat_interleave(2, dim=-1)  # (32, 16)
+
+    h_broad = h_freqs[:, None, :].expand(VAE_SEQ_H, VAE_SEQ_W, -1)
+    w_broad = w_freqs[None, :, :].expand(VAE_SEQ_H, VAE_SEQ_W, -1)
+    freqs_2d = torch.cat([h_broad, w_broad], dim=-1)  # (18, 32, 32)
+    freqs_flat = freqs_2d.reshape(VAE_SEQ_LEN, VAE_ROPE_DIM)  # (576, 32)
+
+    # Build per-head tables: first 32 dims rotated, last 32 identity
+    cos_per_head = torch.ones(VAE_SEQ_LEN, VAE_D_HEAD)
+    sin_per_head = torch.zeros(VAE_SEQ_LEN, VAE_D_HEAD)
+    cos_per_head[:, :VAE_ROPE_DIM] = freqs_flat.cos()
+    sin_per_head[:, :VAE_ROPE_DIM] = freqs_flat.sin()
+
+    # Bake rotate_half sign into sin: [-, +, -, +, ...] for rotated dims
+    sign = torch.ones(VAE_D_HEAD)
+    sign[:VAE_ROPE_DIM:2] = -1
+    sin_perm_per_head = sin_per_head * sign.unsqueeze(0)
+
+    # Repeat across all 16 heads: (576, 64) -> (576, 1024)
+    cos_full = cos_per_head.repeat(1, VAE_DEC_HEADS).to(torch.bfloat16)
+    sin_full = sin_perm_per_head.repeat(1, VAE_DEC_HEADS).to(torch.bfloat16)
+
+    return to_tt(cos_full, tt_device), to_tt(sin_full, tt_device)
 
 # ============================================================
 # Weight loading
@@ -2035,6 +2096,109 @@ def preload_dit_weights(tt_device, n_frames=2):
     elapsed = time.time() - t0
     print("Preloaded %d tensors in %.1fs" % (len(dev), elapsed))
     return dev
+
+def preload_vae_decoder_weights(vae, tt_device):
+    """Extract VAE decoder weights from CPU model and load onto device."""
+    t0 = time.time()
+    vd = {}
+    sd = vae.state_dict()
+
+    # post_quant_conv: Linear(16, 1024)
+    pqc_w = sd["post_quant_conv.weight"].T.contiguous().to(torch.bfloat16)  # (16, 1024)
+    # Pad input dim to 32 for tile alignment
+    pqc_w_padded = torch.zeros(32, VAE_DEC_DIM, dtype=torch.bfloat16)
+    pqc_w_padded[:VAE_LATENT_DIM] = pqc_w
+    vd["pqc_w"] = to_tt(pqc_w_padded, tt_device)
+    vd["pqc_b"] = to_tt(expand_bias(sd["post_quant_conv.bias"].to(torch.bfloat16), VAE_SEQ_LEN), tt_device)
+
+    for i in range(VAE_DEC_DEPTH):
+        p = "decoder.%d" % i
+
+        # LN weight/bias expanded to (VAE_SEQ_LEN, D) for layernorm kernel
+        for ln_idx in ["1", "2"]:
+            w = sd["%s.norm%s.weight" % (p, ln_idx)].to(torch.bfloat16)
+            b = sd["%s.norm%s.bias" % (p, ln_idx)].to(torch.bfloat16)
+            vd["%s.norm%s_w" % (p, ln_idx)] = to_tt(expand_bias(w, VAE_SEQ_LEN), tt_device)
+            vd["%s.norm%s_b" % (p, ln_idx)] = to_tt(expand_bias(b, VAE_SEQ_LEN), tt_device)
+
+        # Combined QKV+swap: [Q, K, V, Q_swap, K_swap] = (1024, 5120)
+        qkv_w = sd["%s.attn.qkv.weight" % p].T.contiguous().to(torch.bfloat16)
+        q_w = qkv_w[:, :VAE_DEC_DIM]
+        k_w = qkv_w[:, VAE_DEC_DIM:2*VAE_DEC_DIM]
+        v_w = qkv_w[:, 2*VAE_DEC_DIM:]
+        qkv_full_w = torch.cat([q_w, k_w, v_w,
+                                swap_adjacent_columns(q_w),
+                                swap_adjacent_columns(k_w)], dim=1)
+        vd["%s.qkv_full_w" % p] = to_tt(qkv_full_w, tt_device)
+
+        # QKV bias with swap for RoPE trick
+        qkv_b = sd["%s.attn.qkv.bias" % p].to(torch.bfloat16)
+        b_q = qkv_b[:VAE_DEC_DIM]
+        b_k = qkv_b[VAE_DEC_DIM:2*VAE_DEC_DIM]
+        b_v = qkv_b[2*VAE_DEC_DIM:]
+        full_b = torch.cat([b_q, b_k, b_v,
+                           swap_adjacent_elements(b_q),
+                           swap_adjacent_elements(b_k)])
+        vd["%s.qkv_full_b" % p] = to_tt(expand_bias(full_b, VAE_SEQ_LEN), tt_device)
+
+        # Output projection
+        vd["%s.proj_w" % p] = to_tt(
+            sd["%s.attn.proj.weight" % p].T.contiguous().to(torch.bfloat16), tt_device)
+        vd["%s.proj_b" % p] = to_tt(
+            expand_bias(sd["%s.attn.proj.bias" % p].to(torch.bfloat16), VAE_SEQ_LEN), tt_device)
+
+        # MLP
+        vd["%s.fc1_w" % p] = to_tt(
+            sd["%s.mlp.fc1.weight" % p].T.contiguous().to(torch.bfloat16), tt_device)
+        vd["%s.fc1_b" % p] = to_tt(
+            expand_bias(sd["%s.mlp.fc1.bias" % p].to(torch.bfloat16), VAE_SEQ_LEN), tt_device)
+        vd["%s.fc2_w" % p] = to_tt(
+            sd["%s.mlp.fc2.weight" % p].T.contiguous().to(torch.bfloat16), tt_device)
+        vd["%s.fc2_b" % p] = to_tt(
+            expand_bias(sd["%s.mlp.fc2.bias" % p].to(torch.bfloat16), VAE_SEQ_LEN), tt_device)
+
+    # Final LN
+    vd["dec_norm_w"] = to_tt(
+        expand_bias(sd["dec_norm.weight"].to(torch.bfloat16), VAE_SEQ_LEN), tt_device)
+    vd["dec_norm_b"] = to_tt(
+        expand_bias(sd["dec_norm.bias"].to(torch.bfloat16), VAE_SEQ_LEN), tt_device)
+
+    # Predictor: Linear(1024, 1200) - pad to 1216 for tile alignment
+    VAE_PATCH_DIM_PAD = ((VAE_PATCH_DIM + TILE - 1) // TILE) * TILE  # 1216
+    pred_w_raw = sd["predictor.weight"].T.contiguous().to(torch.bfloat16)  # (1024, 1200)
+    pred_w_padded = torch.zeros(VAE_DEC_DIM, VAE_PATCH_DIM_PAD, dtype=torch.bfloat16)
+    pred_w_padded[:, :VAE_PATCH_DIM] = pred_w_raw
+    vd["pred_w"] = to_tt(pred_w_padded, tt_device)
+    pred_b_raw = sd["predictor.bias"].to(torch.bfloat16)  # (1200,)
+    pred_b_padded = torch.zeros(VAE_PATCH_DIM_PAD, dtype=torch.bfloat16)
+    pred_b_padded[:VAE_PATCH_DIM] = pred_b_raw
+    vd["pred_b"] = to_tt(expand_bias(pred_b_padded, VAE_SEQ_LEN), tt_device)
+
+    # VAE RoPE tables
+    vd["vae_cos"], vd["vae_sin_perm"] = precompute_vae_rope(tt_device)
+
+    elapsed = time.time() - t0
+    print("Preloaded %d VAE decoder tensors in %.1fs" % (len(vd), elapsed))
+    return vd
+
+def prealloc_vae_scratch(tt_device):
+    """Pre-allocate VAE decoder scratch buffers. All DRAM to avoid L1 pressure
+    (DiT already uses ~25MB of L1). Can promote hot tensors to L1 later."""
+    t0 = time.time()
+    vs = {}
+    vs["z_a"] = zeros_tt((VAE_SEQ_LEN, VAE_DEC_DIM), tt_device)
+    vs["z_b"] = zeros_tt((VAE_SEQ_LEN, VAE_DEC_DIM), tt_device)
+    vs["normed"] = zeros_tt((VAE_SEQ_LEN, VAE_DEC_DIM), tt_device)
+    vs["qkv_full"] = zeros_tt((VAE_SEQ_LEN, 5 * VAE_DEC_DIM), tt_device)
+    vs["o_proj"] = zeros_tt((VAE_SEQ_LEN, VAE_DEC_DIM), tt_device)
+    vs["fc1"] = zeros_tt((VAE_SEQ_LEN, VAE_D_MLP), tt_device)
+    vs["gelu"] = zeros_tt((VAE_SEQ_LEN, VAE_D_MLP), tt_device)
+    vs["fc2"] = zeros_tt((VAE_SEQ_LEN, VAE_DEC_DIM), tt_device)
+    VAE_PATCH_DIM_PAD = ((VAE_PATCH_DIM + TILE - 1) // TILE) * TILE  # 1216
+    vs["pred_out"] = zeros_tt((VAE_SEQ_LEN, VAE_PATCH_DIM_PAD), tt_device)
+    elapsed = time.time() - t0
+    print("Pre-allocated %d VAE scratch tensors in %.1fs" % (len(vs), elapsed))
+    return vs
 
 # ============================================================
 # Scratch buffers
@@ -2401,11 +2565,11 @@ def dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale
     return result
 
 # ============================================================
-# VAE (CPU only)
+# VAE
 # ============================================================
 
 def load_vae_cpu():
-    """Load VAE model on CPU."""
+    """Load VAE model on CPU (needed for encoding prompt image)."""
     import sys
     sys.path.insert(0, "/tmp")
     from vae import VAE_models
@@ -2419,7 +2583,7 @@ def load_vae_cpu():
     return vae
 
 def vae_decode_cpu(z_latent, vae):
-    """Decode latent to image using VAE on CPU.
+    """Decode latent to image using VAE on CPU (fallback).
     z_latent: (B, T, C, H, W) = (1, 1, 16, 18, 32)
     Returns: (B, T, 3, 360, 640) in [0, 1]
     """
@@ -2430,15 +2594,117 @@ def vae_decode_cpu(z_latent, vae):
     decoded = torch.clamp(decoded, 0, 1)
     return rearrange(decoded, "(b t) c h w -> b t h w c", b=B, t=T)
 
+def vae_decode_device(z_flat, vae_dev, vae_scr, tt_device, scaler, mean_scale):
+    """Decode latent on TT device. 12 transformer blocks with 2D RoPE.
+    z_flat: (576, 16) torch bf16 - flattened latent (already divided by scaling factor).
+    Returns: (576, 1200) torch float - patch predictions for unpatchify on host.
+    """
+    # Pad latent from 16 to 32 cols for tile alignment
+    z_padded = torch.zeros(VAE_SEQ_LEN, 32, dtype=torch.bfloat16)
+    z_padded[:, :VAE_LATENT_DIM] = z_flat.to(torch.bfloat16)
+    z_tt = to_tt(z_padded, tt_device)
+
+    # post_quant_conv: (576, 32) @ (32, 1024) + bias -> (576, 1024) in z_a
+    ttnn.matmul(z_tt, vae_dev["pqc_w"], optional_output_tensor=vae_scr["z_a"])
+    ttnn.add(vae_scr["z_a"], vae_dev["pqc_b"], output_tensor=vae_scr["z_a"])
+    ttnn.deallocate(z_tt)
+
+    for i in range(VAE_DEC_DEPTH):
+        p = "decoder.%d" % i
+
+        # === Attention path: x + attn(LN(x)) ===
+        layernorm_d1024(vae_scr["z_a"], vae_dev["%s.norm1_w" % p], vae_dev["%s.norm1_b" % p],
+                        scaler, mean_scale, vae_scr["normed"])
+
+        ttnn.matmul(vae_scr["normed"], vae_dev["%s.qkv_full_w" % p],
+                    optional_output_tensor=vae_scr["qkv_full"])
+        ttnn.add(vae_scr["qkv_full"], vae_dev["%s.qkv_full_b" % p],
+                 output_tensor=vae_scr["qkv_full"])
+
+        # RoPE via slice + elementwise (fused layout kernel DFBs too large for L1)
+        D = VAE_DEC_DIM
+        q_raw = ttnn.slice(vae_scr["qkv_full"], [0, 0], [VAE_SEQ_LEN, D])
+        k_raw = ttnn.slice(vae_scr["qkv_full"], [0, D], [VAE_SEQ_LEN, 2*D])
+        v_raw = ttnn.slice(vae_scr["qkv_full"], [0, 2*D], [VAE_SEQ_LEN, 3*D])
+        q_swap = ttnn.slice(vae_scr["qkv_full"], [0, 3*D], [VAE_SEQ_LEN, 4*D])
+        k_swap = ttnn.slice(vae_scr["qkv_full"], [0, 4*D], [VAE_SEQ_LEN, 5*D])
+        # q_roped = q * cos + q_swap * sin_perm
+        fused_rope_kernel(q_raw, q_swap, vae_dev["vae_cos"], vae_dev["vae_sin_perm"], vae_scr["z_b"])
+        fused_rope_kernel(k_raw, k_swap, vae_dev["vae_cos"], vae_dev["vae_sin_perm"], vae_scr["normed"])
+        # Reshape for SDPA: (576, 1024) -> (16, 1, 576, 64)
+        BATCH_S = VAE_DEC_HEADS
+        q_s = ttnn.reshape(vae_scr["z_b"], [1, VAE_SEQ_LEN, VAE_DEC_HEADS, VAE_D_HEAD])
+        q_s = ttnn.permute(q_s, [0, 2, 1, 3])
+        k_s = ttnn.reshape(vae_scr["normed"], [1, VAE_SEQ_LEN, VAE_DEC_HEADS, VAE_D_HEAD])
+        k_s = ttnn.permute(k_s, [0, 2, 1, 3])
+        v_s = ttnn.reshape(v_raw, [1, VAE_SEQ_LEN, VAE_DEC_HEADS, VAE_D_HEAD])
+        v_s = ttnn.permute(v_s, [0, 2, 1, 3])
+        attn_out = ttnn.transformer.scaled_dot_product_attention(q_s, k_s, v_s, is_causal=False)
+
+        # Reshape back to (576, 1024)
+        attn_out = ttnn.permute(attn_out, [0, 2, 1, 3])  # (1, 576, 16, 64)
+        attn_2d = ttnn.reshape(attn_out, [VAE_SEQ_LEN, VAE_DEC_DIM])
+
+        # Out proj + bias
+        ttnn.matmul(attn_2d, vae_dev["%s.proj_w" % p], optional_output_tensor=vae_scr["o_proj"])
+        ttnn.add(vae_scr["o_proj"], vae_dev["%s.proj_b" % p], output_tensor=vae_scr["o_proj"])
+
+        # Residual: z_b = z_a + o_proj
+        ttnn.add(vae_scr["z_a"], vae_scr["o_proj"], output_tensor=vae_scr["z_b"])
+
+        # === MLP path: x + MLP(LN(x)) ===
+        layernorm_d1024(vae_scr["z_b"], vae_dev["%s.norm2_w" % p], vae_dev["%s.norm2_b" % p],
+                        scaler, mean_scale, vae_scr["normed"])
+
+        # FC1 + bias + GELU
+        ttnn.matmul(vae_scr["normed"], vae_dev["%s.fc1_w" % p],
+                    optional_output_tensor=vae_scr["fc1"])
+        ttnn.add(vae_scr["fc1"], vae_dev["%s.fc1_b" % p], output_tensor=vae_scr["fc1"])
+        gelu_approx_kernel(vae_scr["fc1"], vae_scr["gelu"])
+
+        # FC2 + bias
+        ttnn.matmul(vae_scr["gelu"], vae_dev["%s.fc2_w" % p],
+                    optional_output_tensor=vae_scr["fc2"])
+        ttnn.add(vae_scr["fc2"], vae_dev["%s.fc2_b" % p], output_tensor=vae_scr["fc2"])
+
+        # Residual: z_a = z_b + fc2
+        ttnn.add(vae_scr["z_b"], vae_scr["fc2"], output_tensor=vae_scr["z_a"])
+
+    # Final LN
+    layernorm_d1024(vae_scr["z_a"], vae_dev["dec_norm_w"], vae_dev["dec_norm_b"],
+                    scaler, mean_scale, vae_scr["normed"])
+
+    # Predictor: (576, 1024) @ (1024, 1200) + bias
+    ttnn.matmul(vae_scr["normed"], vae_dev["pred_w"],
+                optional_output_tensor=vae_scr["pred_out"])
+    ttnn.add(vae_scr["pred_out"], vae_dev["pred_b"], output_tensor=vae_scr["pred_out"])
+
+    result = ttnn.to_torch(vae_scr["pred_out"]).float()
+    return result[:, :VAE_PATCH_DIM]  # strip tile padding (1216 -> 1200)
+
+def vae_unpatchify(patches):
+    """Convert VAE patch predictions to image.
+    patches: (576, 1200) float tensor.
+    Returns: (1, 3, 360, 640) float tensor in [-1, 1].
+    """
+    x = patches.reshape(1, VAE_SEQ_H, VAE_SEQ_W, VAE_PATCH_DIM)
+    x = x.permute(0, 3, 1, 2)  # (1, 1200, 18, 32)
+    x = x.reshape(1, 3, VAE_PATCH_SIZE_VAE, VAE_PATCH_SIZE_VAE, VAE_SEQ_H, VAE_SEQ_W)
+    x = x.permute(0, 1, 4, 2, 5, 3)  # (1, 3, 18, 20, 32, 20)
+    return x.reshape(1, 3, 360, 640)
+
 # ============================================================
 # Main
 # ============================================================
 
 if __name__ == "__main__":
     # Increase config buffer for pipe-fused kernels (~85KB compiled)
-    default_l1 = ttnn.device.get_max_worker_l1_unreserved_size()
-    tt_device = ttnn.open_device(device_id=0, trace_region_size=100000000,
-                                  worker_l1_size=default_l1 - 90112)
+    # Increase config buffer for pipe-fused kernels (~85KB compiled)
+    # Disabled: pipe kernel not in use, and reduced L1 causes OOM with VAE scratch
+    # default_l1 = ttnn.device.get_max_worker_l1_unreserved_size()
+    # tt_device = ttnn.open_device(device_id=0, trace_region_size=100000000,
+    #                               worker_l1_size=default_l1 - 90112)
+    tt_device = ttnn.open_device(device_id=0, trace_region_size=100000000)
     init_compute_configs(tt_device)
     torch.manual_seed(42)
 
@@ -2452,9 +2718,12 @@ if __name__ == "__main__":
 
     N_FRAMES = 2  # sliding window: T-1 context + 1 generated
 
-    # Load VAE first (needed for encoding prompt)
+    # Load VAE (CPU for encoding, device for decoding)
     print("\nLoading VAE...")
     vae = load_vae_cpu()
+    print("Loading VAE decoder weights onto device...")
+    vae_dev = preload_vae_decoder_weights(vae, tt_device)
+    vae_scr = prealloc_vae_scratch(tt_device)
 
     # Encode prompt image
     prompt_path = "/tmp/sample_image_0.png"
@@ -2784,23 +3053,31 @@ if __name__ == "__main__":
     print("\nDiT generation: %.1fs for %d frames (%.2f FPS)" % (
         total_video, N_VIDEO_FRAMES - 1, (N_VIDEO_FRAMES - 1) / total_video))
 
-    # Batch VAE decode all frames
-    print("\nVAE decoding %d frames..." % len(all_latents))
+    # VAE decode all frames on device
+    print("\nVAE decoding %d frames on device..." % len(all_latents))
     t_vae = time.time()
-    all_latent_tensor = torch.stack(all_latents, dim=0).unsqueeze(0)  # (1, T, C, H, W)
-    all_decoded = vae_decode_cpu(all_latent_tensor, vae)  # (1, T, 360, 640, 3)
-    print("VAE decode: %.1fs" % (time.time() - t_vae))
+    all_decoded_frames = []
+    for fi, lat in enumerate(all_latents):
+        # lat: (C, H, W) = (16, 18, 32) -> flatten to (576, 16)
+        z_flat = rearrange(lat.float(), "c h w -> (h w) c") / SCALING_FACTOR
+        patches = vae_decode_device(z_flat, vae_dev, vae_scr, tt_device, scaler, mean_scale)
+        image = vae_unpatchify(patches)  # (1, 3, 360, 640) in [-1, 1]
+        decoded = torch.clamp((image + 1) / 2, 0, 1)  # [0, 1]
+        # (1, 3, H, W) -> (H, W, 3)
+        all_decoded_frames.append(decoded.squeeze(0).permute(1, 2, 0))
+    vae_time = time.time() - t_vae
+    print("VAE decode: %.2fs (%.0fms/frame)" % (vae_time, vae_time * 1000 / len(all_latents)))
 
     # Save as individual PNGs
     video_dir = "/tmp/oasis_video_%dstep_T%d" % (ddim_steps, N_FRAMES)
     os.makedirs(video_dir, exist_ok=True)
-    for i in range(all_decoded.shape[1]):
-        frame_rgb = (all_decoded[0, i] * 255).byte().numpy()
+    for i, frame_hwc in enumerate(all_decoded_frames):
+        frame_rgb = (frame_hwc * 255).byte().numpy()
         Image.fromarray(frame_rgb).save("%s/frame_%04d.png" % (video_dir, i))
-    print("Saved %d frames to %s/" % (all_decoded.shape[1], video_dir))
+    print("Saved %d frames to %s/" % (len(all_decoded_frames), video_dir))
 
     # Save first generated frame
-    first_gen = (all_decoded[0, 1] * 255).byte().numpy()
+    first_gen = (all_decoded_frames[1] * 255).byte().numpy()
     Image.fromarray(first_gen).save("/tmp/oasis_frame.png")
 
     # Stitch frames into mp4 with ffmpeg
