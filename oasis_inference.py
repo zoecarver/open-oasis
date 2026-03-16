@@ -97,7 +97,7 @@ D_MLP_TILES = D_MLP // TILE  # 128
 ELEM_GRAN = 8  # divides 32 (D_MODEL tiles) and 16 (128/8 for D_MLP)
 
 # Multi-chip tensor parallelism: set to 1 for single-chip, 2+ for TP
-N_CHIPS = 2
+N_CHIPS = 1
 
 # VAE decoder constants
 VAE_DEC_DEPTH = 12
@@ -2647,6 +2647,15 @@ def compute_cond_for_frame(t_scalar, action_vec, dev, scr, tt_device):
     cond_pad = cond_bf16.unsqueeze(0).expand(TILE, -1).contiguous()
     return to_tt(cond_pad, tt_device)
 
+def precompute_gen_cond(action_vec, ddim_steps, noise_range, dev, scr, tt_device):
+    """Pre-compute conditioning for all DDIM noise levels with given action."""
+    cond_per_step = {}
+    for noise_idx in reversed(range(1, ddim_steps + 1)):
+        noise_level = int(noise_range[noise_idx].item())
+        cond_per_step[noise_idx] = compute_cond_for_frame(
+            noise_level, action_vec, dev, scr, tt_device)
+    return cond_per_step
+
 def dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale, profile_step=False):
     """DiT forward pass, all on device. Returns final_out as device tensor.
     z_cur: (SEQ, D_MODEL) device tensor
@@ -2956,20 +2965,10 @@ if __name__ == "__main__":
     chunk_pad[:N_PATCHES] = chunk_patches.to(torch.bfloat16)
     chunk_dev = to_tt(chunk_pad, tt_device)
 
-    # Pre-compute gen conditioning per DDIM step for a given action vector
-    def precompute_gen_cond(action_vec):
-        """Pre-compute conditioning for all DDIM noise levels with given action."""
-        cond_per_step = {}
-        for noise_idx in reversed(range(1, ddim_steps + 1)):
-            noise_level = int(noise_range[noise_idx].item())
-            cond_per_step[noise_idx] = compute_cond_for_frame(
-                noise_level, action_vec, dev, scr, tt_device)
-        return cond_per_step
-
     # Default: zero action for warmup and single-frame test
     print("Pre-computing conditioning for %d steps..." % ddim_steps)
     t_precond = time.time()
-    gen_cond_per_step = precompute_gen_cond(prompt_action)
+    gen_cond_per_step = precompute_gen_cond(prompt_action, ddim_steps, noise_range, dev, scr, tt_device)
     print("Pre-computed conditioning in %.1fs" % (time.time() - t_precond))
 
     # Pre-compute DDIM scalar coefficients as host tensors for trace-compatible updates
@@ -3105,7 +3104,7 @@ if __name__ == "__main__":
     # Sliding window: T-1 context frames + 1 generated frame.
     # Generated frame's latent feeds into context window for next frame.
     # VAE decode happens once at the end for all frames.
-    N_VIDEO_FRAMES = 3 if N_CHIPS > 1 else 30  # fewer frames for TP validation
+    N_VIDEO_FRAMES = 30
     print("\n=== GENERATING %d-FRAME VIDEO (T=%d window) ===" % (N_VIDEO_FRAMES, N_FRAMES))
     t_video_start = time.time()
 
@@ -3140,7 +3139,7 @@ if __name__ == "__main__":
 
         # Pre-compute gen conditioning with this frame's action
         action_idx = min(frame_idx, sample_actions.shape[0] - 1)
-        frame_cond_dev = precompute_gen_cond(sample_actions[action_idx])
+        frame_cond_dev = precompute_gen_cond(sample_actions[action_idx], ddim_steps, noise_range, dev, scr, tt_device)
 
         frame_cond_host = {}
         for noise_idx in frame_cond_dev:
