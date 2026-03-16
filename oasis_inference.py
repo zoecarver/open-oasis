@@ -1705,9 +1705,10 @@ fused_lbg_k32 = make_fused_linear_bias_gelu_kernel(D_TILES, n_chunk=4)  # FC1 + 
 fused_ln_adaln_d1024 = make_fused_ln_adaln_kernel(D_TILES)  # LayerNorm + adaLN modulate
 layernorm_d1024 = make_layernorm_kernel(D_TILES)
 fused_gated_res_ln_adaln_d1024 = make_fused_gated_res_ln_adaln_kernel(D_TILES)  # gated_res + LN + adaLN (5-core seq-only)
-# Pipe-based version: 40-core (8 D-cores x 5 SEQ-cores) with gather+scatter
-from pipe_fused_ln import make_pipe_fused_gated_res_ln_adaln
-pipe_fused_gated_res_ln_adaln_d1024 = make_pipe_fused_gated_res_ln_adaln(D_TILES, 8, N_PATCH_PAD // TILE)
+# TODO: pipe-based version produces incorrect values on repeated calls (many-to-one
+# pipe runtime args caching bug). Re-enable once resolved.
+# from pipe_fused_ln import make_pipe_fused_gated_res_ln_adaln
+# pipe_fused_gated_res_ln_adaln_d1024 = make_pipe_fused_gated_res_ln_adaln(D_TILES, 8, N_PATCH_PAD // TILE)
 # Fused adaLN params: matmul + bias + expand in one kernel (replaces ~10 ttnn ops)
 from adaln_matmul_expand import make_adaln_matmul_expand_kernel
 adaln_matmul_expand_kernel = make_adaln_matmul_expand_kernel(D_TILES, N_PATCH_PAD // TILE)
@@ -2269,7 +2270,7 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
     # Phase B: Fused gated_residual + LN + adaLN modulate (single TT-Lang kernel)
     # Replaces 3 separate kernels: gated_residual_kernel + layernorm_d1024 + adaln_modulate_kernel
     # Eliminates 2 DRAM intermediates (z_scratch: 640KB, normed: 640KB) = 1.28MB saved per call
-    pipe_fused_gated_res_ln_adaln_d1024(
+    fused_gated_res_ln_adaln_d1024(
         x_tt, scr["o_proj"], gate_msa, scaler, mean_scale, adaln_packed,
         scr["z_scratch"], scr["modulated"])
     if _do_dev_profile:
