@@ -2446,10 +2446,9 @@ def build_per_frame_adaln(silu_cond_list, prefix, dev, scr, tt_device):
 
     per_frame_expanded = []
     for silu_cond in silu_cond_list:
-        ttnn.matmul(silu_cond, dev["%s.adaln_w" % prefix],
+        ttnn.linear(silu_cond, dev["%s.adaln_w" % prefix],
+                    bias=dev["%s.adaln_b" % prefix],
                     optional_output_tensor=scr["adaln_out"])
-        ttnn.add(scr["adaln_out"], dev["%s.adaln_b" % prefix],
-                 output_tensor=scr["adaln_out"])
         expanded = ttnn.concat([scr["adaln_out"]] * N_REPEAT, dim=0)
         per_frame_expanded.append(expanded)
 
@@ -2572,6 +2571,7 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
     #   out_w, out_b, fc1_w, fc1_b, fc2_w, fc2_b, scaler, mean_scale,
     #   z_scratch, gelu_scratch, z_a)
     # Phase A: O proj (row-parallel) + all_reduce + bias
+    # TODO: fuse matmul+bias via ttnn.linear when N_CHIPS==1 (no all_reduce between them)
     o_proj = ttnn.matmul(attn_2d, dev["%s.out_w" % prefix])
     if N_CHIPS > 1:
         o_proj = ttnn.all_reduce(o_proj)
@@ -2588,16 +2588,15 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
         ttnn.synchronize_device(tt_device)
         _t1 = _dt.time(); print("      %s ln+mod: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
 
-    # Phase C: FC1 + bias + GELU
-    # Note: can't fuse GELU into matmul because bias must be added first: GELU(Wx + b)
-    ttnn.matmul(scr["modulated"], dev["%s.fc1_w" % prefix], optional_output_tensor=scr["fc1"])
-    ttnn.add(scr["fc1"], dev["%s.fc1_b" % prefix], output_tensor=scr["fc1"])
-    ttnn.gelu(scr["fc1"], output_tensor=scr["gelu"])
+    # Phase C: Fused FC1 + bias + GELU (single ttnn.linear call)
+    ttnn.linear(scr["modulated"], dev["%s.fc1_w" % prefix], bias=dev["%s.fc1_b" % prefix],
+                activation="gelu", optional_output_tensor=scr["gelu"])
     if _do_dev_profile:
         ttnn.synchronize_device(tt_device)
         _t1 = _dt.time(); print("      %s fc1+gelu: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
 
     # Phase D: FC2 (row-parallel) + all_reduce + bias + gated residual
+    # TODO: fuse matmul+bias via ttnn.linear when N_CHIPS==1 (no all_reduce between them)
     fc2_out = ttnn.matmul(scr["gelu"], dev["%s.fc2_w" % prefix])
     if N_CHIPS > 1:
         fc2_out = ttnn.all_reduce(fc2_out)
@@ -2691,8 +2690,8 @@ def dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale
     N_REPEAT = N_PATCH_PAD // TILE  # 5
     per_frame_final = []
     for t_idx in range(T):
-        final_raw = ttnn.matmul(silu_cond_list[t_idx], dev["final_adaln_w"])
-        final_raw = ttnn.add(final_raw, dev["final_adaln_b"])
+        final_raw = ttnn.linear(silu_cond_list[t_idx], dev["final_adaln_w"],
+                                bias=dev["final_adaln_b"])
         expanded = ttnn.concat([final_raw] * N_REPEAT, dim=0)
         per_frame_final.append(expanded)
     if T == 1:
@@ -2705,6 +2704,7 @@ def dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale
 
     layernorm_d1024(z_cur, dev["ln_w_ones"], dev["ln_b_zeros"], scaler, mean_scale, scr["normed"])
     adaln_modulate_kernel(scr["normed"], shift_tt, scale_tt, scr["modulated"])
+    # TODO: fuse linear+bias via ttnn.linear (currently uses TT-Lang linear_k32 kernel)
     linear_k32(scr["modulated"], dev["final_linear_w"], scr["final_out"])
     ttnn.add(scr["final_out"], dev["final_linear_b"], output_tensor=scr["final_out"])
     result = scr["final_out"]
@@ -2748,8 +2748,8 @@ def vae_decode_forward(vae_dev, vae_scr, scaler, mean_scale):
     Input: vae_scr["vae_input"] already populated with padded latent.
     Output: vae_scr["pred_out"] contains predictions."""
     # post_quant_conv: (576, 32) @ (32, 1024) + bias -> (576, 1024) in z_a
-    ttnn.matmul(vae_scr["vae_input"], vae_dev["pqc_w"], optional_output_tensor=vae_scr["z_a"])
-    ttnn.add(vae_scr["z_a"], vae_dev["pqc_b"], output_tensor=vae_scr["z_a"])
+    ttnn.linear(vae_scr["vae_input"], vae_dev["pqc_w"], bias=vae_dev["pqc_b"],
+                optional_output_tensor=vae_scr["z_a"])
 
     for i in range(VAE_DEC_DEPTH):
         p = "decoder.%d" % i
@@ -2758,10 +2758,9 @@ def vae_decode_forward(vae_dev, vae_scr, scaler, mean_scale):
         layernorm_d1024(vae_scr["z_a"], vae_dev["%s.norm1_w" % p], vae_dev["%s.norm1_b" % p],
                         scaler, mean_scale, vae_scr["normed"])
 
-        ttnn.matmul(vae_scr["normed"], vae_dev["%s.qkv_full_w" % p],
+        ttnn.linear(vae_scr["normed"], vae_dev["%s.qkv_full_w" % p],
+                    bias=vae_dev["%s.qkv_full_b" % p],
                     optional_output_tensor=vae_scr["qkv_full"])
-        ttnn.add(vae_scr["qkv_full"], vae_dev["%s.qkv_full_b" % p],
-                 output_tensor=vae_scr["qkv_full"])
 
         # Fused RoPE: reads qkv_full, writes Q/K/V in heads-first SDPA layout
         vae_rope_fused(vae_scr["qkv_full"], vae_dev["vae_cos"], vae_dev["vae_sin_perm"],
@@ -2779,8 +2778,8 @@ def vae_decode_forward(vae_dev, vae_scr, scaler, mean_scale):
         attn_2d = ttnn.reshape(attn_out, [VAE_SEQ_LEN, VAE_DEC_DIM])
 
         # Out proj + bias
-        ttnn.matmul(attn_2d, vae_dev["%s.proj_w" % p], optional_output_tensor=vae_scr["o_proj"])
-        ttnn.add(vae_scr["o_proj"], vae_dev["%s.proj_b" % p], output_tensor=vae_scr["o_proj"])
+        ttnn.linear(attn_2d, vae_dev["%s.proj_w" % p], bias=vae_dev["%s.proj_b" % p],
+                    optional_output_tensor=vae_scr["o_proj"])
 
         # Residual: z_b = z_a + o_proj
         ttnn.add(vae_scr["z_a"], vae_scr["o_proj"], output_tensor=vae_scr["z_b"])
@@ -2789,16 +2788,15 @@ def vae_decode_forward(vae_dev, vae_scr, scaler, mean_scale):
         layernorm_d1024(vae_scr["z_b"], vae_dev["%s.norm2_w" % p], vae_dev["%s.norm2_b" % p],
                         scaler, mean_scale, vae_scr["normed"])
 
-        # FC1 + bias + GELU
-        ttnn.matmul(vae_scr["normed"], vae_dev["%s.fc1_w" % p],
-                    optional_output_tensor=vae_scr["fc1"])
-        ttnn.add(vae_scr["fc1"], vae_dev["%s.fc1_b" % p], output_tensor=vae_scr["fc1"])
-        ttnn.gelu(vae_scr["fc1"], output_tensor=vae_scr["gelu"])
+        # Fused FC1 + bias + GELU
+        ttnn.linear(vae_scr["normed"], vae_dev["%s.fc1_w" % p],
+                    bias=vae_dev["%s.fc1_b" % p], activation="gelu",
+                    optional_output_tensor=vae_scr["gelu"])
 
         # FC2 + bias
-        ttnn.matmul(vae_scr["gelu"], vae_dev["%s.fc2_w" % p],
+        ttnn.linear(vae_scr["gelu"], vae_dev["%s.fc2_w" % p],
+                    bias=vae_dev["%s.fc2_b" % p],
                     optional_output_tensor=vae_scr["fc2"])
-        ttnn.add(vae_scr["fc2"], vae_dev["%s.fc2_b" % p], output_tensor=vae_scr["fc2"])
 
         # Residual: z_a = z_b + fc2
         ttnn.add(vae_scr["z_b"], vae_scr["fc2"], output_tensor=vae_scr["z_a"])
@@ -2808,9 +2806,8 @@ def vae_decode_forward(vae_dev, vae_scr, scaler, mean_scale):
                     scaler, mean_scale, vae_scr["normed"])
 
     # Predictor: (576, 1024) @ (1024, 1200) + bias
-    ttnn.matmul(vae_scr["normed"], vae_dev["pred_w"],
+    ttnn.linear(vae_scr["normed"], vae_dev["pred_w"], bias=vae_dev["pred_b"],
                 optional_output_tensor=vae_scr["pred_out"])
-    ttnn.add(vae_scr["pred_out"], vae_dev["pred_b"], output_tensor=vae_scr["pred_out"])
     return vae_scr["pred_out"]
 
 def vae_decode_device(z_flat, vae_dev, vae_scr, tt_device, scaler, mean_scale):
@@ -3005,8 +3002,7 @@ if __name__ == "__main__":
     def ddim_step_fn(chunk):
         """One DDIM step: round-trip + DiT forward + DDIM arithmetic.
         Uses cond_traced and ddim_coeff_dev which are updated before each call."""
-        gen_z = ttnn.matmul(chunk, W_rt_dev)
-        ttnn.add(gen_z, b_rt_dev, output_tensor=gen_z)
+        gen_z = ttnn.linear(chunk, W_rt_dev, bias=b_rt_dev)
         z_cur = ttnn.concat([context_z_dev, gen_z], dim=0)
 
         final_out = dit_forward_device(z_cur, cond_traced, dev, scr, tt_device, scaler, mean_scale)
