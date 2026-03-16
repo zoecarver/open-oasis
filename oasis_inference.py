@@ -96,6 +96,9 @@ D_MLP_TILES = D_MLP // TILE  # 128
 
 ELEM_GRAN = 8  # divides 32 (D_MODEL tiles) and 16 (128/8 for D_MLP)
 
+# Multi-chip tensor parallelism: set to 1 for single-chip, 2+ for TP
+N_CHIPS = 2
+
 # VAE decoder constants
 VAE_DEC_DEPTH = 12
 VAE_DEC_DIM = 1024
@@ -1729,9 +1732,10 @@ from adaln_matmul_expand import make_adaln_matmul_expand_kernel
 adaln_matmul_expand_kernel = make_adaln_matmul_expand_kernel(D_TILES, N_PATCH_PAD // TILE)
 # Fused RoPE + layout transform: eliminates 5 slices + 2 RoPE + 9 reshape/permute
 from rope_layout_kernel import make_rope_layout_kernel, make_rope_temporal_kernel
-rope_layout_spatial = make_rope_layout_kernel(N_PATCH_PAD // TILE, D_HEAD // TILE, N_HEADS)
+N_HEADS_TP = N_HEADS // N_CHIPS
+rope_layout_spatial = make_rope_layout_kernel(N_PATCH_PAD // TILE, D_HEAD // TILE, N_HEADS_TP)
 # Fused temporal RoPE: eliminates 5 slices + 2 RoPE kernels
-rope_temporal = make_rope_temporal_kernel(D_HEAD // TILE, N_HEADS)
+rope_temporal = make_rope_temporal_kernel(D_HEAD // TILE, N_HEADS_TP)
 # VAE decoder RoPE + layout (2D pixel-based, seq=576 tokens)
 vae_rope_layout = make_rope_layout_kernel(VAE_SEQ_TILES, VAE_D_HEAD // TILE, VAE_DEC_HEADS)
 
@@ -1744,15 +1748,16 @@ SDPA_PROGRAM_CONFIG = None
 def init_compute_configs(device):
     """Initialize compute kernel configs. Call after device is opened."""
     global MATMUL_COMPUTE_CONFIG, SDPA_COMPUTE_CONFIG, SDPA_PROGRAM_CONFIG
+    arch = device.arch()
     MATMUL_COMPUTE_CONFIG = ttnn.init_device_compute_kernel_config(
-        device.arch(),
+        arch,
         math_fidelity=ttnn.MathFidelity.HiFi2,
         math_approx_mode=False,
         fp32_dest_acc_en=True,
         packer_l1_acc=True,
     )
     SDPA_COMPUTE_CONFIG = ttnn.init_device_compute_kernel_config(
-        device.arch(),
+        arch,
         math_fidelity=ttnn.MathFidelity.HiFi2,
         math_approx_mode=False,
         fp32_dest_acc_en=False,
@@ -1768,13 +1773,33 @@ def init_compute_configs(device):
 # Host helpers
 # ============================================================
 
+def _mesh_kwargs(device):
+    """Return mesh_mapper kwarg if device is a MeshDevice."""
+    if isinstance(device, ttnn.MeshDevice):
+        return {"mesh_mapper": ttnn.ReplicateTensorToMesh(device)}
+    return {}
+
 def to_tt(t, device):
     return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-                           device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+                           device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                           **_mesh_kwargs(device))
 
 def to_tt_l1(t, device):
     return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-                           device=device, memory_config=ttnn.L1_MEMORY_CONFIG)
+                           device=device, memory_config=ttnn.L1_MEMORY_CONFIG,
+                           **_mesh_kwargs(device))
+
+def shard_tt(t, device, dim):
+    """Load tensor sharded across mesh devices along given dimension."""
+    return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                           device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                           mesh_mapper=ttnn.ShardTensorToMesh(device, dim=dim))
+
+def shard_tt_l1(t, device, dim):
+    """Load tensor sharded across mesh devices along given dimension (L1)."""
+    return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                           device=device, memory_config=ttnn.L1_MEMORY_CONFIG,
+                           mesh_mapper=ttnn.ShardTensorToMesh(device, dim=dim))
 
 def zeros_tt(shape, device):
     return to_tt(torch.zeros(shape, dtype=torch.bfloat16), device)
@@ -1782,8 +1807,35 @@ def zeros_tt(shape, device):
 def zeros_l1(shape, device):
     return to_tt_l1(torch.zeros(shape, dtype=torch.bfloat16), device)
 
+# Global mesh device reference for readback (set in main)
+_MESH_DEVICE = None
+
+def readback_torch(t):
+    """Read tensor from device/mesh to torch. For mesh, reads chip 0."""
+    if _MESH_DEVICE is not None:
+        return ttnn.to_torch(t, mesh_composer=ttnn.ConcatMeshToTensor(_MESH_DEVICE, dim=0))[:t.shape[0]]
+    return ttnn.to_torch(t)
+
 def expand_bias(bias_1d, seq_pad):
     return bias_1d.unsqueeze(0).expand(seq_pad, -1).contiguous().to(torch.bfloat16)
+
+def interleave_qkv_for_tp(qkv_full_w, n_chips, d_model, d_head):
+    """Rearrange QKV weight for per-head sharding across chips.
+    Input: (d_model, 5*d_model) layout [Q|K|V|Q_swap|K_swap] each d_model cols.
+    Output: (d_model, 5*d_model) rearranged so ShardTensorToMesh(dim=1)
+    gives each chip n_heads/n_chips heads with [Q|K|V|Q_swap|K_swap] layout."""
+    if n_chips == 1:
+        return qkv_full_w
+    heads_per_chip = d_model // d_head // n_chips
+    cols_per_chip = heads_per_chip * d_head  # per section
+    sections = torch.split(qkv_full_w, d_model, dim=1)  # 5 sections
+    chip_parts = []
+    for chip in range(n_chips):
+        sc = chip * cols_per_chip
+        ec = sc + cols_per_chip
+        for section in sections:
+            chip_parts.append(section[:, sc:ec])
+    return torch.cat(chip_parts, dim=1)
 
 def timestep_embedding(t, dim, max_period=10000):
     half = dim // 2
@@ -1917,13 +1969,14 @@ def build_spatial_rope_device_tables(spatial_freqs, n_frames, tt_device):
     sign[0::2] = -1
     sin_perm_per_pos = sin_per_pos * sign.unsqueeze(0)  # (N_PATCHES, 64)
 
-    # Repeat across all heads: (N_PATCHES, 64) -> (N_PATCHES, 1024)
-    cos_expanded = cos_per_pos.repeat(1, N_HEADS)
-    sin_expanded = sin_perm_per_pos.repeat(1, N_HEADS)
+    # Repeat across TP heads: (N_PATCHES, 64) -> (N_PATCHES, N_HEADS_TP * D_HEAD)
+    d_model_tp = N_HEADS_TP * D_HEAD
+    cos_expanded = cos_per_pos.repeat(1, N_HEADS_TP)
+    sin_expanded = sin_perm_per_pos.repeat(1, N_HEADS_TP)
 
     # Pad to N_PATCH_PAD rows, repeat for T frames
-    cos_full = torch.zeros(SEQ, D_MODEL, dtype=torch.bfloat16)
-    sin_full = torch.zeros(SEQ, D_MODEL, dtype=torch.bfloat16)
+    cos_full = torch.zeros(SEQ, d_model_tp, dtype=torch.bfloat16)
+    sin_full = torch.zeros(SEQ, d_model_tp, dtype=torch.bfloat16)
     for t in range(n_frames):
         start = t * N_PATCH_PAD
         cos_full[start:start + N_PATCHES] = cos_expanded.to(torch.bfloat16)
@@ -2039,28 +2092,41 @@ def preload_dit_weights(tt_device, n_frames=2):
                 qkv_full_w = torch.cat([q_w, k_w, v_w,
                                         swap_adjacent_columns(q_w),
                                         swap_adjacent_columns(k_w)], dim=1)
-                dev["%s.qkv_full_w" % p] = to_tt(qkv_full_w, tt_device)
+                # TP: interleave heads so ShardTensorToMesh(dim=1) gives each chip its heads
+                if N_CHIPS > 1:
+                    qkv_full_w = interleave_qkv_for_tp(qkv_full_w, N_CHIPS, D_MODEL, D_HEAD)
+                    dev["%s.qkv_full_w" % p] = shard_tt(qkv_full_w, tt_device, dim=1)
+                else:
+                    dev["%s.qkv_full_w" % p] = to_tt(qkv_full_w, tt_device)
                 # Separate QK_swap weights still needed for temporal path
                 qk_swap_w = torch.cat([swap_adjacent_columns(q_w),
                                        swap_adjacent_columns(k_w)], dim=1)
                 dev["%s.qk_swap_w" % p] = to_tt(qk_swap_w, tt_device)
                 dev["%s.qkv_w" % p] = to_tt(qkv_w, tt_device)
 
-                # Output projection: Linear(1024, 1024) with bias
+                # Output projection: row-parallel (shard input dim)
                 SEQ = N_PATCH_PAD * n_frames
                 out_w = st.get_tensor("%s_attn.to_out.weight" % p).T.contiguous().to(torch.bfloat16)
-                dev["%s.out_w" % p] = to_tt(out_w, tt_device)
+                if N_CHIPS > 1:
+                    dev["%s.out_w" % p] = shard_tt(out_w, tt_device, dim=0)
+                else:
+                    dev["%s.out_w" % p] = to_tt(out_w, tt_device)
                 out_b = st.get_tensor("%s_attn.to_out.bias" % p).to(torch.bfloat16)
                 dev["%s.out_b" % p] = to_tt(expand_bias(out_b, SEQ), tt_device)
 
-                # MLP: fc1 Linear(1024, 4096) + fc2 Linear(4096, 1024)
+                # MLP: fc1 column-parallel (shard output dim), fc2 row-parallel (shard input dim)
                 fc1_w = st.get_tensor("%s_mlp.fc1.weight" % p).T.contiguous().to(torch.bfloat16)
-                dev["%s.fc1_w" % p] = to_tt(fc1_w, tt_device)
                 fc1_b = st.get_tensor("%s_mlp.fc1.bias" % p).to(torch.bfloat16)
-                dev["%s.fc1_b" % p] = to_tt(expand_bias(fc1_b, SEQ), tt_device)
                 fc2_w = st.get_tensor("%s_mlp.fc2.weight" % p).T.contiguous().to(torch.bfloat16)
-                dev["%s.fc2_w" % p] = to_tt(fc2_w, tt_device)
                 fc2_b = st.get_tensor("%s_mlp.fc2.bias" % p).to(torch.bfloat16)
+                if N_CHIPS > 1:
+                    dev["%s.fc1_w" % p] = shard_tt(fc1_w, tt_device, dim=1)
+                    dev["%s.fc1_b" % p] = shard_tt(expand_bias(fc1_b, SEQ), tt_device, dim=1)
+                    dev["%s.fc2_w" % p] = shard_tt(fc2_w, tt_device, dim=0)
+                else:
+                    dev["%s.fc1_w" % p] = to_tt(fc1_w, tt_device)
+                    dev["%s.fc1_b" % p] = to_tt(expand_bias(fc1_b, SEQ), tt_device)
+                    dev["%s.fc2_w" % p] = to_tt(fc2_w, tt_device)
                 dev["%s.fc2_b" % p] = to_tt(expand_bias(fc2_b, SEQ), tt_device)
                 # 1D bias for ttnn.linear
                 dev["%s.fc2_b_1d" % p] = to_tt(fc2_b.unsqueeze(0).contiguous(), tt_device)
@@ -2078,7 +2144,7 @@ def preload_dit_weights(tt_device, n_frames=2):
         print("Precomputed RoPE freqs: spatial %s, temporal %s" % (
             tuple(SPATIAL_ROPE_FREQS.shape), tuple(TEMPORAL_ROPE_FREQS.shape)))
 
-        # Device-side spatial RoPE tables
+        # Device-side spatial RoPE tables (sized for N_HEADS_TP heads per chip)
         dev["spatial_cos"], dev["spatial_sin_perm"] = \
             build_spatial_rope_device_tables(SPATIAL_ROPE_FREQS, n_frames, tt_device)
 
@@ -2091,7 +2157,7 @@ def preload_dit_weights(tt_device, n_frames=2):
             n_frames * N_PATCH_PAD, TEMPORAL_ROPE_DIM)  # (SEQ, 64)
         dev["temporal_cos"], dev["temporal_sin_perm"] = \
             build_rope_device_tables(temporal_expanded, n_frames * N_PATCH_PAD,
-                                     N_PATCH_PAD, N_HEADS, n_frames, tt_device)
+                                     N_PATCH_PAD, N_HEADS_TP, n_frames, tt_device)
 
     elapsed = time.time() - t0
     print("Preloaded %d tensors in %.1fs" % (len(dev), elapsed))
@@ -2209,44 +2275,44 @@ def prealloc_scratch(tt_device, n_frames=2):
     t0 = time.time()
     s = {}
     SEQ = N_PATCH_PAD * n_frames  # 320 for T=2
+    D_MODEL_TP = D_MODEL // N_CHIPS  # per-chip model dim for sharded tensors
+    D_MLP_TP = D_MLP // N_CHIPS
     # L1 intermediates: eliminates DRAM round-trips between operations
-    # Total ~13MB across 72 cores = ~180KB/core (well within ~1.4MB/core budget)
     s["z_a"] = zeros_l1((SEQ, D_MODEL), tt_device)
     s["z_b"] = zeros_l1((SEQ, D_MODEL), tt_device)
     s["normed"] = zeros_l1((SEQ, D_MODEL), tt_device)
     s["modulated"] = zeros_l1((SEQ, D_MODEL), tt_device)
-    s["qkv"] = zeros_l1((SEQ, 3 * D_MODEL), tt_device)
-    s["qkv_full"] = zeros_l1((SEQ, 5 * D_MODEL), tt_device)
+    s["qkv"] = zeros_l1((SEQ, 3 * D_MODEL_TP), tt_device)
+    s["qkv_full"] = zeros_l1((SEQ, 5 * D_MODEL_TP), tt_device)
     s["o_proj"] = zeros_l1((SEQ, D_MODEL), tt_device)
-    s["fc1"] = zeros_l1((SEQ, D_MLP), tt_device)
-    s["gelu"] = zeros_l1((SEQ, D_MLP), tt_device)
+    s["fc1"] = zeros_l1((SEQ, D_MLP_TP), tt_device)
+    s["gelu"] = zeros_l1((SEQ, D_MLP_TP), tt_device)
     s["fc2"] = zeros_l1((SEQ, D_MODEL), tt_device)
     # Conditioning scratch (per-frame, so TILE * n_frames)
     s["t_emb_a"] = zeros_tt((TILE, D_MODEL), tt_device)
     s["t_emb_b"] = zeros_tt((TILE, D_MODEL), tt_device)
     s["cond"] = zeros_tt((TILE, D_MODEL), tt_device)
-    # adaLN scratch
+    # adaLN scratch (replicated, not sharded)
     s["adaln_out"] = to_tt_l1(torch.zeros(TILE, 6 * D_MODEL, dtype=torch.bfloat16), tt_device)
     s["silu_cond"] = zeros_tt((TILE, D_MODEL), tt_device)
-    # Packed adaln: (SEQ, 6*D_MODEL) reused across blocks
+    # Packed adaln: (SEQ, 6*D_MODEL) reused across blocks (replicated)
     s["adaln_packed"] = zeros_l1((SEQ, 6 * D_MODEL), tt_device)
     # Per-frame adaln expanded: (N_PATCH_PAD, 6*D_MODEL) for building packed tensor
     for f in range(n_frames):
         s["adaln_frame_%d" % f] = zeros_l1((N_PATCH_PAD, 6 * D_MODEL), tt_device)
-    # RoPE scratch (reused for spatial and temporal)
-    s["q_roped"] = zeros_l1((SEQ, D_MODEL), tt_device)
-    s["k_roped"] = zeros_l1((SEQ, D_MODEL), tt_device)
+    # RoPE scratch: sized for N_HEADS_TP heads per chip
+    s["q_roped"] = zeros_l1((SEQ, D_MODEL_TP), tt_device)
+    s["k_roped"] = zeros_l1((SEQ, D_MODEL_TP), tt_device)
     # SDPA-format scratch for fused RoPE+layout kernel (spatial)
     # Stored as 2D: (BATCH_S * N_PATCH_PAD, D_HEAD), reshaped to 4D for SDPA
-    # L1: eliminates DRAM round-trip between RoPE kernel output and SDPA input
-    BATCH_S = n_frames * N_HEADS
+    BATCH_S = n_frames * N_HEADS_TP
     s["q_sdpa"] = to_tt_l1(torch.zeros(BATCH_S * N_PATCH_PAD, D_HEAD, dtype=torch.bfloat16), tt_device)
     s["k_sdpa"] = to_tt_l1(torch.zeros(BATCH_S * N_PATCH_PAD, D_HEAD, dtype=torch.bfloat16), tt_device)
     s["v_sdpa"] = to_tt_l1(torch.zeros(BATCH_S * N_PATCH_PAD, D_HEAD, dtype=torch.bfloat16), tt_device)
-    # Temporal mega kernel scratch (Q/K roped + V)
-    s["t_q_scratch"] = zeros_l1((SEQ, D_MODEL), tt_device)
-    s["t_k_scratch"] = zeros_l1((SEQ, D_MODEL), tt_device)
-    s["t_v_scratch"] = zeros_l1((SEQ, D_MODEL), tt_device)
+    # Temporal mega kernel scratch (Q/K roped + V) - sized for TP heads
+    s["t_q_scratch"] = zeros_l1((SEQ, D_MODEL_TP), tt_device)
+    s["t_k_scratch"] = zeros_l1((SEQ, D_MODEL_TP), tt_device)
+    s["t_v_scratch"] = zeros_l1((SEQ, D_MODEL_TP), tt_device)
     # SDPA scratch: (SEQ, D_MODEL) for TT-Lang spatial SDPA output
     s["sdpa_out"] = zeros_l1((SEQ, D_MODEL), tt_device)
     # Mega kernel B scratch
@@ -2380,28 +2446,30 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
         ttnn.synchronize_device(tt_device)
         _t1 = _dt.time(); print("      %s qkv_matmul: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
 
+    D_MODEL_TP = D_MODEL // N_CHIPS
+
     if attn_type == "spatial":
         cos_key, sin_key = "spatial_cos", "spatial_sin_perm"
         # Fused RoPE + layout: reads qkv_full, writes Q,K,V in SDPA format directly
         rope_layout_spatial(scr["qkv_full"], dev[cos_key], dev[sin_key],
                            scr["q_sdpa"], scr["k_sdpa"], scr["v_sdpa"])
-        BATCH_S = T * N_HEADS
+        BATCH_S = T * N_HEADS_TP
         # Already in (BATCH_S * N_PATCH_PAD, D_HEAD) layout, just reshape for SDPA
         q_s = ttnn.reshape(scr["q_sdpa"], [BATCH_S, 1, N_PATCH_PAD, D_HEAD])
         k_s = ttnn.reshape(scr["k_sdpa"], [BATCH_S, 1, N_PATCH_PAD, D_HEAD])
         v_s = ttnn.reshape(scr["v_sdpa"], [BATCH_S, 1, N_PATCH_PAD, D_HEAD])
         attn_out = ttnn.transformer.scaled_dot_product_attention(q_s, k_s, v_s, is_causal=False)
-        attn_out = ttnn.reshape(attn_out, [T, N_HEADS, N_PATCH_PAD, D_HEAD])
+        attn_out = ttnn.reshape(attn_out, [T, N_HEADS_TP, N_PATCH_PAD, D_HEAD])
         attn_out = ttnn.permute(attn_out, [0, 2, 1, 3])
-        attn_2d = ttnn.reshape(attn_out, [SEQ, D_MODEL])
+        attn_2d = ttnn.reshape(attn_out, [SEQ, D_MODEL_TP])
         _timer.mark("qkv+sdpa")
     else:
-        # Fused temporal RoPE: reads qkv_full, writes q/k/v in (SEQ, D_MODEL)
+        # Fused temporal RoPE: reads qkv_full, writes q/k/v in (SEQ, D_MODEL_TP)
         cos_key, sin_key = "temporal_cos", "temporal_sin_perm"
         rope_temporal(scr["qkv_full"], dev[cos_key], dev[sin_key],
                       scr["q_roped"], scr["k_roped"], scr["t_v_scratch"])
         # Temporal: each patch attends across frames, batch over (patch, head)
-        BATCH_T = N_PATCH_PAD * N_HEADS
+        BATCH_T = N_PATCH_PAD * N_HEADS_TP
         q_t = ttnn.reshape(scr["q_roped"], [T, BATCH_T, D_HEAD])
         q_t = ttnn.permute(q_t, [1, 0, 2])
         q_t = ttnn.reshape(q_t, [BATCH_T, 1, T, D_HEAD])
@@ -2414,7 +2482,7 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
         attn_out = ttnn.transformer.scaled_dot_product_attention(q_t, k_t, v_t, is_causal=True)
         attn_out = ttnn.reshape(attn_out, [BATCH_T, T, D_HEAD])
         attn_out = ttnn.permute(attn_out, [1, 0, 2])
-        attn_2d = ttnn.reshape(attn_out, [SEQ, D_MODEL])
+        attn_2d = ttnn.reshape(attn_out, [SEQ, D_MODEL_TP])
         _timer.mark("sdpa")
     if _do_dev_profile:
         ttnn.synchronize_device(tt_device)
@@ -2426,9 +2494,11 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
     # To restore fused version: mega_post_attn_kernel(attn_2d, x_tt, adaln_packed,
     #   out_w, out_b, fc1_w, fc1_b, fc2_w, fc2_b, scaler, mean_scale,
     #   z_scratch, gelu_scratch, z_a)
-    # Phase A: O proj + bias
-    ttnn.matmul(attn_2d, dev["%s.out_w" % prefix], optional_output_tensor=scr["o_proj"])
-    ttnn.add(scr["o_proj"], dev["%s.out_b" % prefix], output_tensor=scr["o_proj"])
+    # Phase A: O proj (row-parallel) + all_reduce + bias
+    o_proj = ttnn.matmul(attn_2d, dev["%s.out_w" % prefix])
+    if N_CHIPS > 1:
+        o_proj = ttnn.all_reduce(o_proj)
+    ttnn.add(o_proj, dev["%s.out_b" % prefix], output_tensor=scr["o_proj"])
     gate_msa = ttnn.slice(adaln_packed, [0, 2 * D_MODEL], [SEQ, 3 * D_MODEL])
 
     # Phase B: Fused gated_residual + LN + adaLN modulate (single TT-Lang kernel)
@@ -2450,9 +2520,11 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
         ttnn.synchronize_device(tt_device)
         _t1 = _dt.time(); print("      %s fc1+gelu: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
 
-    # Phase D: FC2 + bias + gated residual
-    ttnn.matmul(scr["gelu"], dev["%s.fc2_w" % prefix], optional_output_tensor=scr["fc2"])
-    ttnn.add(scr["fc2"], dev["%s.fc2_b" % prefix], output_tensor=scr["fc2"])
+    # Phase D: FC2 (row-parallel) + all_reduce + bias + gated residual
+    fc2_out = ttnn.matmul(scr["gelu"], dev["%s.fc2_w" % prefix])
+    if N_CHIPS > 1:
+        fc2_out = ttnn.all_reduce(fc2_out)
+    ttnn.add(fc2_out, dev["%s.fc2_b" % prefix], output_tensor=scr["fc2"])
     gate_mlp = ttnn.slice(adaln_packed, [0, 5 * D_MODEL], [SEQ, 6 * D_MODEL])
     gated_residual_kernel(scr["z_scratch"], scr["fc2"], gate_mlp, scr["z_a"])
     _timer.mark("post_attn")
@@ -2679,7 +2751,7 @@ def vae_decode_device(z_flat, vae_dev, vae_scr, tt_device, scaler, mean_scale):
                 optional_output_tensor=vae_scr["pred_out"])
     ttnn.add(vae_scr["pred_out"], vae_dev["pred_b"], output_tensor=vae_scr["pred_out"])
 
-    result = ttnn.to_torch(vae_scr["pred_out"]).float()
+    result = readback_torch(vae_scr["pred_out"]).float()
     return result[:, :VAE_PATCH_DIM]  # strip tile padding (1216 -> 1200)
 
 def vae_unpatchify(patches):
@@ -2698,13 +2770,14 @@ def vae_unpatchify(patches):
 # ============================================================
 
 if __name__ == "__main__":
-    # Increase config buffer for pipe-fused kernels (~85KB compiled)
-    # Increase config buffer for pipe-fused kernels (~85KB compiled)
-    # Disabled: pipe kernel not in use, and reduced L1 causes OOM with VAE scratch
-    # default_l1 = ttnn.device.get_max_worker_l1_unreserved_size()
-    # tt_device = ttnn.open_device(device_id=0, trace_region_size=100000000,
-    #                               worker_l1_size=default_l1 - 90112)
-    tt_device = ttnn.open_device(device_id=0, trace_region_size=100000000)
+    # Multi-chip: enable fabric for inter-chip collectives
+    if N_CHIPS > 1:
+        ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
+        tt_device = ttnn.open_mesh_device(ttnn.MeshShape(1, N_CHIPS),
+                                           trace_region_size=100000000)
+        _MESH_DEVICE = tt_device
+    else:
+        tt_device = ttnn.open_device(device_id=0, trace_region_size=100000000)
     init_compute_configs(tt_device)
     torch.manual_seed(42)
 
@@ -2880,103 +2953,131 @@ if __name__ == "__main__":
         ttnn.add(scr["ddim_tmp"], scr["ddim_x_noise"], output_tensor=chunk)
         return chunk
 
-    # === Trace capture ===
-    # Compile: run one step to warm up all kernels
-    print("Compiling DDIM step...")
-    t_compile = time.time()
-    # Load first step's coefficients and conditioning
-    first_noise_idx = ddim_steps  # reversed range starts here
-    for k in ddim_coeff_dev:
-        ttnn.copy_host_to_device_tensor(ddim_coeffs_host[first_noise_idx][k], ddim_coeff_dev[k])
-    # Context frames get prompt conditioning, last frame gets gen conditioning
-    for f in range(N_FRAMES - 1):
-        prompt_cond_host = ttnn.from_torch(
-            ttnn.to_torch(prompt_cond_dev),
-            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
-        ttnn.copy_host_to_device_tensor(prompt_cond_host, cond_traced[f])
-    first_cond_host = ttnn.from_torch(
-        ttnn.to_torch(gen_cond_per_step[first_noise_idx]),
-        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
-    ttnn.copy_host_to_device_tensor(first_cond_host, cond_traced[N_FRAMES - 1])
-    # Initialize context with prompt replicated
-    prompt_z_host_tile = ttnn.from_torch(
-        ttnn.to_torch(prompt_z_dev), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
-    context_tiles = [prompt_z_host_tile] * (N_FRAMES - 1)
-    context_host = ttnn.from_torch(
-        torch.cat([ttnn.to_torch(prompt_z_dev)] * (N_FRAMES - 1), dim=0),
-        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
-    ttnn.copy_host_to_device_tensor(context_host, context_z_dev)
-
-    ddim_step_fn(trace_chunk)
-    ttnn.synchronize_device(tt_device)
-    print("Compile done in %.1fs" % (time.time() - t_compile))
-
-    # Capture trace
-    print("Capturing trace...")
-    t_trace = time.time()
-    trace_id = ttnn.begin_trace_capture(tt_device, cq_id=0)
-    traced_output = ddim_step_fn(trace_chunk)
-    ttnn.end_trace_capture(tt_device, trace_id, cq_id=0)
-    ttnn.synchronize_device(tt_device)
-    print("Trace captured in %.1fs" % (time.time() - t_trace))
-
-    # Pre-convert gen_cond to host tensors for fast copy
-    gen_cond_host = {}
-    for noise_idx in gen_cond_per_step:
-        gen_cond_host[noise_idx] = ttnn.from_torch(
-            ttnn.to_torch(gen_cond_per_step[noise_idx]),
-            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
-    # Pre-convert prompt_cond to host tensor
-    prompt_cond_host = ttnn.from_torch(
-        ttnn.to_torch(prompt_cond_dev),
-        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
-
-    def run_ddim_loop(chunk_in_host, label, context_cond_hosts=None, gen_cond_map=None):
-        """Run full DDIM loop using traced execution.
-        chunk_in_host: host tensor (tilized bfloat16) to copy into trace_chunk.
-        context_cond_hosts: list of T-1 host tensors for context frame conditioning.
-        gen_cond_map: dict of {noise_idx: host_tensor} for gen frame conditioning."""
-        if gen_cond_map is None:
-            gen_cond_map = gen_cond_host
-        if context_cond_hosts is None:
-            context_cond_hosts = [prompt_cond_host] * (N_FRAMES - 1)
-        # Copy initial chunk into traced buffer
-        ttnn.copy_host_to_device_tensor(chunk_in_host, trace_chunk)
-        # Update context conditioning (constant across DDIM steps)
-        for f in range(N_FRAMES - 1):
-            ttnn.copy_host_to_device_tensor(context_cond_hosts[f], cond_traced[f])
+    # === DDIM Execution ===
+    def run_ddim_loop_direct(chunk_dev, label, context_cond_list, gen_cond_per_step_dev):
+        """Run DDIM loop with direct (non-traced) execution.
+        chunk_dev: device tensor (N_PATCH_PAD, OUT_DIM) in output space.
+        context_cond_list: list of T-1 device conditioning tensors.
+        gen_cond_per_step_dev: dict {noise_idx: device_tensor} conditioning per step."""
         t_total = time.time()
         for noise_idx in reversed(range(1, ddim_steps + 1)):
             # Update coefficients
             for k in ddim_coeff_dev:
                 ttnn.copy_host_to_device_tensor(ddim_coeffs_host[noise_idx][k], ddim_coeff_dev[k])
-            # Update gen frame conditioning (varies per DDIM step)
-            ttnn.copy_host_to_device_tensor(gen_cond_map[noise_idx], cond_traced[N_FRAMES - 1])
-            # Execute traced step
-            ttnn.execute_trace(tt_device, trace_id, cq_id=0, blocking=False)
+            # Set conditioning BEFORE calling ddim_step_fn (it captures cond_traced)
+            for f in range(N_FRAMES - 1):
+                cond_traced[f] = context_cond_list[f]
+            cond_traced[N_FRAMES - 1] = gen_cond_per_step_dev[noise_idx]
+            chunk_dev = ddim_step_fn(chunk_dev)
 
         ttnn.synchronize_device(tt_device)
         total_time = time.time() - t_total
         print("%s: %.3fs total (%.0fms/step, %.2f FPS)" % (
             label, total_time, total_time * 1000 / ddim_steps, ddim_steps / total_time))
-        return trace_chunk
+        return chunk_dev
 
-    # Prepare initial chunk as host tensor for trace input
-    chunk_host_tilized = ttnn.from_torch(chunk_pad, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+    USE_TRACE = (N_CHIPS == 1)
 
-    # Warmup: trace is already compiled+captured, just run one loop to verify
-    print("\n=== WARMUP (traced execution) ===")
-    _ = run_ddim_loop(chunk_host_tilized, "Warmup")
+    if USE_TRACE:
+        # === Trace capture (single-chip only) ===
+        print("Compiling DDIM step...")
+        t_compile = time.time()
+        first_noise_idx = ddim_steps
+        for k in ddim_coeff_dev:
+            ttnn.copy_host_to_device_tensor(ddim_coeffs_host[first_noise_idx][k], ddim_coeff_dev[k])
+        for f in range(N_FRAMES - 1):
+            prompt_cond_host = ttnn.from_torch(
+                readback_torch(prompt_cond_dev),
+                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+            ttnn.copy_host_to_device_tensor(prompt_cond_host, cond_traced[f])
+        first_cond_host = ttnn.from_torch(
+            readback_torch(gen_cond_per_step[first_noise_idx]),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+        ttnn.copy_host_to_device_tensor(first_cond_host, cond_traced[N_FRAMES - 1])
+        prompt_z_host_tile = ttnn.from_torch(
+            readback_torch(prompt_z_dev), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+        context_tiles = [prompt_z_host_tile] * (N_FRAMES - 1)
+        context_host = ttnn.from_torch(
+            torch.cat([readback_torch(prompt_z_dev)] * (N_FRAMES - 1), dim=0),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+        ttnn.copy_host_to_device_tensor(context_host, context_z_dev)
+        ddim_step_fn(trace_chunk)
+        ttnn.synchronize_device(tt_device)
+        print("Compile done in %.1fs" % (time.time() - t_compile))
+        print("Capturing trace...")
+        t_trace = time.time()
+        trace_id = ttnn.begin_trace_capture(tt_device, cq_id=0)
+        traced_output = ddim_step_fn(trace_chunk)
+        ttnn.end_trace_capture(tt_device, trace_id, cq_id=0)
+        ttnn.synchronize_device(tt_device)
+        print("Trace captured in %.1fs" % (time.time() - t_trace))
+        gen_cond_host = {}
+        for noise_idx in gen_cond_per_step:
+            gen_cond_host[noise_idx] = ttnn.from_torch(
+                readback_torch(gen_cond_per_step[noise_idx]),
+                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+        prompt_cond_host = ttnn.from_torch(
+            readback_torch(prompt_cond_dev),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
 
-    # Timed single-frame test
-    print("\n=== TIMED SINGLE FRAME ===")
-    result_dev = run_ddim_loop(chunk_host_tilized, "Timed")
+        def run_ddim_loop(chunk_in_host, label, context_cond_hosts=None, gen_cond_map=None):
+            if gen_cond_map is None:
+                gen_cond_map = gen_cond_host
+            if context_cond_hosts is None:
+                context_cond_hosts = [prompt_cond_host] * (N_FRAMES - 1)
+            ttnn.copy_host_to_device_tensor(chunk_in_host, trace_chunk)
+            for f in range(N_FRAMES - 1):
+                ttnn.copy_host_to_device_tensor(context_cond_hosts[f], cond_traced[f])
+            t_total = time.time()
+            for noise_idx in reversed(range(1, ddim_steps + 1)):
+                for k in ddim_coeff_dev:
+                    ttnn.copy_host_to_device_tensor(ddim_coeffs_host[noise_idx][k], ddim_coeff_dev[k])
+                ttnn.copy_host_to_device_tensor(gen_cond_map[noise_idx], cond_traced[N_FRAMES - 1])
+                ttnn.execute_trace(tt_device, trace_id, cq_id=0, blocking=False)
+            ttnn.synchronize_device(tt_device)
+            total_time = time.time() - t_total
+            print("%s: %.3fs total (%.0fms/step, %.2f FPS)" % (
+                label, total_time, total_time * 1000 / ddim_steps, ddim_steps / total_time))
+            return trace_chunk
 
-    # === Generate 30-frame video ===
+        chunk_host_tilized = ttnn.from_torch(chunk_pad, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+        print("\n=== WARMUP (traced execution) ===")
+        _ = run_ddim_loop(chunk_host_tilized, "Warmup")
+        print("\n=== TIMED SINGLE FRAME ===")
+        result_dev = run_ddim_loop(chunk_host_tilized, "Timed")
+    else:
+        # === Direct execution (multi-chip) ===
+        print("\n=== WARMUP (direct execution, %d chips) ===" % N_CHIPS)
+        # Set up conditioning for ddim_step_fn
+        for f in range(N_FRAMES - 1):
+            cond_traced[f] = prompt_cond_dev
+        first_noise_idx = ddim_steps
+        cond_traced[N_FRAMES - 1] = gen_cond_per_step[first_noise_idx]
+        # Initialize context
+        context_host = torch.cat([readback_torch(prompt_z_dev)] * (N_FRAMES - 1), dim=0)
+        context_z_dev_new = to_tt(context_host.to(torch.bfloat16), tt_device)
+        ttnn.copy_host_to_device_tensor(
+            ttnn.from_torch(context_host.to(torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT),
+            context_z_dev)
+        # Warmup
+        for k in ddim_coeff_dev:
+            ttnn.copy_host_to_device_tensor(ddim_coeffs_host[first_noise_idx][k], ddim_coeff_dev[k])
+        ddim_step_fn(trace_chunk)
+        ttnn.synchronize_device(tt_device)
+        print("Warmup done")
+        # Timed run
+        print("\n=== TIMED SINGLE FRAME (%d chips) ===" % N_CHIPS)
+        # Reset chunk
+        ttnn.copy_host_to_device_tensor(
+            ttnn.from_torch(chunk_pad, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT), trace_chunk)
+        context_cond_list = [prompt_cond_dev] * (N_FRAMES - 1)
+        result_dev = run_ddim_loop_direct(trace_chunk, "Timed", context_cond_list, gen_cond_per_step)
+
+    # === Generate video ===
     # Sliding window: T-1 context frames + 1 generated frame.
     # Generated frame's latent feeds into context window for next frame.
     # VAE decode happens once at the end for all frames.
-    N_VIDEO_FRAMES = 30  # prompt + 29 generated frames
+    N_VIDEO_FRAMES = 3 if N_CHIPS > 1 else 30  # fewer frames for TP validation
     print("\n=== GENERATING %d-FRAME VIDEO (T=%d window) ===" % (N_VIDEO_FRAMES, N_FRAMES))
     t_video_start = time.time()
 
@@ -2988,11 +3089,14 @@ if __name__ == "__main__":
     prompt_z_torch = torch.zeros(N_PATCH_PAD, D_MODEL, dtype=torch.bfloat16)
     prompt_z_torch[:N_PATCHES] = patch_embed_host(
         prompt_latent[0, 0].unsqueeze(0), dev["x_emb_conv_w"], dev["x_emb_conv_b"])
-    context_window = [prompt_z_torch.clone() for _ in range(N_FRAMES - 1)]
+    context_window_z = [prompt_z_torch.clone() for _ in range(N_FRAMES - 1)]
 
-    # Sliding window of per-frame conditioning (host tensors for context frames)
-    # All context frames use stabilization_level with their respective actions
-    context_cond_window = [prompt_cond_host] * (N_FRAMES - 1)
+    # Sliding window of per-frame conditioning
+    # For multi-chip: keep device tensors directly; for trace: keep host tensors
+    if USE_TRACE:
+        context_cond_window = [prompt_cond_host] * (N_FRAMES - 1)
+    else:
+        context_cond_window = [prompt_cond_dev] * (N_FRAMES - 1)
 
     for frame_idx in range(1, N_VIDEO_FRAMES):
         t_frame = time.time()
@@ -3006,26 +3110,31 @@ if __name__ == "__main__":
         chunk_host_f = ttnn.from_torch(chunk_pad_f, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
 
         # Update context_z_dev with current sliding window
-        context_cat = torch.cat(context_window, dim=0)  # ((T-1)*N_PATCH_PAD, D_MODEL)
+        context_cat = torch.cat(context_window_z, dim=0)  # ((T-1)*N_PATCH_PAD, D_MODEL)
         context_host = ttnn.from_torch(context_cat, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
         ttnn.copy_host_to_device_tensor(context_host, context_z_dev)
 
         # Pre-compute gen conditioning with this frame's action
         action_idx = min(frame_idx, sample_actions.shape[0] - 1)
         frame_cond_dev = precompute_gen_cond(sample_actions[action_idx])
-        frame_cond_host = {}
-        for noise_idx in frame_cond_dev:
-            frame_cond_host[noise_idx] = ttnn.from_torch(
-                ttnn.to_torch(frame_cond_dev[noise_idx]),
-                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
 
-        # DDIM denoise (traced)
-        result_dev = run_ddim_loop(chunk_host_f, "Frame %d" % frame_idx,
-                                   context_cond_hosts=context_cond_window,
-                                   gen_cond_map=frame_cond_host)
+        if USE_TRACE:
+            frame_cond_host = {}
+            for noise_idx in frame_cond_dev:
+                frame_cond_host[noise_idx] = ttnn.from_torch(
+                    readback_torch(frame_cond_dev[noise_idx]),
+                    dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+            result_dev = run_ddim_loop(chunk_host_f, "Frame %d" % frame_idx,
+                                       context_cond_hosts=context_cond_window,
+                                       gen_cond_map=frame_cond_host)
+        else:
+            # Direct execution for multi-chip
+            ttnn.copy_host_to_device_tensor(chunk_host_f, trace_chunk)
+            result_dev = run_ddim_loop_direct(trace_chunk, "Frame %d" % frame_idx,
+                                              context_cond_window, frame_cond_dev)
 
         # Readback generated latent (output space -> image space)
-        chunk_result = ttnn.to_torch(result_dev)[:N_PATCHES].float()
+        chunk_result = readback_torch(result_dev)[:N_PATCHES].float()
         gen_latent = unpatchify_host(chunk_result, PATCH_SIZE, IN_CHANNELS, FRAME_H, FRAME_W)
         all_latents.append(gen_latent.squeeze(0))  # (C, H, W)
 
@@ -3035,16 +3144,19 @@ if __name__ == "__main__":
             gen_latent, dev["x_emb_conv_w"], dev["x_emb_conv_b"])
 
         # Slide window: drop oldest, append newest
-        context_window.pop(0)
-        context_window.append(new_z)
+        context_window_z.pop(0)
+        context_window_z.append(new_z)
 
         # Slide conditioning: context frames all use stabilization_level
         new_context_cond = compute_cond_for_frame(
             stabilization_level - 1, sample_actions[action_idx], dev, scr, tt_device)
-        new_context_cond_host = ttnn.from_torch(
-            ttnn.to_torch(new_context_cond), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+        if USE_TRACE:
+            new_cond_entry = ttnn.from_torch(
+                readback_torch(new_context_cond), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+        else:
+            new_cond_entry = new_context_cond
         context_cond_window.pop(0)
-        context_cond_window.append(new_context_cond_host)
+        context_cond_window.append(new_cond_entry)
 
         elapsed = time.time() - t_frame
         print("  Frame %d: %.2fs" % (frame_idx, elapsed))
@@ -3099,4 +3211,7 @@ if __name__ == "__main__":
         print("ffmpeg failed: %s" % result.stderr[-200:])
 
     print("\nDone!")
-    ttnn.close_device(tt_device)
+    if isinstance(tt_device, ttnn.MeshDevice):
+        ttnn.close_mesh_device(tt_device)
+    else:
+        ttnn.close_device(tt_device)
