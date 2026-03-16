@@ -2505,8 +2505,15 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
         ttnn.synchronize_device(tt_device)
         _t1 = _dt.time(); print("      %s adaln: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
 
-    # Fused LayerNorm + adaLN modulate (reads shift/scale from packed tensor)
-    fused_ln_adaln_d1024(x_tt, scaler, mean_scale, adaln_packed, scr["modulated"])
+    # LayerNorm + adaLN modulate via ttnn ops
+    # TODO: revisit TT-Lang fused_ln_adaln_d1024 kernel (0.3ms vs 0.15ms ttnn, 2x slower)
+    # Was: fused_ln_adaln_d1024(x_tt, scaler, mean_scale, adaln_packed, scr["modulated"])
+    normed_a = ttnn.layer_norm(x_tt)
+    shift_a = ttnn.slice(adaln_packed, [0, 0], [SEQ, D_MODEL])
+    scale_a = ttnn.slice(adaln_packed, [0, D_MODEL], [SEQ, 2 * D_MODEL])
+    ttnn.add(scale_a, 1.0, output_tensor=scr["normed"])
+    ttnn.multiply(normed_a, scr["normed"], output_tensor=scr["modulated"])
+    ttnn.add(scr["modulated"], shift_a, output_tensor=scr["modulated"])
     _timer.mark("norm+mod")
     if _do_dev_profile:
         ttnn.synchronize_device(tt_device)
@@ -2578,12 +2585,18 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
     ttnn.add(o_proj, dev["%s.out_b" % prefix], output_tensor=scr["o_proj"])
     gate_msa = ttnn.slice(adaln_packed, [0, 2 * D_MODEL], [SEQ, 3 * D_MODEL])
 
-    # Phase B: Fused gated_residual + LN + adaLN modulate (single TT-Lang kernel)
-    # Replaces 3 separate kernels: gated_residual_kernel + layernorm_d1024 + adaln_modulate_kernel
-    # Eliminates 2 DRAM intermediates (z_scratch: 640KB, normed: 640KB) = 1.28MB saved per call
-    fused_gated_res_ln_adaln_d1024(
-        x_tt, scr["o_proj"], gate_msa, scaler, mean_scale, adaln_packed,
-        scr["z_scratch"], scr["modulated"])
+    # Phase B: gated_residual + LN + adaLN modulate via ttnn ops
+    # TODO: revisit TT-Lang fused_gated_res_ln_adaln_d1024 kernel (0.8ms vs 0.15ms ttnn, 5.5x slower)
+    # Was: fused_gated_res_ln_adaln_d1024(x_tt, scr["o_proj"], gate_msa, scaler, mean_scale,
+    #          adaln_packed, scr["z_scratch"], scr["modulated"])
+    ttnn.multiply(scr["o_proj"], gate_msa, output_tensor=scr["normed"])
+    ttnn.add(x_tt, scr["normed"], output_tensor=scr["z_scratch"])
+    normed = ttnn.layer_norm(scr["z_scratch"])
+    shift_b = ttnn.slice(adaln_packed, [0, 3 * D_MODEL], [SEQ, 4 * D_MODEL])
+    scale_b = ttnn.slice(adaln_packed, [0, 4 * D_MODEL], [SEQ, 5 * D_MODEL])
+    ttnn.add(scale_b, 1.0, output_tensor=scr["normed"])
+    ttnn.multiply(normed, scr["normed"], output_tensor=scr["modulated"])
+    ttnn.add(scr["modulated"], shift_b, output_tensor=scr["modulated"])
     if _do_dev_profile:
         ttnn.synchronize_device(tt_device)
         _t1 = _dt.time(); print("      %s ln+mod: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
