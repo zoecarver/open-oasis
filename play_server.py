@@ -97,18 +97,18 @@ HTML_PAGE = r"""<!doctype html>
     </div>
 
     <div>
-      <div style="margin-bottom: 8px; font-size: 13px; color: #888;">Camera (click to lock mouse)</div>
-      <div class="mouse-area" id="mouseArea">
-        <div class="mouse-dot" id="mouseDot"></div>
-        <span id="mouseLabel">Click to lock</span>
+      <div style="margin-bottom: 8px; font-size: 13px; color: #888;">Camera (arrows)</div>
+      <div class="key-grid">
+        <div class="key empty"></div>
+        <div class="key" data-key="arrowup" id="k-arrowup">&uarr;</div>
+        <div class="key empty"></div>
+        <div class="key" data-key="arrowleft" id="k-arrowleft">&larr;</div>
+        <div class="key" data-key="arrowdown" id="k-arrowdown">&darr;</div>
+        <div class="key" data-key="arrowright" id="k-arrowright">&rarr;</div>
       </div>
-      <div class="mouse-btns">
+      <div class="mouse-btns" style="margin-top: 8px;">
         <div class="mouse-btn" id="mb-attack">LMB</div>
         <div class="mouse-btn" id="mb-use">RMB</div>
-      </div>
-      <div style="margin-top: 8px; font-size: 11px; color: #666;">
-        cameraX: <span id="camX">0.00</span><br>
-        cameraY: <span id="camY">0.00</span>
       </div>
     </div>
 
@@ -142,10 +142,13 @@ function buildActionVec() {
   let vec = new Array(25).fill(0);
   for (const key of pressed) {
     const idx = KEY_MAP[key];
-    if (idx !== undefined) vec[idx] = 1;
+    if (idx !== undefined && idx >= 0) vec[idx] = 1;
   }
-  vec[15] = Math.max(-1, Math.min(1, cameraX));
-  vec[16] = Math.max(-1, Math.min(1, cameraY));
+  // Arrow keys control camera (binary, like WASD)
+  if (pressed.has('arrowup'))    vec[15] = -1;
+  if (pressed.has('arrowdown'))  vec[15] = 1;
+  if (pressed.has('arrowleft'))  vec[16] = -1;
+  if (pressed.has('arrowright')) vec[16] = 1;
   if (mouseDown.left) vec[21] = 1;
   if (mouseDown.right) vec[22] = 1;
   return vec;
@@ -161,8 +164,6 @@ function updateUI() {
   });
   document.getElementById('mb-attack').classList.toggle('active', mouseDown.left);
   document.getElementById('mb-use').classList.toggle('active', mouseDown.right);
-  document.getElementById('camX').textContent = vec[15].toFixed(2);
-  document.getElementById('camY').textContent = vec[16].toFixed(2);
 }
 
 document.addEventListener('keydown', (e) => {
@@ -180,27 +181,7 @@ document.addEventListener('keyup', (e) => {
   sendAction();
 });
 
-const mouseArea = document.getElementById('mouseArea');
-const mouseDot = document.getElementById('mouseDot');
-const mouseLabel = document.getElementById('mouseLabel');
-mouseArea.addEventListener('click', () => mouseArea.requestPointerLock());
-document.addEventListener('pointerlockchange', () => {
-  const locked = document.pointerLockElement === mouseArea;
-  mouseArea.classList.toggle('locked', locked);
-  mouseLabel.style.display = locked ? 'none' : '';
-});
-document.addEventListener('mousemove', (e) => {
-  if (document.pointerLockElement !== mouseArea) return;
-  cameraX = Math.max(-1, Math.min(1, e.movementX / 50));
-  cameraY = Math.max(-1, Math.min(1, e.movementY / 50));
-  mouseDot.style.left = (60 + cameraX * 50) + 'px';
-  mouseDot.style.top = (40 + cameraY * 30) + 'px';
-  updateUI();
-  sendAction();
-  setTimeout(() => { cameraX = 0; cameraY = 0; updateUI(); }, 50);
-});
 document.addEventListener('mousedown', (e) => {
-  if (document.pointerLockElement !== mouseArea) return;
   if (e.button === 0) mouseDown.left = true;
   if (e.button === 2) mouseDown.right = true;
   updateUI(); sendAction();
@@ -213,14 +194,20 @@ document.addEventListener('mouseup', (e) => {
 document.addEventListener('contextmenu', (e) => e.preventDefault());
 
 let actionPending = false;
+let actionDirty = false;
 function sendAction() {
+  actionDirty = true;
   if (actionPending) return;
   actionPending = true;
+  actionDirty = false;
   fetch('/action', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({action: buildActionVec()})
-  }).finally(() => { actionPending = false; });
+  }).finally(() => {
+    actionPending = false;
+    if (actionDirty) sendAction();
+  });
 }
 
 // Poll for frames
@@ -232,20 +219,16 @@ async function pollFrames() {
     try {
       const resp = await fetch('/frame?t=' + Date.now());
       if (resp.ok) {
-        const newMod = resp.headers.get('X-Frame-Mtime') || '';
-        if (newMod !== lastMod) {
-          const blob = await resp.blob();
-          const url = URL.createObjectURL(blob);
-          frameImg.onload = () => URL.revokeObjectURL(url);
-          frameImg.src = url;
-          lastMod = newMod;
-        }
+        const blob = await resp.blob();
+        const url = URL.createObjectURL(blob);
+        frameImg.onload = () => URL.revokeObjectURL(url);
+        frameImg.src = url;
         const fps = resp.headers.get('X-FPS') || '?';
         const idx = resp.headers.get('X-Frame-Index') || '?';
         statusEl.textContent = 'Frame: ' + idx + '  FPS: ' + fps;
       }
     } catch(e) {}
-    await new Promise(r => setTimeout(r, 80));
+    await new Promise(r => setTimeout(r, 21));
   }
 }
 pollFrames();

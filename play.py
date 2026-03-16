@@ -423,14 +423,11 @@ if __name__ == "__main__":
             context_cond_window.append(new_cond_entry)
             _t5 = time.time()
 
-            # Reset context every 120 frames, cycling through prompts
+            # Reset context to initial prompt every 120 frames
             if frame_idx % 120 == 0 and frame_idx > 0:
-                prompt_idx = (prompt_idx + 1) % len(all_prompts)
-                prompt_z_pad = all_prompts[prompt_idx]["z_pad"]
-                prompt_latent = all_prompts[prompt_idx]["latent"]
-                context_window_z = [prompt_z_pad.clone() for _ in range(N_FRAMES - 1)]
+                context_window_z = [all_prompts[0]["z_pad"].clone() for _ in range(N_FRAMES - 1)]
                 context_cond_window = [prompt_cond_host] * (N_FRAMES - 1)
-                print("  [reset to prompt %d: %s]" % (prompt_idx, all_prompts[prompt_idx]["path"]))
+                print("  [reset context]")
 
             # Periodic GC to prevent ttnn host tensor accumulation
             if frame_idx % 10 == 0:
