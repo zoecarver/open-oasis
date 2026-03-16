@@ -2067,35 +2067,24 @@ def build_spatial_rope_device_tables(spatial_freqs, n_frames, tt_device):
     # L1 for RoPE tables: read 16x per step by each spatial/temporal sub-block
     return to_tt_l1(cos_full, tt_device), to_tt_l1(sin_full, tt_device)
 
-def precompute_vae_rope(tt_device):
-    """Compute 2D pixel-based RoPE tables for VAE decoder attention.
-    Returns cos_tt, sin_perm_tt each (VAE_SEQ_LEN, VAE_DEC_DIM) on device L1."""
-    # RotaryEmbedding(dim=head_dim//4=16) uses dim//2=8 frequencies per axis
-    n_freqs = VAE_D_HEAD // 4 // 2  # 8
-    pixel_freqs = torch.linspace(1.0, (VAE_SEQ_H * VAE_SEQ_W) / 2, n_freqs)
+def precompute_vae_rope(vae, tt_device):
+    """Extract 2D pixel-based RoPE tables from CPU VAE model.
+    Uses the actual rotary_freqs buffer from RotaryEmbedding to match CPU exactly.
+    Returns cos_tt, sin_perm_tt each (VAE_SEQ_LEN, VAE_DEC_DIM) on device."""
+    # Extract the actual rotary_freqs from the model (same for all decoder blocks)
+    cpu_freqs = vae.decoder[0].attn.rotary_freqs  # (H, W, rot_dim) = (18, 32, 32)
+    freqs_flat = cpu_freqs.reshape(VAE_SEQ_LEN, -1)  # (576, 32)
+    rot_dim = freqs_flat.shape[1]  # 32
 
-    h_pos = torch.arange(VAE_SEQ_H, dtype=torch.float32)
-    w_pos = torch.arange(VAE_SEQ_W, dtype=torch.float32)
-
-    h_freqs = torch.einsum("i, f -> i f", h_pos, pixel_freqs)
-    h_freqs = h_freqs.repeat_interleave(2, dim=-1)  # (18, 16)
-    w_freqs = torch.einsum("i, f -> i f", w_pos, pixel_freqs)
-    w_freqs = w_freqs.repeat_interleave(2, dim=-1)  # (32, 16)
-
-    h_broad = h_freqs[:, None, :].expand(VAE_SEQ_H, VAE_SEQ_W, -1)
-    w_broad = w_freqs[None, :, :].expand(VAE_SEQ_H, VAE_SEQ_W, -1)
-    freqs_2d = torch.cat([h_broad, w_broad], dim=-1)  # (18, 32, 32)
-    freqs_flat = freqs_2d.reshape(VAE_SEQ_LEN, VAE_ROPE_DIM)  # (576, 32)
-
-    # Build per-head tables: first 32 dims rotated, last 32 identity
+    # Build per-head tables: first rot_dim dims rotated, rest identity
     cos_per_head = torch.ones(VAE_SEQ_LEN, VAE_D_HEAD)
     sin_per_head = torch.zeros(VAE_SEQ_LEN, VAE_D_HEAD)
-    cos_per_head[:, :VAE_ROPE_DIM] = freqs_flat.cos()
-    sin_per_head[:, :VAE_ROPE_DIM] = freqs_flat.sin()
+    cos_per_head[:, :rot_dim] = freqs_flat.cos()
+    sin_per_head[:, :rot_dim] = freqs_flat.sin()
 
     # Bake rotate_half sign into sin: [-, +, -, +, ...] for rotated dims
     sign = torch.ones(VAE_D_HEAD)
-    sign[:VAE_ROPE_DIM:2] = -1
+    sign[:rot_dim:2] = -1
     sin_perm_per_head = sin_per_head * sign.unsqueeze(0)
 
     # Repeat across all 16 heads: (576, 64) -> (576, 1024)
@@ -2323,7 +2312,7 @@ def preload_vae_decoder_weights(vae, tt_device):
     vd["pred_b"] = to_tt(expand_bias(pred_b_padded, VAE_SEQ_LEN), tt_device)
 
     # VAE RoPE tables
-    vd["vae_cos"], vd["vae_sin_perm"] = precompute_vae_rope(tt_device)
+    vd["vae_cos"], vd["vae_sin_perm"] = precompute_vae_rope(vae, tt_device)
 
     elapsed = time.time() - t0
     print("Preloaded %d VAE decoder tensors in %.1fs" % (len(vd), elapsed))
@@ -2782,7 +2771,8 @@ def vae_decode_forward(vae_dev, vae_scr, scaler, mean_scale):
         q_s = ttnn.reshape(vae_scr["q_sdpa"], [VAE_DEC_HEADS, 1, VAE_SEQ_LEN, VAE_D_HEAD])
         k_s = ttnn.reshape(vae_scr["k_sdpa"], [VAE_DEC_HEADS, 1, VAE_SEQ_LEN, VAE_D_HEAD])
         v_s = ttnn.reshape(vae_scr["v_sdpa"], [VAE_DEC_HEADS, 1, VAE_SEQ_LEN, VAE_D_HEAD])
-        attn_out = ttnn.transformer.scaled_dot_product_attention(q_s, k_s, v_s, is_causal=False)
+        attn_out = ttnn.transformer.scaled_dot_product_attention(
+            q_s, k_s, v_s, is_causal=False)
 
         # Reshape back to (576, 1024): (heads, 1, seq, dim) -> (1, seq, heads, dim) -> (seq, dim*heads)
         attn_out = ttnn.permute(attn_out, [1, 2, 0, 3])  # (1, 576, 16, 64)
