@@ -2450,7 +2450,7 @@ if __name__ == "__main__":
     scaler = to_tt_l1(torch.ones(TILE, TILE, dtype=torch.bfloat16), tt_device)
     mean_scale = to_tt_l1(torch.full((TILE, TILE), 1.0 / D_MODEL, dtype=torch.bfloat16), tt_device)
 
-    N_FRAMES = 2  # prompt + generated
+    N_FRAMES = 2  # sliding window: T-1 context + 1 generated
 
     # Load VAE first (needed for encoding prompt)
     print("\nLoading VAE...")
@@ -2477,7 +2477,7 @@ if __name__ == "__main__":
 
     # Diffusion schedule
     max_noise_level = 1000
-    ddim_steps = 10
+    ddim_steps = 4
     noise_range = torch.linspace(-1, max_noise_level - 1, ddim_steps + 1)
     noise_abs_max = 20
     stabilization_level = 15
@@ -2574,23 +2574,29 @@ if __name__ == "__main__":
     for k in ["at_sqrt", "1mat_sqrt", "inv_at_sqrt", "inv_sigma", "an_sqrt", "1man_sqrt"]:
         ddim_coeff_dev[k] = to_tt(torch.zeros(*CHUNK_SHAPE, dtype=torch.bfloat16), tt_device)
 
-    # Mutable gen_cond tensor for trace (updated before each step)
-    gen_cond_traced = to_tt(torch.zeros(TILE, D_MODEL, dtype=torch.bfloat16), tt_device)
+    # Mutable conditioning tensors for trace (one per frame in window, updated before each step)
+    cond_traced = []
+    for f in range(N_FRAMES):
+        cond_traced.append(to_tt(torch.zeros(TILE, D_MODEL, dtype=torch.bfloat16), tt_device))
+
+    # Context frames: T-1 frames of patch-embedded latents (updated between frames)
+    context_z_dev = to_tt(torch.zeros((N_FRAMES - 1) * N_PATCH_PAD, D_MODEL, dtype=torch.bfloat16), tt_device)
 
     # Traced chunk buffer: the trace operates on this tensor in-place
     trace_chunk = to_tt(torch.zeros(*CHUNK_SHAPE, dtype=torch.bfloat16), tt_device)
 
     def ddim_step_fn(chunk):
         """One DDIM step: round-trip + DiT forward + DDIM arithmetic.
-        Uses gen_cond_traced and ddim_coeff_dev which are updated before each call."""
+        Uses cond_traced and ddim_coeff_dev which are updated before each call."""
         gen_z = ttnn.matmul(chunk, W_rt_dev)
         ttnn.add(gen_z, b_rt_dev, output_tensor=gen_z)
-        z_cur = ttnn.concat([prompt_z_dev, gen_z], dim=0)
-        cond_list = [prompt_cond_dev, gen_cond_traced]
+        z_cur = ttnn.concat([context_z_dev, gen_z], dim=0)
 
-        final_out = dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale)
+        final_out = dit_forward_device(z_cur, cond_traced, dev, scr, tt_device, scaler, mean_scale)
 
-        v_dev = ttnn.slice(final_out, [N_PATCH_PAD, 0], [2 * N_PATCH_PAD, OUT_DIM])
+        # Extract velocity for the last frame (the one being generated)
+        gen_start = (N_FRAMES - 1) * N_PATCH_PAD
+        v_dev = ttnn.slice(final_out, [gen_start, 0], [gen_start + N_PATCH_PAD, OUT_DIM])
         # x_start = at_sqrt * chunk - (1-at)_sqrt * v
         ttnn.multiply(chunk, ddim_coeff_dev["at_sqrt"], output_tensor=scr["ddim_tmp"])
         ttnn.multiply(v_dev, ddim_coeff_dev["1mat_sqrt"], output_tensor=scr["ddim_x_start"])
@@ -2613,10 +2619,24 @@ if __name__ == "__main__":
     first_noise_idx = ddim_steps  # reversed range starts here
     for k in ddim_coeff_dev:
         ttnn.copy_host_to_device_tensor(ddim_coeffs_host[first_noise_idx][k], ddim_coeff_dev[k])
+    # Context frames get prompt conditioning, last frame gets gen conditioning
+    for f in range(N_FRAMES - 1):
+        prompt_cond_host = ttnn.from_torch(
+            ttnn.to_torch(prompt_cond_dev),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+        ttnn.copy_host_to_device_tensor(prompt_cond_host, cond_traced[f])
     first_cond_host = ttnn.from_torch(
         ttnn.to_torch(gen_cond_per_step[first_noise_idx]),
         dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
-    ttnn.copy_host_to_device_tensor(first_cond_host, gen_cond_traced)
+    ttnn.copy_host_to_device_tensor(first_cond_host, cond_traced[N_FRAMES - 1])
+    # Initialize context with prompt replicated
+    prompt_z_host_tile = ttnn.from_torch(
+        ttnn.to_torch(prompt_z_dev), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+    context_tiles = [prompt_z_host_tile] * (N_FRAMES - 1)
+    context_host = ttnn.from_torch(
+        torch.cat([ttnn.to_torch(prompt_z_dev)] * (N_FRAMES - 1), dim=0),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+    ttnn.copy_host_to_device_tensor(context_host, context_z_dev)
 
     ddim_step_fn(trace_chunk)
     ttnn.synchronize_device(tt_device)
@@ -2637,21 +2657,32 @@ if __name__ == "__main__":
         gen_cond_host[noise_idx] = ttnn.from_torch(
             ttnn.to_torch(gen_cond_per_step[noise_idx]),
             dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+    # Pre-convert prompt_cond to host tensor
+    prompt_cond_host = ttnn.from_torch(
+        ttnn.to_torch(prompt_cond_dev),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
 
-    def run_ddim_loop(chunk_in_host, label, cond_override_host=None):
+    def run_ddim_loop(chunk_in_host, label, context_cond_hosts=None, gen_cond_map=None):
         """Run full DDIM loop using traced execution.
         chunk_in_host: host tensor (tilized bfloat16) to copy into trace_chunk.
-        cond_override_host: optional dict of {noise_idx: host_tensor} for gen conditioning."""
-        cond_map = cond_override_host if cond_override_host is not None else gen_cond_host
+        context_cond_hosts: list of T-1 host tensors for context frame conditioning.
+        gen_cond_map: dict of {noise_idx: host_tensor} for gen frame conditioning."""
+        if gen_cond_map is None:
+            gen_cond_map = gen_cond_host
+        if context_cond_hosts is None:
+            context_cond_hosts = [prompt_cond_host] * (N_FRAMES - 1)
         # Copy initial chunk into traced buffer
         ttnn.copy_host_to_device_tensor(chunk_in_host, trace_chunk)
+        # Update context conditioning (constant across DDIM steps)
+        for f in range(N_FRAMES - 1):
+            ttnn.copy_host_to_device_tensor(context_cond_hosts[f], cond_traced[f])
         t_total = time.time()
         for noise_idx in reversed(range(1, ddim_steps + 1)):
             # Update coefficients
             for k in ddim_coeff_dev:
                 ttnn.copy_host_to_device_tensor(ddim_coeffs_host[noise_idx][k], ddim_coeff_dev[k])
-            # Update conditioning
-            ttnn.copy_host_to_device_tensor(cond_map[noise_idx], gen_cond_traced)
+            # Update gen frame conditioning (varies per DDIM step)
+            ttnn.copy_host_to_device_tensor(gen_cond_map[noise_idx], cond_traced[N_FRAMES - 1])
             # Execute traced step
             ttnn.execute_trace(tt_device, trace_id, cq_id=0, blocking=False)
 
@@ -2673,15 +2704,26 @@ if __name__ == "__main__":
     result_dev = run_ddim_loop(chunk_host_tilized, "Timed")
 
     # === Generate 30-frame video ===
-    # Following reference: autoregressive in latent space. Generated frame's latent
-    # feeds directly as prompt for next frame (no VAE decode/re-encode between frames).
+    # Sliding window: T-1 context frames + 1 generated frame.
+    # Generated frame's latent feeds into context window for next frame.
     # VAE decode happens once at the end for all frames.
-    N_VIDEO_FRAMES = 2  # reduced for faster iteration (set to 30 for full video)
-    print("\n=== GENERATING %d-FRAME VIDEO ===" % N_VIDEO_FRAMES)
+    N_VIDEO_FRAMES = 30  # prompt + 29 generated frames
+    print("\n=== GENERATING %d-FRAME VIDEO (T=%d window) ===" % (N_VIDEO_FRAMES, N_FRAMES))
     t_video_start = time.time()
 
     # Collect all latents for batch VAE decode at the end
     all_latents = [prompt_latent[0, 0].clone()]  # frame 0 = prompt
+
+    # Sliding window of patch-embedded frames (host tensors, each (N_PATCH_PAD, D_MODEL))
+    # Start with prompt replicated to fill T-1 context slots
+    prompt_z_torch = torch.zeros(N_PATCH_PAD, D_MODEL, dtype=torch.bfloat16)
+    prompt_z_torch[:N_PATCHES] = patch_embed_host(
+        prompt_latent[0, 0].unsqueeze(0), dev["x_emb_conv_w"], dev["x_emb_conv_b"])
+    context_window = [prompt_z_torch.clone() for _ in range(N_FRAMES - 1)]
+
+    # Sliding window of per-frame conditioning (host tensors for context frames)
+    # All context frames use stabilization_level with their respective actions
+    context_cond_window = [prompt_cond_host] * (N_FRAMES - 1)
 
     for frame_idx in range(1, N_VIDEO_FRAMES):
         t_frame = time.time()
@@ -2694,7 +2736,12 @@ if __name__ == "__main__":
         chunk_pad_f[:N_PATCHES] = chunk_patches.to(torch.bfloat16)
         chunk_host_f = ttnn.from_torch(chunk_pad_f, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
 
-        # Pre-compute conditioning with this frame's action (as host tensors)
+        # Update context_z_dev with current sliding window
+        context_cat = torch.cat(context_window, dim=0)  # ((T-1)*N_PATCH_PAD, D_MODEL)
+        context_host = ttnn.from_torch(context_cat, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+        ttnn.copy_host_to_device_tensor(context_host, context_z_dev)
+
+        # Pre-compute gen conditioning with this frame's action
         action_idx = min(frame_idx, sample_actions.shape[0] - 1)
         frame_cond_dev = precompute_gen_cond(sample_actions[action_idx])
         frame_cond_host = {}
@@ -2705,20 +2752,30 @@ if __name__ == "__main__":
 
         # DDIM denoise (traced)
         result_dev = run_ddim_loop(chunk_host_f, "Frame %d" % frame_idx,
-                                   cond_override_host=frame_cond_host)
+                                   context_cond_hosts=context_cond_window,
+                                   gen_cond_map=frame_cond_host)
 
         # Readback generated latent (output space -> image space)
         chunk_result = ttnn.to_torch(result_dev)[:N_PATCHES].float()
         gen_latent = unpatchify_host(chunk_result, PATCH_SIZE, IN_CHANNELS, FRAME_H, FRAME_W)
         all_latents.append(gen_latent.squeeze(0))  # (C, H, W)
 
-        # Update prompt: patch-embed the generated latent directly (no VAE round-trip)
-        # Must update in-place since prompt_z_dev is captured by the trace
-        prompt_z_pad_new = torch.zeros(N_PATCH_PAD, D_MODEL, dtype=torch.bfloat16)
-        prompt_z_pad_new[:N_PATCHES] = patch_embed_host(
+        # Patch-embed generated frame for context window
+        new_z = torch.zeros(N_PATCH_PAD, D_MODEL, dtype=torch.bfloat16)
+        new_z[:N_PATCHES] = patch_embed_host(
             gen_latent, dev["x_emb_conv_w"], dev["x_emb_conv_b"])
-        prompt_z_host = ttnn.from_torch(prompt_z_pad_new, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
-        ttnn.copy_host_to_device_tensor(prompt_z_host, prompt_z_dev)
+
+        # Slide window: drop oldest, append newest
+        context_window.pop(0)
+        context_window.append(new_z)
+
+        # Slide conditioning: context frames all use stabilization_level
+        new_context_cond = compute_cond_for_frame(
+            stabilization_level - 1, sample_actions[action_idx], dev, scr, tt_device)
+        new_context_cond_host = ttnn.from_torch(
+            ttnn.to_torch(new_context_cond), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+        context_cond_window.pop(0)
+        context_cond_window.append(new_context_cond_host)
 
         elapsed = time.time() - t_frame
         print("  Frame %d: %.2fs" % (frame_idx, elapsed))
@@ -2735,15 +2792,34 @@ if __name__ == "__main__":
     print("VAE decode: %.1fs" % (time.time() - t_vae))
 
     # Save as individual PNGs
-    os.makedirs("/tmp/oasis_video", exist_ok=True)
+    video_dir = "/tmp/oasis_video_%dstep_T%d" % (ddim_steps, N_FRAMES)
+    os.makedirs(video_dir, exist_ok=True)
     for i in range(all_decoded.shape[1]):
         frame_rgb = (all_decoded[0, i] * 255).byte().numpy()
-        Image.fromarray(frame_rgb).save("/tmp/oasis_video/frame_%04d.png" % i)
-    print("Saved %d frames to /tmp/oasis_video/" % all_decoded.shape[1])
+        Image.fromarray(frame_rgb).save("%s/frame_%04d.png" % (video_dir, i))
+    print("Saved %d frames to %s/" % (all_decoded.shape[1], video_dir))
 
     # Save first generated frame
     first_gen = (all_decoded[0, 1] * 255).byte().numpy()
     Image.fromarray(first_gen).save("/tmp/oasis_frame.png")
+
+    # Stitch frames into mp4 with ffmpeg
+    import subprocess
+    mp4_path = "%s/output.mp4" % video_dir
+    ffmpeg_cmd = [
+        "ffmpeg", "-y",
+        "-framerate", "20",
+        "-i", "%s/frame_%%04d.png" % video_dir,
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-crf", "18",
+        mp4_path
+    ]
+    result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        print("Saved video to %s" % mp4_path)
+    else:
+        print("ffmpeg failed: %s" % result.stderr[-200:])
 
     print("\nDone!")
     ttnn.close_device(tt_device)
