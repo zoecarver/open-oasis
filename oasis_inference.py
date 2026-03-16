@@ -2976,7 +2976,7 @@ if __name__ == "__main__":
             label, total_time, total_time * 1000 / ddim_steps, ddim_steps / total_time))
         return chunk_dev
 
-    USE_TRACE = (N_CHIPS == 1)
+    USE_TRACE = True
 
     if USE_TRACE:
         # === Trace capture (single-chip only) ===
