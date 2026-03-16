@@ -33,6 +33,7 @@ KEY_TO_ACTION = {
     "w": 11, "s": 12, "a": 13, "d": 14,
     " ": 17, "shift": 18, "control": 19,
     "q": 24, "e": 0,
+    "arrowup": -1, "arrowdown": -2, "arrowleft": -3, "arrowright": -4,
 }
 
 HTML_PAGE = r"""<!doctype html>
@@ -284,7 +285,7 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 self.send_response(200)
-                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Type", "image/bmp")
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("X-Frame-Mtime", mtime)
                 self.send_header("X-FPS", fps)

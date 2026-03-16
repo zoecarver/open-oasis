@@ -13,6 +13,7 @@ import sys
 import os
 import json
 import time
+import gc
 import signal
 import torch
 import ttnn
@@ -90,11 +91,11 @@ def write_status(frame_index, fps):
     os.rename(tmp, STATUS_PATH)
 
 
-def write_frame_png(frame_hwc_float):
+def write_frame_bmp(frame_hwc_float):
     frame_rgb = (frame_hwc_float * 255).byte().numpy()
     img = Image.fromarray(frame_rgb)
-    tmp = FRAME_PATH + ".tmp.png"
-    img.save(tmp)
+    tmp = FRAME_PATH + ".tmp"
+    img.save(tmp, format="BMP")
     os.rename(tmp, FRAME_PATH)
 
 
@@ -126,17 +127,28 @@ if __name__ == "__main__":
     vae_dev = oasis.preload_vae_decoder_weights(vae, tt_device)
     vae_scr = oasis.prealloc_vae_scratch(tt_device)
 
-    # Encode prompt
-    prompt_path = "/tmp/sample_image_0.png"
-    print("Encoding prompt image:", prompt_path)
-    prompt_img = Image.open(prompt_path).convert("RGB").resize((640, 360))
-    prompt_tensor = torch.tensor(list(prompt_img.getdata()), dtype=torch.float32)
-    prompt_tensor = prompt_tensor.reshape(1, 360, 640, 3).permute(0, 3, 1, 2) / 255.0
-    with torch.no_grad():
-        prompt_latent = vae.encode(prompt_tensor * 2 - 1).mean * SCALING_FACTOR
-    prompt_latent = rearrange(prompt_latent, "b (h w) c -> b 1 c h w",
-                              h=INPUT_H, w=INPUT_W)
-    print("Prompt latent shape:", prompt_latent.shape)
+    # Encode all prompt images
+    def encode_prompt(path):
+        img = Image.open(path).convert("RGB").resize((640, 360))
+        t = torch.tensor(list(img.getdata()), dtype=torch.float32)
+        t = t.reshape(1, 360, 640, 3).permute(0, 3, 1, 2) / 255.0
+        with torch.no_grad():
+            latent = vae.encode(t * 2 - 1).mean * SCALING_FACTOR
+        latent = rearrange(latent, "b (h w) c -> b 1 c h w", h=INPUT_H, w=INPUT_W)
+        return latent, t
+
+    import glob
+    prompt_paths = ["/tmp/sample_image_0.png"] + sorted(glob.glob("/tmp/prompts/*.png"))
+    all_prompts = []
+    for p in prompt_paths:
+        if os.path.exists(p):
+            print("Encoding prompt:", p)
+            latent, tensor = encode_prompt(p)
+            all_prompts.append({"path": p, "latent": latent, "tensor": tensor})
+    print("Encoded %d prompts" % len(all_prompts))
+    prompt_idx = 0
+    prompt_latent = all_prompts[0]["latent"]
+    prompt_tensor = all_prompts[0]["tensor"]
 
     # Load DiT weights and scratch
     dev = oasis.preload_dit_weights(tt_device, n_frames=N_FRAMES)
@@ -149,11 +161,14 @@ if __name__ == "__main__":
     alphas = 1.0 - betas
     alphas_cumprod = torch.cumprod(alphas, dim=0)
 
-    # Prompt data
+    # Prompt data: pre-compute patch embeddings for all prompts
     prompt_action = torch.zeros(EXT_COND_DIM)
-    prompt_z_pad = torch.zeros(N_PATCH_PAD, D_MODEL, dtype=torch.bfloat16)
-    prompt_z_pad[:N_PATCHES] = oasis.patch_embed_host(
-        prompt_latent[0, 0].unsqueeze(0), dev["x_emb_conv_w"], dev["x_emb_conv_b"])
+    for p in all_prompts:
+        z_pad = torch.zeros(N_PATCH_PAD, D_MODEL, dtype=torch.bfloat16)
+        z_pad[:N_PATCHES] = oasis.patch_embed_host(
+            p["latent"][0, 0].unsqueeze(0), dev["x_emb_conv_w"], dev["x_emb_conv_b"])
+        p["z_pad"] = z_pad
+    prompt_z_pad = all_prompts[0]["z_pad"]
     prompt_z_dev = oasis.to_tt(prompt_z_pad, tt_device)
     prompt_cond_dev = oasis.compute_cond_for_frame(
         stabilization_level - 1, prompt_action, dev, scr, tt_device)
@@ -336,7 +351,7 @@ if __name__ == "__main__":
     # The warmup just ran the full trace, so vae_scr["pred_out"] has some output.
     # For the prompt frame, we already have the prompt image - just write it directly.
     prompt_img_tensor = prompt_tensor.squeeze(0).permute(1, 2, 0)  # (360, 640, 3)
-    write_frame_png(prompt_img_tensor)
+    write_frame_bmp(prompt_img_tensor)
     print("Wrote prompt frame")
 
     # Context window
@@ -358,6 +373,7 @@ if __name__ == "__main__":
             action_vec = read_action()
 
             # Fresh noise
+            _t0 = time.time()
             chunk_img = torch.randn(1, IN_CHANNELS, INPUT_H, INPUT_W)
             chunk_img = torch.clamp(chunk_img, -noise_abs_max, noise_abs_max)
             chunk_patches = oasis.patchify_to_output_space(chunk_img)
@@ -367,14 +383,19 @@ if __name__ == "__main__":
 
             # Update context
             context_cat = torch.cat(context_window_z, dim=0)
-            context_host = ttnn.from_torch(context_cat, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
-            ttnn.copy_host_to_device_tensor(context_host, context_z_dev)
+            context_host_t = ttnn.from_torch(context_cat, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+            ttnn.copy_host_to_device_tensor(context_host_t, context_z_dev)
 
             # Conditioning (host-only, no device alloc)
             frame_cond_host = precompute_gen_cond_host(action_vec)
+            _t1 = time.time()
 
             # Single trace: 4 DDIM + bridge + VAE
             run_full_frame(chunk_host_f, context_cond_window, frame_cond_host)
+            _t2 = time.time()
+
+            # Free host tilized tensors immediately after copy to device
+            del chunk_host_f, context_host_t, frame_cond_host
 
             # Readback VAE output
             result = oasis.readback_torch(vae_scr["pred_out"]).float()
@@ -382,7 +403,10 @@ if __name__ == "__main__":
             image = oasis.vae_unpatchify(patches)
             decoded = torch.clamp((image + 1) / 2, 0, 1)
             frame_hwc = decoded.squeeze(0).permute(1, 2, 0)  # (360, 640, 3)
-            write_frame_png(frame_hwc)
+            _t3 = time.time()
+            write_frame_bmp(frame_hwc)
+            _t4 = time.time()
+            del result, patches, image, decoded
 
             # Update context window (readback DiT output for patch embedding)
             chunk_result = oasis.readback_torch(trace_chunk)[:N_PATCHES].float()
@@ -392,10 +416,36 @@ if __name__ == "__main__":
                 gen_latent, dev["x_emb_conv_w"], dev["x_emb_conv_b"])
             context_window_z.pop(0)
             context_window_z.append(new_z)
+            del chunk_result, gen_latent
 
             new_cond_entry = compute_cond_host(stabilization_level - 1, action_vec)
             context_cond_window.pop(0)
             context_cond_window.append(new_cond_entry)
+            _t5 = time.time()
+
+            # Reset context every 120 frames, cycling through prompts
+            if frame_idx % 120 == 0 and frame_idx > 0:
+                prompt_idx = (prompt_idx + 1) % len(all_prompts)
+                prompt_z_pad = all_prompts[prompt_idx]["z_pad"]
+                prompt_latent = all_prompts[prompt_idx]["latent"]
+                context_window_z = [prompt_z_pad.clone() for _ in range(N_FRAMES - 1)]
+                context_cond_window = [prompt_cond_host] * (N_FRAMES - 1)
+                print("  [reset to prompt %d: %s]" % (prompt_idx, all_prompts[prompt_idx]["path"]))
+
+            # Periodic GC to prevent ttnn host tensor accumulation
+            if frame_idx % 10 == 0:
+                gc.collect()
+
+            # Timing breakdown every 20 frames
+            if frame_idx % 20 == 0:
+                import tracemalloc
+                if not tracemalloc.is_tracing():
+                    tracemalloc.start()
+                cur, peak = tracemalloc.get_traced_memory()
+                print("  [profile] prep=%.0fms trace=%.0fms readback=%.0fms png=%.0fms ctx=%.0fms | mem cur=%.0fMB peak=%.0fMB" % (
+                    (_t1-_t0)*1000, (_t2-_t1)*1000, (_t3-_t2)*1000,
+                    (_t4-_t3)*1000, (_t5-_t4)*1000,
+                    cur/1e6, peak/1e6))
 
             elapsed = time.time() - t_frame
             frame_times.append(elapsed)
