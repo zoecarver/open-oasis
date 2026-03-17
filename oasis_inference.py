@@ -118,9 +118,10 @@ VAE_ROPE_DIM = VAE_D_HEAD // 2  # 32 (first 32 dims of each head rotated)
 # TT-Lang Kernels
 # ============================================================
 
-import sys
-# TODO: claude please check if we are in /tmp because the tool will put all copied files next to each other in tmp so can you conditionalize this if our path is tmp don't insert dir?
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_src_dir = os.path.join(_script_dir, "src")
+if os.path.isdir(_src_dir):
+    sys.path.insert(0, _src_dir)
 
 from linear import make_linear_kernel
 from silu import silu_kernel
@@ -128,7 +129,6 @@ from gated_residual import gated_residual_kernel
 from adaln_modulate import adaln_modulate_kernel
 from layernorm import make_layernorm_kernel
 from vae_rope import make_vae_rope_kernel
-
 from adaln_matmul_expand import make_adaln_matmul_expand_kernel
 from rope_layout_kernel import make_rope_layout_kernel, make_rope_temporal_kernel
 
@@ -139,10 +139,6 @@ N_HEADS_TP = N_HEADS // N_CHIPS
 
 linear_k32 = make_linear_kernel(D_TILES)
 layernorm_d1024 = make_layernorm_kernel(D_TILES)
-adaln_matmul_expand_kernel = make_adaln_matmul_expand_kernel(D_TILES, N_PATCH_PAD // TILE)
-rope_layout_spatial = make_rope_layout_kernel(N_PATCH_PAD // TILE, D_HEAD // TILE, N_HEADS_TP)
-rope_temporal = make_rope_temporal_kernel(D_HEAD // TILE, N_HEADS_TP)
-vae_rope_fused = make_vae_rope_kernel(VAE_DEC_HEADS, VAE_D_HEAD // TILE)
 
 # In-progress kernels (defined but superseded by ttnn in hot path, kept for future optimization)
 # See src/in_progress.py for definitions
@@ -153,11 +149,8 @@ vae_rope_fused = make_vae_rope_kernel(VAE_DEC_HEADS, VAE_D_HEAD // TILE)
 # TODO: mega_post_attn_kernel fuses O proj+LN+FC1+GELU+FC2+residual but only uses 10 cores
 
 # Fused adaLN params: matmul + bias + expand in one kernel (replaces ~10 ttnn ops)
-from adaln_matmul_expand import make_adaln_matmul_expand_kernel
 adaln_matmul_expand_kernel = make_adaln_matmul_expand_kernel(D_TILES, N_PATCH_PAD // TILE)
 # Fused RoPE + layout transform: eliminates 5 slices + 2 RoPE + 9 reshape/permute
-from rope_layout_kernel import make_rope_layout_kernel, make_rope_temporal_kernel
-N_HEADS_TP = N_HEADS // N_CHIPS
 rope_layout_spatial = make_rope_layout_kernel(N_PATCH_PAD // TILE, D_HEAD // TILE, N_HEADS_TP)
 # Fused temporal RoPE: eliminates 5 slices + 2 RoPE kernels
 rope_temporal = make_rope_temporal_kernel(D_HEAD // TILE, N_HEADS_TP)
