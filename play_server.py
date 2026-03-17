@@ -145,10 +145,10 @@ function buildActionVec() {
     if (idx !== undefined && idx >= 0) vec[idx] = 1;
   }
   // Arrow keys control camera (binary, like WASD)
-  if (pressed.has('arrowup'))    vec[15] = -1;
-  if (pressed.has('arrowdown'))  vec[15] = 1;
-  if (pressed.has('arrowleft'))  vec[16] = -1;
-  if (pressed.has('arrowright')) vec[16] = 1;
+  if (pressed.has('arrowup'))    vec[15] = -0.08;
+  if (pressed.has('arrowdown'))  vec[15] = 0.08;
+  if (pressed.has('arrowleft'))  vec[16] = -0.08;
+  if (pressed.has('arrowright')) vec[16] = 0.08;
   if (mouseDown.left) vec[21] = 1;
   if (mouseDown.right) vec[22] = 1;
   return vec;

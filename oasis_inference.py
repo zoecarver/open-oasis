@@ -97,7 +97,7 @@ D_MLP_TILES = D_MLP // TILE  # 128
 ELEM_GRAN = 8  # divides 32 (D_MODEL tiles) and 16 (128/8 for D_MLP)
 
 # Multi-chip tensor parallelism: set to 1 for single-chip, 2+ for TP
-N_CHIPS = 1
+N_CHIPS = 4
 
 # VAE decoder constants
 VAE_DEC_DEPTH = 12
