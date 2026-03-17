@@ -209,7 +209,7 @@ The TT-Lang kernel does this in a single pass: the **data movement thread** read
 
 ### In-progress kernels (not currently used)
 
-Several TT-Lang kernels were written that fuse larger portions of the pipeline and leverage pipes but are currently superseded by ttnn equivalents that achieve better core utilization or accuracy. These are preserved in `src/in_progress.py` for future optimization:
+Several TT-Lang kernels were written that fuse larger portions of the pipeline but are currently superseded by ttnn equivalents that achieve better core utilization or accuracy. These are preserved in `src/in_progress.py` and `src/_wip_ln_qkv_rope_sdpa.py` for future optimization:
 
 | Kernel | What it fuses | Why unused |
 |--------|--------------|------------|
@@ -222,6 +222,8 @@ Several TT-Lang kernels were written that fuse larger portions of the pipeline a
 | `make_fused_linear_bias_gelu_kernel` | Matmul + bias + GELU | Replaced by ttnn.linear with fused activation |
 | `make_fused_linear_bias_gated_res_kernel` | Matmul + bias + gate + residual | Replaced by ttnn.matmul + TT-Lang gated_residual |
 | `make_rope_sdpa_kernel` | RoPE + SDPA (no QKV matmul) | Replaced by rope_layout + ttnn.SDPA |
+| `make_ln_qkv_rope_sdpa_kernel` | LN + adaLN + QKV matmul + RoPE + SDPA | Exceeds kernel config buffer limit (27 DFBs) |
+| `make_pipe_fused_gated_res_ln_adaln` | Gated residual + LN + adaLN (pipe-based) | Pipe caching bug causes incorrect values on repeated calls |
 
 ### What runs on host
 
@@ -247,7 +249,10 @@ src/
   adaln_matmul_expand.py    # Fused adaLN matmul + bias + row expand
   rope_layout_kernel.py     # Fused RoPE + SDPA layout transform
   in_progress.py            # Superseded kernels kept for future optimization
-tests/                      # Test kernels and validation scripts
+  _wip_ln_qkv_rope_sdpa.py # Fused LN + adaLN + QKV + RoPE + SDPA (exceeds config buffer)
+tests/
+  pipe_fused_ln.py          # Pipe-based fused gated_residual + LN + adaLN (WIP)
+  ...                       # Test kernels and validation scripts
 docs/
   minecraft_4x.mov          # Demo video
 ```
