@@ -6,9 +6,23 @@ Single-frame generation for initial testing (T=1).
 
 Usage: run via run-test.sh --hw oasis_inference.py
 """
-import sys, types
+import sys
+import types
+import os
+import math
+import time
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import ttnn
+import ttl
+from safetensors import safe_open
+from safetensors.torch import load_model
+from einops import rearrange
+from einops import repeat as einops_repeat
+from PIL import Image
+import subprocess
 
 # Stub out timm entirely -- vae.py/dit.py only need Mlp and to_2tuple.
 # Trying to stub torchvision (timm's transitive dep) is endless whack-a-mole.
@@ -52,14 +66,20 @@ _timm_layers_helpers = _make_stub('timm.layers.helpers', _timm_layers)
 _timm_models_vit.Mlp = _Mlp
 _timm_layers_helpers.to_2tuple = _to_2tuple
 
-import torch.nn.functional as F
-import ttnn
-import ttl
-import math
-import time
-import os
-from safetensors import safe_open
-from einops import rearrange
+# TT-Lang kernel imports (src/ directory when running from repo, flat /tmp when via run-test.sh)
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_src_dir = os.path.join(_script_dir, "src")
+if os.path.isdir(_src_dir):
+    sys.path.insert(0, _src_dir)
+
+from linear import make_linear_kernel
+from silu import silu_kernel
+from gated_residual import gated_residual_kernel
+from adaln_modulate import adaln_modulate_kernel
+from layernorm import make_layernorm_kernel
+from vae_rope import make_vae_rope_kernel
+from adaln_matmul_expand import make_adaln_matmul_expand_kernel
+from rope_layout_kernel import make_rope_layout_kernel, make_rope_temporal_kernel
 
 # ============================================================
 # Constants
@@ -81,7 +101,6 @@ N_PATCHES = FRAME_H * FRAME_W  # 144
 N_PATCH_PAD = ((N_PATCHES + TILE - 1) // TILE) * TILE  # 160
 FREQ_DIM = 256
 EXT_COND_DIM = 25
-EXT_COND_PAD = 32  # padded to tile
 OUT_DIM = PATCH_SIZE * PATCH_SIZE * IN_CHANNELS  # 64
 SCALING_FACTOR = 0.07843137255
 
@@ -92,9 +111,6 @@ SPATIAL_ROPE_DIM = 64
 TEMPORAL_ROPE_DIM = 64
 
 D_TILES = D_MODEL // TILE  # 32
-D_MLP_TILES = D_MLP // TILE  # 128
-
-ELEM_GRAN = 8  # divides 32 (D_MODEL tiles) and 16 (128/8 for D_MLP)
 
 # Multi-chip tensor parallelism: set to 1 for single-chip, 2+ for TP
 N_CHIPS = 4
@@ -114,27 +130,19 @@ VAE_D_HEAD = VAE_DEC_DIM // VAE_DEC_HEADS  # 64
 VAE_D_MLP = VAE_DEC_DIM * 4  # 4096
 VAE_ROPE_DIM = VAE_D_HEAD // 2  # 32 (first 32 dims of each head rotated)
 
+# Global mutable state (set during init)
+_MESH_DEVICE = None              # mesh device reference for readback (set in main)
+SPATIAL_ROPE_FREQS = None        # (144, 64) float, set during weight loading
+TEMPORAL_ROPE_FREQS = None       # (max_t, 64) float, set during weight loading
+
+# Profiling (set to True / a block name to enable per-phase timing)
+PROFILE_BLOCKS = False
+PROFILE_BLOCK_DEVICE = None      # e.g. "blocks.1.s" for per-phase profiling (breaks trace)
+
 # ============================================================
-# TT-Lang Kernels
+# Kernel instantiation
 # ============================================================
 
-_script_dir = os.path.dirname(os.path.abspath(__file__))
-_src_dir = os.path.join(_script_dir, "src")
-if os.path.isdir(_src_dir):
-    sys.path.insert(0, _src_dir)
-
-from linear import make_linear_kernel
-from silu import silu_kernel
-from gated_residual import gated_residual_kernel
-from adaln_modulate import adaln_modulate_kernel
-from layernorm import make_layernorm_kernel
-from vae_rope import make_vae_rope_kernel
-from adaln_matmul_expand import make_adaln_matmul_expand_kernel
-from rope_layout_kernel import make_rope_layout_kernel, make_rope_temporal_kernel
-
-# Instantiate kernel variants
-N_PATCH_PAD_TILES = N_PATCH_PAD // TILE  # 5
-D_HEAD_TILES = D_HEAD // TILE  # 2
 N_HEADS_TP = N_HEADS // N_CHIPS
 
 linear_k32 = make_linear_kernel(D_TILES)
@@ -160,35 +168,6 @@ vae_rope_layout = make_rope_layout_kernel(VAE_SEQ_TILES, VAE_D_HEAD // TILE, VAE
 # Uses (1, 2) tile DFBs (~160KB/core) vs vae_rope_layout's (18, 2) (~1.4MB/core OOM)
 vae_rope_fused = make_vae_rope_kernel(VAE_DEC_HEADS, VAE_D_HEAD // TILE)
 
-# Compute kernel configs (following tt-metal DiT patterns)
-# Initialized lazily after device is opened (need device.arch())
-MATMUL_COMPUTE_CONFIG = None
-SDPA_COMPUTE_CONFIG = None
-SDPA_PROGRAM_CONFIG = None
-
-def init_compute_configs(device):
-    """Initialize compute kernel configs. Call after device is opened."""
-    global MATMUL_COMPUTE_CONFIG, SDPA_COMPUTE_CONFIG, SDPA_PROGRAM_CONFIG
-    arch = device.arch()
-    MATMUL_COMPUTE_CONFIG = ttnn.init_device_compute_kernel_config(
-        arch,
-        math_fidelity=ttnn.MathFidelity.HiFi2,
-        math_approx_mode=False,
-        fp32_dest_acc_en=True,
-        packer_l1_acc=True,
-    )
-    SDPA_COMPUTE_CONFIG = ttnn.init_device_compute_kernel_config(
-        arch,
-        math_fidelity=ttnn.MathFidelity.HiFi2,
-        math_approx_mode=False,
-        fp32_dest_acc_en=False,
-    )
-    grid = device.compute_with_storage_grid_size()
-    SDPA_PROGRAM_CONFIG = ttnn.SDPAProgramConfig(
-        compute_with_storage_grid_size=(grid.x, grid.y - 1),
-        q_chunk_size=128,
-        k_chunk_size=128,
-    )
 
 # ============================================================
 # Host helpers
@@ -227,9 +206,6 @@ def zeros_tt(shape, device):
 
 def zeros_l1(shape, device):
     return to_tt_l1(torch.zeros(shape, dtype=torch.bfloat16), device)
-
-# Global mesh device reference for readback (set in main)
-_MESH_DEVICE = None
 
 def readback_torch(t):
     """Read tensor from device/mesh to torch. For mesh, reads chip 0."""
@@ -300,7 +276,7 @@ def precompute_spatial_rope_freqs(freqs_param):
     freqs_param: learned freqs tensor shape (half_dim,) from weights.
     Returns: (N_PATCHES, rot_dim) float tensor.
     rot_dim = 2 axes * 2 * half_dim = 4 * half_dim (e.g. 4*16=64 for Oasis)."""
-    from einops import repeat as einops_repeat
+
     h_pos = torch.linspace(-1, 1, steps=FRAME_H)
     w_pos = torch.linspace(-1, 1, steps=FRAME_W)
 
@@ -321,14 +297,10 @@ def precompute_temporal_rope_freqs(freqs_param, max_t=32):
     """Precompute temporal RoPE freqs.
     freqs_param: learned freqs tensor shape (half_dim,) from weights.
     Returns: (max_t, rot_dim) float tensor. rot_dim = 2 * half_dim."""
-    from einops import repeat as einops_repeat
+
     positions = torch.arange(max_t, dtype=torch.float32)
     freqs = torch.einsum("i, f -> i f", positions, freqs_param)
     return einops_repeat(freqs, "... n -> ... (n r)", r=2)  # (max_t, 64)
-
-# Global RoPE freq tables (set during weight loading)
-SPATIAL_ROPE_FREQS = None   # (144, 64) float
-TEMPORAL_ROPE_FREQS = None  # (max_t, 64) float
 
 def swap_adjacent_columns(w):
     """Swap adjacent column pairs: col 2k <-> col 2k+1.
@@ -796,9 +768,6 @@ def build_per_frame_adaln(silu_cond_list, prefix, dev, scr, tt_device):
     else:
         return ttnn.concat(per_frame_expanded, dim=0)
 
-PROFILE_BLOCKS = False
-PROFILE_BLOCK_DEVICE = None  # set to "blocks.1.s" for per-phase profiling (breaks trace)
-
 def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mean_scale, attn_type="spatial"):
     """Run one spatial or temporal sub-block.
     prefix: e.g. "blocks.0.s" or "blocks.0.t"
@@ -1083,7 +1052,6 @@ def load_vae_cpu():
     import sys
     sys.path.insert(0, "/tmp")
     from vae import VAE_models
-    from safetensors.torch import load_model
 
     vae = VAE_models["vit-l-20-shallow-encoder"]()
     path = find_vae_weights()
@@ -1092,17 +1060,6 @@ def load_vae_cpu():
     vae = vae.eval()
     return vae
 
-def vae_decode_cpu(z_latent, vae):
-    """Decode latent to image using VAE on CPU (fallback).
-    z_latent: (B, T, C, H, W) = (1, 1, 16, 18, 32)
-    Returns: (B, T, 3, 360, 640) in [0, 1]
-    """
-    B, T = z_latent.shape[:2]
-    z = rearrange(z_latent, "b t c h w -> (b t) (h w) c")
-    with torch.no_grad():
-        decoded = (vae.decode(z.float() / SCALING_FACTOR) + 1) / 2
-    decoded = torch.clamp(decoded, 0, 1)
-    return rearrange(decoded, "(b t) c h w -> b t h w c", b=B, t=T)
 
 def vae_decode_forward(vae_dev, vae_scr, scaler, mean_scale):
     """VAE forward pass on device (trace-compatible, no allocations).
@@ -1274,7 +1231,6 @@ if __name__ == "__main__":
         _MESH_DEVICE = tt_device
     else:
         tt_device = ttnn.open_device(device_id=0, trace_region_size=100000000)
-    init_compute_configs(tt_device)
     torch.manual_seed(42)
 
     print("=" * 60)
@@ -1297,7 +1253,6 @@ if __name__ == "__main__":
     # Encode prompt image
     prompt_path = "/tmp/sample_image_0.png"
     print("Encoding prompt image:", prompt_path)
-    from PIL import Image
     prompt_img = Image.open(prompt_path).convert("RGB").resize((640, 360))
     prompt_tensor = torch.tensor(list(prompt_img.getdata()), dtype=torch.float32)
     prompt_tensor = prompt_tensor.reshape(1, 360, 640, 3).permute(0, 3, 1, 2) / 255.0  # (1, 3, 360, 640)
@@ -1655,7 +1610,6 @@ if __name__ == "__main__":
     Image.fromarray(first_gen).save("/tmp/oasis_frame.png")
 
     # Stitch frames into mp4 with ffmpeg
-    import subprocess
     mp4_path = "%s/output.mp4" % video_dir
     ffmpeg_cmd = [
         "ffmpeg", "-y",
