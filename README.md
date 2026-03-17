@@ -50,9 +50,9 @@ Place a prompt image and (optionally) recorded actions in `/tmp`:
 
 ## Running
 
-### Batch inference
+### Video generation
 
-Generates 30 frames from a prompt image and saves them as PNGs + mp4:
+Generates 30 frames autoregressively from a prompt image and saves them as PNGs + mp4:
 
 ```bash
 python oasis_inference.py
