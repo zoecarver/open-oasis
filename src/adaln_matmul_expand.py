@@ -11,22 +11,22 @@ TILE = 32
 
 
 def make_adaln_matmul_expand_kernel(k_tiles, n_repeat):
-    @ttl.kernel(grid="auto")
+    @ttl.operation(grid="auto")
     def adaln_matmul_expand(silu_cond, adaln_w, adaln_b, out):
         grid_cols, _ = ttl.grid_size(dims=2)
         out_col_tiles = adaln_w.shape[1] // TILE
         cols_per_core = -(-out_col_tiles // grid_cols)
 
-        cond_dfb = ttl.make_dataflow_buffer_like(silu_cond, shape=(1, 1), buffer_factor=2)
-        w_dfb = ttl.make_dataflow_buffer_like(adaln_w, shape=(1, 1), buffer_factor=2)
-        mm_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
-        acc_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
-        b_dfb = ttl.make_dataflow_buffer_like(adaln_b, shape=(1, 1), buffer_factor=2)
-        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
+        cond_dfb = ttl.make_dataflow_buffer_like(silu_cond, shape=(1, 1), block_count=2)
+        w_dfb = ttl.make_dataflow_buffer_like(adaln_w, shape=(1, 1), block_count=2)
+        mm_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+        acc_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+        b_dfb = ttl.make_dataflow_buffer_like(adaln_b, shape=(1, 1), block_count=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
 
         @ttl.compute()
         def compute():
-            core_x, _ = ttl.core(dims=2)
+            core_x, _ = ttl.node(dims=2)
             for local_c in range(cols_per_core):
                 col = core_x * cols_per_core + local_c
                 if col < out_col_tiles:
@@ -46,7 +46,7 @@ def make_adaln_matmul_expand_kernel(k_tiles, n_repeat):
 
         @ttl.datamovement()
         def dm_read():
-            core_x, _ = ttl.core(dims=2)
+            core_x, _ = ttl.node(dims=2)
             for local_c in range(cols_per_core):
                 col = core_x * cols_per_core + local_c
                 if col < out_col_tiles:
@@ -60,7 +60,7 @@ def make_adaln_matmul_expand_kernel(k_tiles, n_repeat):
 
         @ttl.datamovement()
         def dm_write():
-            core_x, _ = ttl.core(dims=2)
+            core_x, _ = ttl.node(dims=2)
             for local_c in range(cols_per_core):
                 col = core_x * cols_per_core + local_c
                 if col < out_col_tiles:

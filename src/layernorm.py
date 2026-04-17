@@ -8,26 +8,26 @@ TILE = 32
 
 
 def make_layernorm_kernel(dim_tiles):
-    @ttl.kernel(grid="auto")
+    @ttl.operation(grid="auto")
     def layernorm_kernel(x, weight, ln_bias, scaler, mean_scale, out):
         grid_cols, _ = ttl.grid_size(dims=2)
         seq_tiles = x.shape[0] // TILE
         tiles_per_core = -(-seq_tiles // grid_cols)
-        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), buffer_factor=2)
-        sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=1)
-        ms_dfb = ttl.make_dataflow_buffer_like(mean_scale, shape=(1, 1), buffer_factor=1)
-        red_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
-        acc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
-        bcast_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), buffer_factor=2)
-        sq_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), buffer_factor=2)
-        mean_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), buffer_factor=2)
-        istd_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), buffer_factor=2)
-        w_dfb = ttl.make_dataflow_buffer_like(weight, shape=(1, 1), buffer_factor=2)
-        b_dfb = ttl.make_dataflow_buffer_like(ln_bias, shape=(1, 1), buffer_factor=2)
-        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
+        ms_dfb = ttl.make_dataflow_buffer_like(mean_scale, shape=(1, 1), block_count=1)
+        red_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        acc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        bcast_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        sq_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        mean_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        istd_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        w_dfb = ttl.make_dataflow_buffer_like(weight, shape=(1, 1), block_count=2)
+        b_dfb = ttl.make_dataflow_buffer_like(ln_bias, shape=(1, 1), block_count=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
         @ttl.compute()
         def compute():
-            core_x, _ = ttl.core(dims=2)
+            core_x, _ = ttl.node(dims=2)
             with sc_dfb.wait() as sc, ms_dfb.wait() as ms:
                 for local_t in range(tiles_per_core):
                     tile_idx = core_x * tiles_per_core + local_t
@@ -45,7 +45,7 @@ def make_layernorm_kernel(dim_tiles):
                             with red_dfb.wait() as rv, acc_dfb.wait() as av, acc_dfb.reserve() as acc:
                                 acc.store(av + rv)
                         with acc_dfb.wait() as sum_x, bcast_dfb.reserve() as bc:
-                            bc.store(ttl.math.broadcast(sum_x, dims=[1]))
+                            bc.store(ttl.math.broadcast(sum_x, bc, dims=[1]))
                         with bcast_dfb.wait() as sum_x_bc, mean_dfb.reserve() as mean_out:
                             mean_out.store(sum_x_bc * ms)
                         # Pass 2: variance
@@ -68,7 +68,7 @@ def make_layernorm_kernel(dim_tiles):
                                 with red_dfb.wait() as rv, acc_dfb.wait() as av, acc_dfb.reserve() as acc:
                                     acc.store(av + rv)
                             with acc_dfb.wait() as sum_sq, bcast_dfb.reserve() as bc:
-                                bc.store(ttl.math.broadcast(sum_sq, dims=[1]))
+                                bc.store(ttl.math.broadcast(sum_sq, bc, dims=[1]))
                             with bcast_dfb.wait() as var_bc, istd_dfb.reserve() as istd:
                                 istd.store(ttl.math.rsqrt(var_bc * ms + ttl.math.fill(var_bc, 1e-6)))
                             # Pass 3: normalize + affine
@@ -78,7 +78,7 @@ def make_layernorm_kernel(dim_tiles):
                                         o.store((xj - mean_val) * inv_std * wj + bj)
         @ttl.datamovement()
         def dm_read():
-            core_x, _ = ttl.core(dims=2)
+            core_x, _ = ttl.node(dims=2)
             with sc_dfb.reserve() as blk:
                 tx = ttl.copy(scaler[0, 0], blk); tx.wait()
             with ms_dfb.reserve() as blk:
@@ -101,7 +101,7 @@ def make_layernorm_kernel(dim_tiles):
                             tx = ttl.copy(ln_bias[tile_idx, j], blk); tx.wait()
         @ttl.datamovement()
         def dm_write():
-            core_x, _ = ttl.core(dims=2)
+            core_x, _ = ttl.node(dims=2)
             for local_t in range(tiles_per_core):
                 tile_idx = core_x * tiles_per_core + local_t
                 if tile_idx < seq_tiles:

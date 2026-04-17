@@ -6,7 +6,7 @@ import ttl
 TILE = 32
 
 def make_vae_rope_kernel(n_heads, head_tiles):
-    @ttl.kernel(grid="auto")
+    @ttl.operation(grid="auto")
     def vae_rope_kernel(qkv_full, cos_tab, sin_tab, q_out, k_out, v_out):
         grid_cols, _ = ttl.grid_size(dims=2)
         seq_tiles = qkv_full.shape[0] // TILE
@@ -14,20 +14,20 @@ def make_vae_rope_kernel(n_heads, head_tiles):
         tiles_per_core = -(-total // grid_cols)
         d_tiles = n_heads * head_tiles
 
-        q_dfb = ttl.make_dataflow_buffer_like(qkv_full, shape=(1, head_tiles), buffer_factor=2)
-        qs_dfb = ttl.make_dataflow_buffer_like(qkv_full, shape=(1, head_tiles), buffer_factor=2)
-        k_dfb = ttl.make_dataflow_buffer_like(qkv_full, shape=(1, head_tiles), buffer_factor=2)
-        ks_dfb = ttl.make_dataflow_buffer_like(qkv_full, shape=(1, head_tiles), buffer_factor=2)
-        v_dfb = ttl.make_dataflow_buffer_like(qkv_full, shape=(1, head_tiles), buffer_factor=2)
-        cos_dfb = ttl.make_dataflow_buffer_like(cos_tab, shape=(1, head_tiles), buffer_factor=2)
-        sin_dfb = ttl.make_dataflow_buffer_like(sin_tab, shape=(1, head_tiles), buffer_factor=2)
-        qr_dfb = ttl.make_dataflow_buffer_like(q_out, shape=(1, head_tiles), buffer_factor=2)
-        kr_dfb = ttl.make_dataflow_buffer_like(k_out, shape=(1, head_tiles), buffer_factor=2)
-        vo_dfb = ttl.make_dataflow_buffer_like(v_out, shape=(1, head_tiles), buffer_factor=2)
+        q_dfb = ttl.make_dataflow_buffer_like(qkv_full, shape=(1, head_tiles), block_count=2)
+        qs_dfb = ttl.make_dataflow_buffer_like(qkv_full, shape=(1, head_tiles), block_count=2)
+        k_dfb = ttl.make_dataflow_buffer_like(qkv_full, shape=(1, head_tiles), block_count=2)
+        ks_dfb = ttl.make_dataflow_buffer_like(qkv_full, shape=(1, head_tiles), block_count=2)
+        v_dfb = ttl.make_dataflow_buffer_like(qkv_full, shape=(1, head_tiles), block_count=2)
+        cos_dfb = ttl.make_dataflow_buffer_like(cos_tab, shape=(1, head_tiles), block_count=2)
+        sin_dfb = ttl.make_dataflow_buffer_like(sin_tab, shape=(1, head_tiles), block_count=2)
+        qr_dfb = ttl.make_dataflow_buffer_like(q_out, shape=(1, head_tiles), block_count=2)
+        kr_dfb = ttl.make_dataflow_buffer_like(k_out, shape=(1, head_tiles), block_count=2)
+        vo_dfb = ttl.make_dataflow_buffer_like(v_out, shape=(1, head_tiles), block_count=2)
 
         @ttl.compute()
         def compute():
-            core_x, _ = ttl.core(dims=2)
+            core_x, _ = ttl.node(dims=2)
             for local_t in range(tiles_per_core):
                 t = core_x * tiles_per_core + local_t
                 if t < total:
@@ -41,7 +41,7 @@ def make_vae_rope_kernel(n_heads, head_tiles):
 
         @ttl.datamovement()
         def dm_read():
-            core_x, _ = ttl.core(dims=2)
+            core_x, _ = ttl.node(dims=2)
             for local_t in range(tiles_per_core):
                 t = core_x * tiles_per_core + local_t
                 if t < total:
@@ -65,7 +65,7 @@ def make_vae_rope_kernel(n_heads, head_tiles):
 
         @ttl.datamovement()
         def dm_write():
-            core_x, _ = ttl.core(dims=2)
+            core_x, _ = ttl.node(dims=2)
             for local_t in range(tiles_per_core):
                 t = core_x * tiles_per_core + local_t
                 if t < total:

@@ -113,7 +113,7 @@ TEMPORAL_ROPE_DIM = 64
 D_TILES = D_MODEL // TILE  # 32
 
 # Multi-chip tensor parallelism: set to 1 for single-chip, 2+ for TP
-N_CHIPS = 4
+N_CHIPS = 1
 
 # VAE decoder constants
 VAE_DEC_DEPTH = 12

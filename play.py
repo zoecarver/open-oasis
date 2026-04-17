@@ -107,7 +107,6 @@ if __name__ == "__main__":
         oasis._MESH_DEVICE = tt_device
     else:
         tt_device = ttnn.open_device(device_id=0, trace_region_size=100000000)
-    oasis.init_compute_configs(tt_device)
     torch.manual_seed(42)
 
     signal.signal(signal.SIGINT, lambda *_: safe_shutdown(tt_device))
