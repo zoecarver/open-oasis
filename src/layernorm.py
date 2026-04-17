@@ -1,7 +1,11 @@
 """LayerNorm kernel with affine transform: out = (x - mean) / std * weight + bias.
 
 Three-pass streaming: mean, variance, normalize.
-Factory function parameterized by dim_tiles (number of tiles in the reduction dimension)."""
+Factory function parameterized by dim_tiles (number of tiles in the reduction dimension).
+
+Note: kept in `with`-statement / explicit-intermediate-DFB form. The bare-statement
+step-2 style triggers a missing-push compiler bug (variant of tt-lang #519).
+"""
 import ttl
 
 TILE = 32

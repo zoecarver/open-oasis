@@ -32,7 +32,6 @@ def make_rope_layout_kernel(seq_tiles, head_tiles, n_heads_val):
         v_dfb = ttl.make_dataflow_buffer_like(qkv_full, shape=(seq_tiles, head_tiles), block_count=2)
         cos_dfb = ttl.make_dataflow_buffer_like(cos_tab, shape=(seq_tiles, head_tiles), block_count=2)
         sin_dfb = ttl.make_dataflow_buffer_like(sin_tab, shape=(seq_tiles, head_tiles), block_count=2)
-        # Compute in 2D, output in 3D (matching output tensor rank)
         qr_dfb = ttl.make_dataflow_buffer_like(qkv_full, shape=(seq_tiles, head_tiles), block_count=2)
         kr_dfb = ttl.make_dataflow_buffer_like(qkv_full, shape=(seq_tiles, head_tiles), block_count=2)
         vo_dfb = ttl.make_dataflow_buffer_like(qkv_full, shape=(seq_tiles, head_tiles), block_count=2)
@@ -43,13 +42,15 @@ def make_rope_layout_kernel(seq_tiles, head_tiles, n_heads_val):
             for local_h in range(heads_per_core):
                 head_idx = core_x * heads_per_core + local_h
                 if head_idx < total_heads:
-                    with cos_dfb.wait() as cv, sin_dfb.wait() as sv:
-                        with q_dfb.wait() as q, qs_dfb.wait() as qs, qr_dfb.reserve() as qr:
-                            qr.store(q * cv + qs * sv)
-                        with k_dfb.wait() as k, ks_dfb.wait() as ks, kr_dfb.reserve() as kr:
-                            kr.store(k * cv + ks * sv)
-                    with v_dfb.wait() as vv, vo_dfb.reserve() as vo:
-                        vo.store(vv)
+                    cv = cos_dfb.wait()
+                    sv = sin_dfb.wait()
+                    q = q_dfb.wait()
+                    qs = qs_dfb.wait()
+                    qr_dfb.reserve().store(q * cv + qs * sv)
+                    k = k_dfb.wait()
+                    ks = ks_dfb.wait()
+                    kr_dfb.reserve().store(k * cv + ks * sv)
+                    vo_dfb.reserve().store(v_dfb.wait())
 
         @ttl.datamovement()
         def dm_read():
@@ -62,20 +63,13 @@ def make_rope_layout_kernel(seq_tiles, head_tiles, n_heads_val):
                     h = head_idx % n_heads_val
                     row_start = frame * seq_tiles
                     hc = h * head_tiles
-                    with q_dfb.reserve() as blk:
-                        tx = ttl.copy(qkv_full[row_start:row_start + seq_tiles, hc:hc + head_tiles], blk); tx.wait()
-                    with qs_dfb.reserve() as blk:
-                        tx = ttl.copy(qkv_full[row_start:row_start + seq_tiles, 3 * d_tiles + hc:3 * d_tiles + hc + head_tiles], blk); tx.wait()
-                    with k_dfb.reserve() as blk:
-                        tx = ttl.copy(qkv_full[row_start:row_start + seq_tiles, d_tiles + hc:d_tiles + hc + head_tiles], blk); tx.wait()
-                    with ks_dfb.reserve() as blk:
-                        tx = ttl.copy(qkv_full[row_start:row_start + seq_tiles, 4 * d_tiles + hc:4 * d_tiles + hc + head_tiles], blk); tx.wait()
-                    with v_dfb.reserve() as blk:
-                        tx = ttl.copy(qkv_full[row_start:row_start + seq_tiles, 2 * d_tiles + hc:2 * d_tiles + hc + head_tiles], blk); tx.wait()
-                    with cos_dfb.reserve() as blk:
-                        tx = ttl.copy(cos_tab[row_start:row_start + seq_tiles, hc:hc + head_tiles], blk); tx.wait()
-                    with sin_dfb.reserve() as blk:
-                        tx = ttl.copy(sin_tab[row_start:row_start + seq_tiles, hc:hc + head_tiles], blk); tx.wait()
+                    ttl.copy(qkv_full[row_start:row_start + seq_tiles, hc:hc + head_tiles], q_dfb.reserve()).wait()
+                    ttl.copy(qkv_full[row_start:row_start + seq_tiles, 3 * d_tiles + hc:3 * d_tiles + hc + head_tiles], qs_dfb.reserve()).wait()
+                    ttl.copy(qkv_full[row_start:row_start + seq_tiles, d_tiles + hc:d_tiles + hc + head_tiles], k_dfb.reserve()).wait()
+                    ttl.copy(qkv_full[row_start:row_start + seq_tiles, 4 * d_tiles + hc:4 * d_tiles + hc + head_tiles], ks_dfb.reserve()).wait()
+                    ttl.copy(qkv_full[row_start:row_start + seq_tiles, 2 * d_tiles + hc:2 * d_tiles + hc + head_tiles], v_dfb.reserve()).wait()
+                    ttl.copy(cos_tab[row_start:row_start + seq_tiles, hc:hc + head_tiles], cos_dfb.reserve()).wait()
+                    ttl.copy(sin_tab[row_start:row_start + seq_tiles, hc:hc + head_tiles], sin_dfb.reserve()).wait()
 
         @ttl.datamovement()
         def dm_write():
@@ -85,12 +79,9 @@ def make_rope_layout_kernel(seq_tiles, head_tiles, n_heads_val):
                 if head_idx < total_heads:
                     # Output: (BATCH, N_PATCH_PAD, D_HEAD) as 2D: row = head_idx * seq_tiles
                     out_row = head_idx * seq_tiles
-                    with qr_dfb.wait() as blk:
-                        tx = ttl.copy(blk, q_out[out_row:out_row + seq_tiles, 0:head_tiles]); tx.wait()
-                    with kr_dfb.wait() as blk:
-                        tx = ttl.copy(blk, k_out[out_row:out_row + seq_tiles, 0:head_tiles]); tx.wait()
-                    with vo_dfb.wait() as blk:
-                        tx = ttl.copy(blk, v_out[out_row:out_row + seq_tiles, 0:head_tiles]); tx.wait()
+                    ttl.copy(qr_dfb.wait(), q_out[out_row:out_row + seq_tiles, 0:head_tiles]).wait()
+                    ttl.copy(kr_dfb.wait(), k_out[out_row:out_row + seq_tiles, 0:head_tiles]).wait()
+                    ttl.copy(vo_dfb.wait(), v_out[out_row:out_row + seq_tiles, 0:head_tiles]).wait()
 
     return rope_layout
 
@@ -126,13 +117,15 @@ def make_rope_temporal_kernel(head_tiles, n_heads_val):
             for local_u in range(units_per_core):
                 uid = core_x * units_per_core + local_u
                 if uid < total_units:
-                    with cos_dfb.wait() as cv, sin_dfb.wait() as sv:
-                        with q_dfb.wait() as q, qs_dfb.wait() as qs, qr_dfb.reserve() as qr:
-                            qr.store(q * cv + qs * sv)
-                        with k_dfb.wait() as k, ks_dfb.wait() as ks, kr_dfb.reserve() as kr:
-                            kr.store(k * cv + ks * sv)
-                    with v_dfb.wait() as vv, vo_dfb.reserve() as vo:
-                        vo.store(vv)
+                    cv = cos_dfb.wait()
+                    sv = sin_dfb.wait()
+                    q = q_dfb.wait()
+                    qs = qs_dfb.wait()
+                    qr_dfb.reserve().store(q * cv + qs * sv)
+                    k = k_dfb.wait()
+                    ks = ks_dfb.wait()
+                    kr_dfb.reserve().store(k * cv + ks * sv)
+                    vo_dfb.reserve().store(v_dfb.wait())
 
         @ttl.datamovement()
         def dm_read():
@@ -144,20 +137,13 @@ def make_rope_temporal_kernel(head_tiles, n_heads_val):
                     row = uid // n_heads_val
                     h = uid % n_heads_val
                     hc = h * head_tiles
-                    with q_dfb.reserve() as blk:
-                        tx = ttl.copy(qkv_full[row, hc:hc + head_tiles], blk); tx.wait()
-                    with qs_dfb.reserve() as blk:
-                        tx = ttl.copy(qkv_full[row, 3 * d_tiles + hc:3 * d_tiles + hc + head_tiles], blk); tx.wait()
-                    with k_dfb.reserve() as blk:
-                        tx = ttl.copy(qkv_full[row, d_tiles + hc:d_tiles + hc + head_tiles], blk); tx.wait()
-                    with ks_dfb.reserve() as blk:
-                        tx = ttl.copy(qkv_full[row, 4 * d_tiles + hc:4 * d_tiles + hc + head_tiles], blk); tx.wait()
-                    with v_dfb.reserve() as blk:
-                        tx = ttl.copy(qkv_full[row, 2 * d_tiles + hc:2 * d_tiles + hc + head_tiles], blk); tx.wait()
-                    with cos_dfb.reserve() as blk:
-                        tx = ttl.copy(cos_tab[row, hc:hc + head_tiles], blk); tx.wait()
-                    with sin_dfb.reserve() as blk:
-                        tx = ttl.copy(sin_tab[row, hc:hc + head_tiles], blk); tx.wait()
+                    ttl.copy(qkv_full[row, hc:hc + head_tiles], q_dfb.reserve()).wait()
+                    ttl.copy(qkv_full[row, 3 * d_tiles + hc:3 * d_tiles + hc + head_tiles], qs_dfb.reserve()).wait()
+                    ttl.copy(qkv_full[row, d_tiles + hc:d_tiles + hc + head_tiles], k_dfb.reserve()).wait()
+                    ttl.copy(qkv_full[row, 4 * d_tiles + hc:4 * d_tiles + hc + head_tiles], ks_dfb.reserve()).wait()
+                    ttl.copy(qkv_full[row, 2 * d_tiles + hc:2 * d_tiles + hc + head_tiles], v_dfb.reserve()).wait()
+                    ttl.copy(cos_tab[row, hc:hc + head_tiles], cos_dfb.reserve()).wait()
+                    ttl.copy(sin_tab[row, hc:hc + head_tiles], sin_dfb.reserve()).wait()
 
         @ttl.datamovement()
         def dm_write():
@@ -168,11 +154,8 @@ def make_rope_temporal_kernel(head_tiles, n_heads_val):
                     row = uid // n_heads_val
                     h = uid % n_heads_val
                     hc = h * head_tiles
-                    with qr_dfb.wait() as blk:
-                        tx = ttl.copy(blk, q_out[row, hc:hc + head_tiles]); tx.wait()
-                    with kr_dfb.wait() as blk:
-                        tx = ttl.copy(blk, k_out[row, hc:hc + head_tiles]); tx.wait()
-                    with vo_dfb.wait() as blk:
-                        tx = ttl.copy(blk, v_out[row, hc:hc + head_tiles]); tx.wait()
+                    ttl.copy(qr_dfb.wait(), q_out[row, hc:hc + head_tiles]).wait()
+                    ttl.copy(kr_dfb.wait(), k_out[row, hc:hc + head_tiles]).wait()
+                    ttl.copy(vo_dfb.wait(), v_out[row, hc:hc + head_tiles]).wait()
 
     return rope_temporal

@@ -31,13 +31,15 @@ def make_vae_rope_kernel(n_heads, head_tiles):
             for local_t in range(tiles_per_core):
                 t = core_x * tiles_per_core + local_t
                 if t < total:
-                    with cos_dfb.wait() as cv, sin_dfb.wait() as sv:
-                        with q_dfb.wait() as q, qs_dfb.wait() as qs, qr_dfb.reserve() as qr:
-                            qr.store(q * cv + qs * sv)
-                        with k_dfb.wait() as k, ks_dfb.wait() as ks, kr_dfb.reserve() as kr:
-                            kr.store(k * cv + ks * sv)
-                    with v_dfb.wait() as vv, vo_dfb.reserve() as vo:
-                        vo.store(vv)
+                    cv = cos_dfb.wait()
+                    sv = sin_dfb.wait()
+                    q = q_dfb.wait()
+                    qs = qs_dfb.wait()
+                    qr_dfb.reserve().store(q * cv + qs * sv)
+                    k = k_dfb.wait()
+                    ks = ks_dfb.wait()
+                    kr_dfb.reserve().store(k * cv + ks * sv)
+                    vo_dfb.reserve().store(v_dfb.wait())
 
         @ttl.datamovement()
         def dm_read():
@@ -48,20 +50,13 @@ def make_vae_rope_kernel(n_heads, head_tiles):
                     row = t // n_heads
                     h = t % n_heads
                     hc = h * head_tiles
-                    with q_dfb.reserve() as blk:
-                        tx = ttl.copy(qkv_full[row, hc:hc + head_tiles], blk); tx.wait()
-                    with qs_dfb.reserve() as blk:
-                        tx = ttl.copy(qkv_full[row, 3 * d_tiles + hc:3 * d_tiles + hc + head_tiles], blk); tx.wait()
-                    with k_dfb.reserve() as blk:
-                        tx = ttl.copy(qkv_full[row, d_tiles + hc:d_tiles + hc + head_tiles], blk); tx.wait()
-                    with ks_dfb.reserve() as blk:
-                        tx = ttl.copy(qkv_full[row, 4 * d_tiles + hc:4 * d_tiles + hc + head_tiles], blk); tx.wait()
-                    with v_dfb.reserve() as blk:
-                        tx = ttl.copy(qkv_full[row, 2 * d_tiles + hc:2 * d_tiles + hc + head_tiles], blk); tx.wait()
-                    with cos_dfb.reserve() as blk:
-                        tx = ttl.copy(cos_tab[row, hc:hc + head_tiles], blk); tx.wait()
-                    with sin_dfb.reserve() as blk:
-                        tx = ttl.copy(sin_tab[row, hc:hc + head_tiles], blk); tx.wait()
+                    ttl.copy(qkv_full[row, hc:hc + head_tiles], q_dfb.reserve()).wait()
+                    ttl.copy(qkv_full[row, 3 * d_tiles + hc:3 * d_tiles + hc + head_tiles], qs_dfb.reserve()).wait()
+                    ttl.copy(qkv_full[row, d_tiles + hc:d_tiles + hc + head_tiles], k_dfb.reserve()).wait()
+                    ttl.copy(qkv_full[row, 4 * d_tiles + hc:4 * d_tiles + hc + head_tiles], ks_dfb.reserve()).wait()
+                    ttl.copy(qkv_full[row, 2 * d_tiles + hc:2 * d_tiles + hc + head_tiles], v_dfb.reserve()).wait()
+                    ttl.copy(cos_tab[row, hc:hc + head_tiles], cos_dfb.reserve()).wait()
+                    ttl.copy(sin_tab[row, hc:hc + head_tiles], sin_dfb.reserve()).wait()
 
         @ttl.datamovement()
         def dm_write():
@@ -72,11 +67,8 @@ def make_vae_rope_kernel(n_heads, head_tiles):
                     row = t // n_heads
                     h = t % n_heads
                     out_row = h * seq_tiles + row
-                    with qr_dfb.wait() as blk:
-                        tx = ttl.copy(blk, q_out[out_row, 0:head_tiles]); tx.wait()
-                    with kr_dfb.wait() as blk:
-                        tx = ttl.copy(blk, k_out[out_row, 0:head_tiles]); tx.wait()
-                    with vo_dfb.wait() as blk:
-                        tx = ttl.copy(blk, v_out[out_row, 0:head_tiles]); tx.wait()
+                    ttl.copy(qr_dfb.wait(), q_out[out_row, 0:head_tiles]).wait()
+                    ttl.copy(kr_dfb.wait(), k_out[out_row, 0:head_tiles]).wait()
+                    ttl.copy(vo_dfb.wait(), v_out[out_row, 0:head_tiles]).wait()
 
     return vae_rope_kernel

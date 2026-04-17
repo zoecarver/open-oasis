@@ -31,18 +31,20 @@ def make_adaln_matmul_expand_kernel(k_tiles, n_repeat):
                 col = core_x * cols_per_core + local_c
                 if col < out_col_tiles:
                     # K-accumulate: silu_cond @ adaln_w[:, col]
-                    with cond_dfb.wait() as cv, w_dfb.wait() as wv, acc_dfb.reserve() as a:
-                        a.store(cv @ wv)
+                    cv = cond_dfb.wait()
+                    wv = w_dfb.wait()
+                    acc_dfb.reserve().store(cv @ wv)
                     for k in range(k_tiles - 1):
-                        with cond_dfb.wait() as cv, w_dfb.wait() as wv, mm_dfb.reserve() as mm:
-                            mm.store(cv @ wv)
-                        with mm_dfb.wait() as mv, acc_dfb.wait() as prev, acc_dfb.reserve() as a:
-                            a.store(prev + mv)
-                    # Add bias and produce n_repeat copies for dm_write
-                    with acc_dfb.wait() as av, b_dfb.wait() as bv:
-                        for rep in range(n_repeat):
-                            with out_dfb.reserve() as o:
-                                o.store(av + bv)
+                        cv = cond_dfb.wait()
+                        wv = w_dfb.wait()
+                        mm_dfb.reserve().store(cv @ wv)
+                        mv = mm_dfb.wait()
+                        prev = acc_dfb.wait()
+                        acc_dfb.reserve().store(prev + mv)
+                    av = acc_dfb.wait()
+                    bv = b_dfb.wait()
+                    for rep in range(n_repeat):
+                        out_dfb.reserve().store(av + bv)
 
         @ttl.datamovement()
         def dm_read():
@@ -51,12 +53,9 @@ def make_adaln_matmul_expand_kernel(k_tiles, n_repeat):
                 col = core_x * cols_per_core + local_c
                 if col < out_col_tiles:
                     for k in range(k_tiles):
-                        with cond_dfb.reserve() as blk:
-                            tx = ttl.copy(silu_cond[0, k], blk); tx.wait()
-                        with w_dfb.reserve() as blk:
-                            tx = ttl.copy(adaln_w[k, col], blk); tx.wait()
-                    with b_dfb.reserve() as blk:
-                        tx = ttl.copy(adaln_b[0, col], blk); tx.wait()
+                        ttl.copy(silu_cond[0, k], cond_dfb.reserve()).wait()
+                        ttl.copy(adaln_w[k, col], w_dfb.reserve()).wait()
+                    ttl.copy(adaln_b[0, col], b_dfb.reserve()).wait()
 
         @ttl.datamovement()
         def dm_write():
@@ -65,7 +64,6 @@ def make_adaln_matmul_expand_kernel(k_tiles, n_repeat):
                 col = core_x * cols_per_core + local_c
                 if col < out_col_tiles:
                     for rep in range(n_repeat):
-                        with out_dfb.wait() as blk:
-                            tx = ttl.copy(blk, out[rep, col]); tx.wait()
+                        ttl.copy(out_dfb.wait(), out[rep, col]).wait()
 
     return adaln_matmul_expand
