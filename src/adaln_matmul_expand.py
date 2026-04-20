@@ -19,7 +19,6 @@ def make_adaln_matmul_expand_kernel(k_tiles, n_repeat):
 
         cond_dfb = ttl.make_dataflow_buffer_like(silu_cond, shape=(1, 1), block_count=2)
         w_dfb = ttl.make_dataflow_buffer_like(adaln_w, shape=(1, 1), block_count=2)
-        mm_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
         acc_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
         b_dfb = ttl.make_dataflow_buffer_like(adaln_b, shape=(1, 1), block_count=2)
         out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
@@ -31,16 +30,10 @@ def make_adaln_matmul_expand_kernel(k_tiles, n_repeat):
                 col = core_x * cols_per_core + local_c
                 if col < out_col_tiles:
                     # K-accumulate: silu_cond @ adaln_w[:, col]
-                    cv = cond_dfb.wait()
-                    wv = w_dfb.wait()
-                    acc_dfb.reserve().store(cv @ wv)
+                    acc_dfb.reserve().store(cond_dfb.wait() @ w_dfb.wait())
                     for k in range(k_tiles - 1):
-                        cv = cond_dfb.wait()
-                        wv = w_dfb.wait()
-                        mm_dfb.reserve().store(cv @ wv)
-                        mv = mm_dfb.wait()
                         prev = acc_dfb.wait()
-                        acc_dfb.reserve().store(prev + mv)
+                        acc_dfb.reserve().store(prev + cond_dfb.wait() @ w_dfb.wait())
                     av = acc_dfb.wait()
                     bv = b_dfb.wait()
                     for rep in range(n_repeat):

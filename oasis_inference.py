@@ -112,6 +112,15 @@ TEMPORAL_ROPE_DIM = 64
 
 D_TILES = D_MODEL // TILE  # 32
 
+# High-fidelity compute config for ttnn ops. Default ttnn matmul/SDPA uses LoFi and
+# bf16 DST accumulation, which loses precision across large K (1024+) and long seq.
+COMPUTE_HIFI = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.HiFi4,
+    math_approx_mode=False,
+    fp32_dest_acc_en=True,
+    packer_l1_acc=True,
+)
+
 # Multi-chip tensor parallelism: set to 1 for single-chip, 2+ for TP
 N_CHIPS = 1
 
@@ -206,6 +215,12 @@ def zeros_tt(shape, device):
 
 def zeros_l1(shape, device):
     return to_tt_l1(torch.zeros(shape, dtype=torch.bfloat16), device)
+
+def zeros_l1_f32(shape, device):
+    return ttnn.from_torch(torch.zeros(shape, dtype=torch.float32),
+                           dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+                           device=device, memory_config=ttnn.L1_MEMORY_CONFIG,
+                           **_mesh_kwargs(device))
 
 def readback_torch(t):
     """Read tensor from device/mesh to torch. For mesh, reads chip 0."""
@@ -665,17 +680,19 @@ def prealloc_scratch(tt_device, n_frames=2):
     SEQ = N_PATCH_PAD * n_frames  # 320 for T=2
     D_MODEL_TP = D_MODEL // N_CHIPS  # per-chip model dim for sharded tensors
     D_MLP_TP = D_MLP // N_CHIPS
-    # L1 intermediates: eliminates DRAM round-trips between operations
-    s["z_a"] = zeros_l1((SEQ, D_MODEL), tt_device)
+    # L1 intermediates: eliminates DRAM round-trips between operations.
+    # Residual-carrying tensors (z_a, z_scratch, o_proj, fc2) are f32 to preserve
+    # cond-uncond signal across 16 blocks (bf16 accumulation destroys it).
+    s["z_a"] = zeros_l1_f32((SEQ, D_MODEL), tt_device)
     s["z_b"] = zeros_l1((SEQ, D_MODEL), tt_device)
     s["normed"] = zeros_l1((SEQ, D_MODEL), tt_device)
     s["modulated"] = zeros_l1((SEQ, D_MODEL), tt_device)
     s["qkv"] = zeros_l1((SEQ, 3 * D_MODEL_TP), tt_device)
     s["qkv_full"] = zeros_l1((SEQ, 5 * D_MODEL_TP), tt_device)
-    s["o_proj"] = zeros_l1((SEQ, D_MODEL), tt_device)
+    s["o_proj"] = zeros_l1_f32((SEQ, D_MODEL), tt_device)
     s["fc1"] = zeros_l1((SEQ, D_MLP_TP), tt_device)
     s["gelu"] = zeros_l1((SEQ, D_MLP_TP), tt_device)
-    s["fc2"] = zeros_l1((SEQ, D_MODEL), tt_device)
+    s["fc2"] = zeros_l1_f32((SEQ, D_MODEL), tt_device)
     # Conditioning scratch (per-frame, so TILE * n_frames)
     s["t_emb_a"] = zeros_tt((TILE, D_MODEL), tt_device)
     s["t_emb_b"] = zeros_tt((TILE, D_MODEL), tt_device)
@@ -703,8 +720,8 @@ def prealloc_scratch(tt_device, n_frames=2):
     s["t_v_scratch"] = zeros_l1((SEQ, D_MODEL_TP), tt_device)
     # SDPA scratch: (SEQ, D_MODEL) for TT-Lang spatial SDPA output
     s["sdpa_out"] = zeros_l1((SEQ, D_MODEL), tt_device)
-    # Mega kernel B scratch
-    s["z_scratch"] = zeros_l1((SEQ, D_MODEL), tt_device)
+    # Mega kernel B scratch (f32: residual-carrying, see comment above)
+    s["z_scratch"] = zeros_l1_f32((SEQ, D_MODEL), tt_device)
     s["gelu_scratch"] = zeros_l1((SEQ, D_MLP), tt_device)
     # Final layer
     s["final_adaln"] = zeros_l1((TILE, 2 * D_MODEL), tt_device)
@@ -759,7 +776,8 @@ def build_per_frame_adaln(silu_cond_list, prefix, dev, scr, tt_device):
     for silu_cond in silu_cond_list:
         ttnn.linear(silu_cond, dev["%s.adaln_w" % prefix],
                     bias=dev["%s.adaln_b" % prefix],
-                    optional_output_tensor=scr["adaln_out"])
+                    optional_output_tensor=scr["adaln_out"],
+                    compute_kernel_config=COMPUTE_HIFI)
         expanded = ttnn.concat([scr["adaln_out"]] * N_REPEAT, dim=0)
         per_frame_expanded.append(expanded)
 
@@ -832,7 +850,8 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
     # 32 cores for K-accumulation matmul. ttnn.matmul uses all 72 cores (30x faster).
     # To restore fused version: mega_qkv_rope_sdpa(scr["modulated"], qkv_w, cos, sin, scaler, out)
     ttnn.matmul(scr["modulated"], dev["%s.qkv_full_w" % prefix],
-                optional_output_tensor=scr["qkv_full"])
+                optional_output_tensor=scr["qkv_full"],
+                compute_kernel_config=COMPUTE_HIFI)
     if _do_dev_profile:
         ttnn.synchronize_device(tt_device)
         _t1 = _dt.time(); print("      %s qkv_matmul: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
@@ -849,7 +868,8 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
         q_s = ttnn.reshape(scr["q_sdpa"], [BATCH_S, 1, N_PATCH_PAD, D_HEAD])
         k_s = ttnn.reshape(scr["k_sdpa"], [BATCH_S, 1, N_PATCH_PAD, D_HEAD])
         v_s = ttnn.reshape(scr["v_sdpa"], [BATCH_S, 1, N_PATCH_PAD, D_HEAD])
-        attn_out = ttnn.transformer.scaled_dot_product_attention(q_s, k_s, v_s, is_causal=False)
+        attn_out = ttnn.transformer.scaled_dot_product_attention(
+            q_s, k_s, v_s, is_causal=False, compute_kernel_config=COMPUTE_HIFI)
         attn_out = ttnn.reshape(attn_out, [T, N_HEADS_TP, N_PATCH_PAD, D_HEAD])
         attn_out = ttnn.permute(attn_out, [0, 2, 1, 3])
         attn_2d = ttnn.reshape(attn_out, [SEQ, D_MODEL_TP])
@@ -870,7 +890,8 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
         v_t = ttnn.reshape(scr["t_v_scratch"], [T, BATCH_T, D_HEAD])
         v_t = ttnn.permute(v_t, [1, 0, 2])
         v_t = ttnn.reshape(v_t, [BATCH_T, 1, T, D_HEAD])
-        attn_out = ttnn.transformer.scaled_dot_product_attention(q_t, k_t, v_t, is_causal=True)
+        attn_out = ttnn.transformer.scaled_dot_product_attention(
+            q_t, k_t, v_t, is_causal=True, compute_kernel_config=COMPUTE_HIFI)
         attn_out = ttnn.reshape(attn_out, [BATCH_T, T, D_HEAD])
         attn_out = ttnn.permute(attn_out, [1, 0, 2])
         attn_2d = ttnn.reshape(attn_out, [SEQ, D_MODEL_TP])
@@ -887,7 +908,8 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
     #   z_scratch, gelu_scratch, z_a)
     # Phase A: O proj (row-parallel) + all_reduce + bias
     # TODO: fuse matmul+bias via ttnn.linear when N_CHIPS==1 (no all_reduce between them)
-    o_proj = ttnn.matmul(attn_2d, dev["%s.out_w" % prefix])
+    o_proj = ttnn.matmul(attn_2d, dev["%s.out_w" % prefix],
+                         compute_kernel_config=COMPUTE_HIFI)
     if N_CHIPS > 1:
         o_proj = ttnn.all_reduce(o_proj)
     ttnn.add(o_proj, dev["%s.out_b" % prefix], output_tensor=scr["o_proj"])
@@ -911,19 +933,25 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
 
     # Phase C: Fused FC1 + bias + GELU (single ttnn.linear call)
     ttnn.linear(scr["modulated"], dev["%s.fc1_w" % prefix], bias=dev["%s.fc1_b" % prefix],
-                activation="gelu", optional_output_tensor=scr["gelu"])
+                activation="gelu", optional_output_tensor=scr["gelu"],
+                compute_kernel_config=COMPUTE_HIFI)
     if _do_dev_profile:
         ttnn.synchronize_device(tt_device)
         _t1 = _dt.time(); print("      %s fc1+gelu: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
 
     # Phase D: FC2 (row-parallel) + all_reduce + bias + gated residual
     # TODO: fuse matmul+bias via ttnn.linear when N_CHIPS==1 (no all_reduce between them)
-    fc2_out = ttnn.matmul(scr["gelu"], dev["%s.fc2_w" % prefix])
+    fc2_out = ttnn.matmul(scr["gelu"], dev["%s.fc2_w" % prefix],
+                          compute_kernel_config=COMPUTE_HIFI)
     if N_CHIPS > 1:
         fc2_out = ttnn.all_reduce(fc2_out)
     ttnn.add(fc2_out, dev["%s.fc2_b" % prefix], output_tensor=scr["fc2"])
     gate_mlp = ttnn.slice(adaln_packed, [0, 5 * D_MODEL], [SEQ, 6 * D_MODEL])
-    gated_residual_kernel(scr["z_scratch"], scr["fc2"], gate_mlp, scr["z_a"])
+    # TODO: revisit TT-Lang gated_residual_kernel once it handles mixed f32/bf16 inputs.
+    # Currently using ttnn ops because the kernel rejects f32 residual + bf16 gate.
+    # Was: gated_residual_kernel(scr["z_scratch"], scr["fc2"], gate_mlp, scr["z_a"])
+    ttnn.multiply(scr["fc2"], gate_mlp, output_tensor=scr["z_a"])
+    ttnn.add(scr["z_scratch"], scr["z_a"], output_tensor=scr["z_a"])
     _timer.mark("post_attn")
     if _do_dev_profile:
         ttnn.synchronize_device(tt_device)
@@ -990,6 +1018,8 @@ def dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale
         ttnn.synchronize_device(tt_device)
         print("  [PROFILE] silu: %.1fms" % ((_pt() - _pt.__self__) if False else 0))
 
+    z_cur = ttnn.typecast(z_cur, ttnn.float32)
+
     # 16 blocks: each has spatial + temporal sub-block
     if profile_step:
         t_blocks = _pt()
@@ -1021,7 +1051,8 @@ def dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale
     per_frame_final = []
     for t_idx in range(T):
         final_raw = ttnn.linear(silu_cond_list[t_idx], dev["final_adaln_w"],
-                                bias=dev["final_adaln_b"])
+                                bias=dev["final_adaln_b"],
+                                compute_kernel_config=COMPUTE_HIFI)
         expanded = ttnn.concat([final_raw] * N_REPEAT, dim=0)
         per_frame_final.append(expanded)
     if T == 1:
@@ -1032,6 +1063,8 @@ def dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale
     shift_tt = ttnn.slice(full_final, [0, 0], [SEQ, D_MODEL])
     scale_tt = ttnn.slice(full_final, [0, D_MODEL], [SEQ, 2 * D_MODEL])
 
+    # TT-Lang final layer kernels are bf16-only; typecast the f32 residual stream down.
+    z_cur = ttnn.typecast(z_cur, ttnn.bfloat16)
     layernorm_d1024(z_cur, dev["ln_w_ones"], dev["ln_b_zeros"], scaler, mean_scale, scr["normed"])
     adaln_modulate_kernel(scr["normed"], shift_tt, scale_tt, scr["modulated"])
     # TODO: fuse linear+bias via ttnn.linear (currently uses TT-Lang linear_k32 kernel)
@@ -1067,7 +1100,8 @@ def vae_decode_forward(vae_dev, vae_scr, scaler, mean_scale):
     Output: vae_scr["pred_out"] contains predictions."""
     # post_quant_conv: (576, 32) @ (32, 1024) + bias -> (576, 1024) in z_a
     ttnn.linear(vae_scr["vae_input"], vae_dev["pqc_w"], bias=vae_dev["pqc_b"],
-                optional_output_tensor=vae_scr["z_a"])
+                optional_output_tensor=vae_scr["z_a"],
+                compute_kernel_config=COMPUTE_HIFI)
 
     for i in range(VAE_DEC_DEPTH):
         p = "decoder.%d" % i
@@ -1078,7 +1112,8 @@ def vae_decode_forward(vae_dev, vae_scr, scaler, mean_scale):
 
         ttnn.linear(vae_scr["normed"], vae_dev["%s.qkv_full_w" % p],
                     bias=vae_dev["%s.qkv_full_b" % p],
-                    optional_output_tensor=vae_scr["qkv_full"])
+                    optional_output_tensor=vae_scr["qkv_full"],
+                    compute_kernel_config=COMPUTE_HIFI)
 
         # Fused RoPE: reads qkv_full, writes Q/K/V in heads-first SDPA layout
         vae_rope_fused(vae_scr["qkv_full"], vae_dev["vae_cos"], vae_dev["vae_sin_perm"],
@@ -1089,7 +1124,7 @@ def vae_decode_forward(vae_dev, vae_scr, scaler, mean_scale):
         k_s = ttnn.reshape(vae_scr["k_sdpa"], [VAE_DEC_HEADS, 1, VAE_SEQ_LEN, VAE_D_HEAD])
         v_s = ttnn.reshape(vae_scr["v_sdpa"], [VAE_DEC_HEADS, 1, VAE_SEQ_LEN, VAE_D_HEAD])
         attn_out = ttnn.transformer.scaled_dot_product_attention(
-            q_s, k_s, v_s, is_causal=False)
+            q_s, k_s, v_s, is_causal=False, compute_kernel_config=COMPUTE_HIFI)
 
         # Reshape back to (576, 1024): (heads, 1, seq, dim) -> (1, seq, heads, dim) -> (seq, dim*heads)
         attn_out = ttnn.permute(attn_out, [1, 2, 0, 3])  # (1, 576, 16, 64)
@@ -1097,7 +1132,8 @@ def vae_decode_forward(vae_dev, vae_scr, scaler, mean_scale):
 
         # Out proj + bias
         ttnn.linear(attn_2d, vae_dev["%s.proj_w" % p], bias=vae_dev["%s.proj_b" % p],
-                    optional_output_tensor=vae_scr["o_proj"])
+                    optional_output_tensor=vae_scr["o_proj"],
+                    compute_kernel_config=COMPUTE_HIFI)
 
         # Residual: z_b = z_a + o_proj
         ttnn.add(vae_scr["z_a"], vae_scr["o_proj"], output_tensor=vae_scr["z_b"])
@@ -1109,12 +1145,14 @@ def vae_decode_forward(vae_dev, vae_scr, scaler, mean_scale):
         # Fused FC1 + bias + GELU
         ttnn.linear(vae_scr["normed"], vae_dev["%s.fc1_w" % p],
                     bias=vae_dev["%s.fc1_b" % p], activation="gelu",
-                    optional_output_tensor=vae_scr["gelu"])
+                    optional_output_tensor=vae_scr["gelu"],
+                    compute_kernel_config=COMPUTE_HIFI)
 
         # FC2 + bias
         ttnn.linear(vae_scr["gelu"], vae_dev["%s.fc2_w" % p],
                     bias=vae_dev["%s.fc2_b" % p],
-                    optional_output_tensor=vae_scr["fc2"])
+                    optional_output_tensor=vae_scr["fc2"],
+                    compute_kernel_config=COMPUTE_HIFI)
 
         # Residual: z_a = z_b + fc2
         ttnn.add(vae_scr["z_b"], vae_scr["fc2"], output_tensor=vae_scr["z_a"])
@@ -1125,7 +1163,8 @@ def vae_decode_forward(vae_dev, vae_scr, scaler, mean_scale):
 
     # Predictor: (576, 1024) @ (1024, 1200) + bias
     ttnn.linear(vae_scr["normed"], vae_dev["pred_w"], bias=vae_dev["pred_b"],
-                optional_output_tensor=vae_scr["pred_out"])
+                optional_output_tensor=vae_scr["pred_out"],
+                compute_kernel_config=COMPUTE_HIFI)
     return vae_scr["pred_out"]
 
 def vae_decode_device(z_flat, vae_dev, vae_scr, tt_device, scaler, mean_scale):
@@ -1213,9 +1252,11 @@ def bridge_unpatchify(dit_output, bridge, bridge_tmp, vae_input):
     bridge_tmp: (VAE_SEQ_LEN, OUT_DIM) scratch device tensor
     vae_input: (VAE_SEQ_LEN, 32) output device tensor
     """
-    ttnn.matmul(bridge["R"], dit_output, optional_output_tensor=bridge_tmp)
+    ttnn.matmul(bridge["R"], dit_output, optional_output_tensor=bridge_tmp,
+                compute_kernel_config=COMPUTE_HIFI)
     ttnn.multiply(bridge_tmp, bridge["mask"], output_tensor=bridge_tmp)
-    ttnn.matmul(bridge_tmp, bridge["C"], optional_output_tensor=vae_input)
+    ttnn.matmul(bridge_tmp, bridge["C"], optional_output_tensor=vae_input,
+                compute_kernel_config=COMPUTE_HIFI)
 
 
 # ============================================================
@@ -1390,7 +1431,8 @@ if __name__ == "__main__":
 
     def ddim_step_fn(chunk, step_coeffs, cond_list):
         """One DDIM step with explicit per-step coefficients and conditioning."""
-        gen_z = ttnn.linear(chunk, W_rt_dev, bias=b_rt_dev)
+        gen_z = ttnn.linear(chunk, W_rt_dev, bias=b_rt_dev,
+                            compute_kernel_config=COMPUTE_HIFI)
         z_cur = ttnn.concat([context_z_dev, gen_z], dim=0)
 
         final_out = dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale)
