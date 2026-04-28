@@ -508,14 +508,8 @@ def preload_dit_weights(tt_device, n_frames=2):
         dev["x_emb_conv_w"] = st.get_tensor("x_embedder.proj.weight")  # (1024, 16, 2, 2)
         dev["x_emb_conv_b"] = st.get_tensor("x_embedder.proj.bias")  # (1024,)
 
-        # Final layer adaLN: on device with ttnn.matmul for precision
-        dev["final_adaln_w"] = to_tt(st.get_tensor("final_layer.adaLN_modulation.1.weight").T.contiguous().to(torch.bfloat16), tt_device)
-        final_adaln_b = st.get_tensor("final_layer.adaLN_modulation.1.bias").to(torch.bfloat16)
-        dev["final_adaln_b"] = to_tt(final_adaln_b.unsqueeze(0).expand(TILE, -1).contiguous(), tt_device)
-        dev["final_linear_w"] = to_tt(st.get_tensor("final_layer.linear.weight").T.contiguous().to(torch.bfloat16), tt_device)
-        dev["final_linear_b"] = to_tt(expand_bias(st.get_tensor("final_layer.linear.bias").to(torch.bfloat16), N_PATCH_PAD * n_frames), tt_device)
-        # f32 final layer weights to keep the v predictor end-to-end f32 (the
-        # input z_cur is already f32 from the f32 residual stream).
+        # Final layer weights (f32) — keep the v predictor end-to-end f32 to match
+        # the f32 residual stream feeding it.
         dev["final_adaln_w_f32"] = to_tt_f32(st.get_tensor("final_layer.adaLN_modulation.1.weight").T.contiguous().float(), tt_device)
         final_adaln_b_f32 = st.get_tensor("final_layer.adaLN_modulation.1.bias").float()
         dev["final_adaln_b_f32"] = to_tt_f32(final_adaln_b_f32.unsqueeze(0).expand(TILE, -1).contiguous(), tt_device)
@@ -527,34 +521,16 @@ def preload_dit_weights(tt_device, n_frames=2):
             for prefix in ["s", "t"]:
                 p = "blocks.%d.%s" % (i, prefix)
 
-                # adaLN modulation: on device with ttnn.matmul for precision
-                dev["%s.adaln_w" % p] = to_tt(st.get_tensor("%s_adaLN_modulation.1.weight" % p).T.contiguous().to(torch.bfloat16), tt_device)
-                adaln_b_raw = st.get_tensor("%s_adaLN_modulation.1.bias" % p).to(torch.bfloat16)
-                dev["%s.adaln_b" % p] = to_tt(adaln_b_raw.unsqueeze(0).expand(TILE, -1).contiguous(), tt_device)
-                # f32 adaln weights for the f32 path (spatial + temporal) so the
-                # shift/scale/gate slices fed into modulate/gate ops are f32.
+                # adaLN modulation (f32) — shift/scale/gate slices stay f32 for
+                # downstream modulate/gate ops.
                 adaln_w_f32 = st.get_tensor("%s_adaLN_modulation.1.weight" % p).T.contiguous().float()
                 adaln_b_f32 = st.get_tensor("%s_adaLN_modulation.1.bias" % p).float()
                 dev["%s.adaln_w_f32" % p] = to_tt_f32(adaln_w_f32, tt_device)
                 dev["%s.adaln_b_f32" % p] = to_tt_f32(adaln_b_f32.unsqueeze(0).expand(TILE, -1).contiguous(), tt_device)
 
-                # Combined QKV + QK_swap: (1024, 5120) via single ttnn.matmul
-                # Layout: [Q | K | V | Q_swap | K_swap] each 1024 cols
-                qkv_w = st.get_tensor("%s_attn.to_qkv.weight" % p).T.contiguous().to(torch.bfloat16)
-                q_w = qkv_w[:, :D_MODEL]
-                k_w = qkv_w[:, D_MODEL:2*D_MODEL]
-                v_w = qkv_w[:, 2*D_MODEL:]
-                qkv_full_w = torch.cat([q_w, k_w, v_w,
-                                        swap_adjacent_columns(q_w),
-                                        swap_adjacent_columns(k_w)], dim=1)
-                # TP: interleave heads so ShardTensorToMesh(dim=1) gives each chip its heads
-                if N_CHIPS > 1:
-                    qkv_full_w = interleave_qkv_for_tp(qkv_full_w, N_CHIPS, D_MODEL, D_HEAD)
-                    dev["%s.qkv_full_w" % p] = shard_tt(qkv_full_w, tt_device, dim=1)
-                else:
-                    dev["%s.qkv_full_w" % p] = to_tt(qkv_full_w, tt_device)
-                # f32 copy of qkv weights for the f32 qkv matmul accuracy path
-                # (spatial + temporal).
+                # Combined QKV + QK_swap (f32): (1024, 5120) via single ttnn.matmul.
+                # Layout: [Q | K | V | Q_swap | K_swap] each 1024 cols. Q_swap/K_swap
+                # are read by the rope kernels along with Q/K.
                 qkv_full_w_f32 = st.get_tensor("%s_attn.to_qkv.weight" % p).T.contiguous().float()
                 q32 = qkv_full_w_f32[:, :D_MODEL]
                 k32 = qkv_full_w_f32[:, D_MODEL:2*D_MODEL]
@@ -562,6 +538,7 @@ def preload_dit_weights(tt_device, n_frames=2):
                 qkv_full_w_f32 = torch.cat([q32, k32, v32,
                                             swap_adjacent_columns(q32),
                                             swap_adjacent_columns(k32)], dim=1)
+                # TP: interleave heads so ShardTensorToMesh(dim=1) gives each chip its heads
                 if N_CHIPS > 1:
                     qkv_full_w_f32 = interleave_qkv_for_tp(qkv_full_w_f32, N_CHIPS, D_MODEL, D_HEAD)
                     dev["%s.qkv_full_w_f32" % p] = ttnn.from_torch(
@@ -570,22 +547,9 @@ def preload_dit_weights(tt_device, n_frames=2):
                         mesh_mapper=ttnn.ShardTensorToMesh(tt_device, dim=1))
                 else:
                     dev["%s.qkv_full_w_f32" % p] = to_tt_f32(qkv_full_w_f32, tt_device)
-                # Separate QK_swap weights still needed for temporal path
-                qk_swap_w = torch.cat([swap_adjacent_columns(q_w),
-                                       swap_adjacent_columns(k_w)], dim=1)
-                dev["%s.qk_swap_w" % p] = to_tt(qk_swap_w, tt_device)
-                dev["%s.qkv_w" % p] = to_tt(qkv_w, tt_device)
 
-                # Output projection: row-parallel (shard input dim)
+                # Output projection (f32): row-parallel (shard input dim)
                 SEQ = N_PATCH_PAD * n_frames
-                out_w = st.get_tensor("%s_attn.to_out.weight" % p).T.contiguous().to(torch.bfloat16)
-                if N_CHIPS > 1:
-                    dev["%s.out_w" % p] = shard_tt(out_w, tt_device, dim=0)
-                else:
-                    dev["%s.out_w" % p] = to_tt(out_w, tt_device)
-                out_b = st.get_tensor("%s_attn.to_out.bias" % p).to(torch.bfloat16)
-                dev["%s.out_b" % p] = to_tt(expand_bias(out_b, SEQ), tt_device)
-                # f32 copies for the f32 attn -> o_proj path (spatial + temporal).
                 out_w_f32 = st.get_tensor("%s_attn.to_out.weight" % p).T.contiguous().float()
                 out_b_f32 = st.get_tensor("%s_attn.to_out.bias" % p).float()
                 if N_CHIPS > 1:
@@ -597,23 +561,8 @@ def preload_dit_weights(tt_device, n_frames=2):
                     dev["%s.out_w_f32" % p] = to_tt_f32(out_w_f32, tt_device)
                 dev["%s.out_b_f32" % p] = to_tt_f32(expand_bias(out_b_f32, SEQ), tt_device)
 
-                # MLP: fc1 column-parallel (shard output dim), fc2 row-parallel (shard input dim)
-                fc1_w = st.get_tensor("%s_mlp.fc1.weight" % p).T.contiguous().to(torch.bfloat16)
-                fc1_b = st.get_tensor("%s_mlp.fc1.bias" % p).to(torch.bfloat16)
-                fc2_w = st.get_tensor("%s_mlp.fc2.weight" % p).T.contiguous().to(torch.bfloat16)
-                fc2_b = st.get_tensor("%s_mlp.fc2.bias" % p).to(torch.bfloat16)
-                if N_CHIPS > 1:
-                    dev["%s.fc1_w" % p] = shard_tt(fc1_w, tt_device, dim=1)
-                    dev["%s.fc1_b" % p] = shard_tt(expand_bias(fc1_b, SEQ), tt_device, dim=1)
-                    dev["%s.fc2_w" % p] = shard_tt(fc2_w, tt_device, dim=0)
-                else:
-                    dev["%s.fc1_w" % p] = to_tt(fc1_w, tt_device)
-                    dev["%s.fc1_b" % p] = to_tt(expand_bias(fc1_b, SEQ), tt_device)
-                    dev["%s.fc2_w" % p] = to_tt(fc2_w, tt_device)
-                dev["%s.fc2_b" % p] = to_tt(expand_bias(fc2_b, SEQ), tt_device)
-                # 1D bias for ttnn.linear
-                dev["%s.fc2_b_1d" % p] = to_tt(fc2_b.unsqueeze(0).contiguous(), tt_device)
-                # f32 MLP weights for the f32 path (spatial + temporal).
+                # MLP (f32): fc1 column-parallel (shard output dim),
+                # fc2 row-parallel (shard input dim)
                 fc1_w_f32 = st.get_tensor("%s_mlp.fc1.weight" % p).T.contiguous().float()
                 fc1_b_f32 = st.get_tensor("%s_mlp.fc1.bias" % p).float()
                 fc2_w_f32 = st.get_tensor("%s_mlp.fc2.weight" % p).T.contiguous().float()
@@ -636,10 +585,6 @@ def preload_dit_weights(tt_device, n_frames=2):
                     dev["%s.fc1_b_f32" % p] = to_tt_f32(expand_bias(fc1_b_f32, SEQ), tt_device)
                     dev["%s.fc2_w_f32" % p] = to_tt_f32(fc2_w_f32, tt_device)
                 dev["%s.fc2_b_f32" % p] = to_tt_f32(expand_bias(fc2_b_f32, SEQ), tt_device)
-
-        SEQ = N_PATCH_PAD * n_frames
-        dev["ln_w_ones"] = to_tt(torch.ones(SEQ, D_MODEL, dtype=torch.bfloat16), tt_device)
-        dev["ln_b_zeros"] = to_tt(torch.zeros(SEQ, D_MODEL, dtype=torch.bfloat16), tt_device)
 
         # RoPE: load learned freqs from block 0 (shared across all blocks)
         global SPATIAL_ROPE_FREQS, TEMPORAL_ROPE_FREQS
@@ -668,12 +613,6 @@ def preload_dit_weights(tt_device, n_frames=2):
         dev["temporal_cos"], dev["temporal_sin_perm"] = \
             build_rope_device_tables(temporal_expanded, n_frames * N_PATCH_PAD,
                                      N_PATCH_PAD, N_HEADS_TP, n_frames, tt_device)
-        # f32 copies for the temporal f32 path (rope reads f32 qkv_full and writes
-        # f32 q/k/v scratch).
-        dev["temporal_cos_f32"], dev["temporal_sin_perm_f32"] = \
-            build_rope_device_tables(temporal_expanded, n_frames * N_PATCH_PAD,
-                                     N_PATCH_PAD, N_HEADS_TP, n_frames, tt_device,
-                                     dtype=torch.float32)
 
     elapsed = time.time() - t0
     print("Preloaded %d tensors in %.1fs" % (len(dev), elapsed))
@@ -803,69 +742,39 @@ def prealloc_scratch(tt_device, n_frames=2):
     # Residual-carrying tensors (z_a, z_scratch, o_proj, fc2) are f32 to preserve
     # cond-uncond signal across 16 blocks (bf16 accumulation destroys it).
     s["z_a"] = zeros_l1_f32((SEQ, D_MODEL), tt_device)
-    s["z_b"] = zeros_l1((SEQ, D_MODEL), tt_device)
-    s["normed"] = zeros_l1((SEQ, D_MODEL), tt_device)
-    s["modulated"] = zeros_l1((SEQ, D_MODEL), tt_device)
-    s["qkv"] = zeros_l1((SEQ, 3 * D_MODEL_TP), tt_device)
+    # bf16 qkv_full: typecast destination for the temporal SDPA bf16 boundary.
     s["qkv_full"] = zeros_l1((SEQ, 5 * D_MODEL_TP), tt_device)
-    # f32 spatial path: modulated cast to f32 feeds the f32 qkv matmul whose
-    # output (qkv_full_f32) is consumed by the f32 rope+sdpa pipeline.
+    # f32 spatial+temporal path: modulated cast to f32 feeds the f32 qkv matmul
+    # whose output (qkv_full_f32) is consumed by the f32 rope+sdpa pipeline
+    # (spatial) or downcast to bf16 qkv_full at the temporal SDPA boundary.
     s["modulated_f32"] = zeros_tt_f32((SEQ, D_MODEL), tt_device)
     s["qkv_full_f32"] = zeros_tt_f32((SEQ, 5 * D_MODEL_TP), tt_device)
-    # f32 (1+scale) scratch for spatial modulate; avoids the bf16 round-trip
-    # through scr["normed"] before the multiply.
+    # f32 (1+scale) scratch for spatial modulate; avoids a bf16 round-trip
+    # before the multiply.
     s["normed_f32"] = zeros_l1_f32((SEQ, D_MODEL), tt_device)
     s["o_proj"] = zeros_l1_f32((SEQ, D_MODEL), tt_device)
-    s["fc1"] = zeros_l1((SEQ, D_MLP_TP), tt_device)
-    s["gelu"] = zeros_l1((SEQ, D_MLP_TP), tt_device)
     s["fc2"] = zeros_l1_f32((SEQ, D_MODEL), tt_device)
-    # f32 MLP scratches for the spatial f32 path: modulated_b cast up, fused
-    # fc1+gelu output, fc2 output before bias add.
+    # f32 MLP scratches for the f32 path.
     s["modulated_b_f32"] = zeros_tt_f32((SEQ, D_MODEL), tt_device)
     s["gelu_f32"] = zeros_l1_f32((SEQ, D_MLP_TP), tt_device)
-    # Conditioning scratch (per-frame, so TILE * n_frames)
-    s["t_emb_a"] = zeros_tt((TILE, D_MODEL), tt_device)
-    s["t_emb_b"] = zeros_tt((TILE, D_MODEL), tt_device)
-    s["cond"] = zeros_tt((TILE, D_MODEL), tt_device)
-    # adaLN scratch (replicated, not sharded)
-    s["adaln_out"] = to_tt_l1(torch.zeros(TILE, 6 * D_MODEL, dtype=torch.bfloat16), tt_device)
-    s["silu_cond"] = zeros_tt((TILE, D_MODEL), tt_device)
-    # Packed adaln: (SEQ, 6*D_MODEL) reused across blocks (replicated)
-    s["adaln_packed"] = zeros_l1((SEQ, 6 * D_MODEL), tt_device)
-    # Per-frame adaln expanded: (N_PATCH_PAD, 6*D_MODEL) for building packed tensor
-    for f in range(n_frames):
-        s["adaln_frame_%d" % f] = zeros_l1((N_PATCH_PAD, 6 * D_MODEL), tt_device)
-    # f32 adaln scratches for the spatial f32 path: linear writes here so the
-    # spatial slices (shift/scale/gate) stay f32 through modulate/gate ops.
+    # f32 adaln scratch: linear writes here so the spatial slices
+    # (shift/scale/gate) stay f32 through modulate/gate ops.
     s["adaln_out_f32"] = ttnn.from_torch(
         torch.zeros(TILE, 6 * D_MODEL, dtype=torch.float32),
         dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
         device=tt_device, memory_config=ttnn.L1_MEMORY_CONFIG,
         **_mesh_kwargs(tt_device))
-    # RoPE scratch: sized for N_HEADS_TP heads per chip
-    s["q_roped"] = zeros_l1((SEQ, D_MODEL_TP), tt_device)
-    s["k_roped"] = zeros_l1((SEQ, D_MODEL_TP), tt_device)
-    # SDPA-format scratch for fused RoPE+layout kernel (spatial), f32 end-to-end
-    # Stored as 2D: (BATCH_S * N_PATCH_PAD, D_HEAD), reshaped to 4D for SDPA.
-    BATCH_S = n_frames * N_HEADS_TP
-    # Temporal mega kernel scratch (Q/K roped + V) - sized for TP heads
+    # Temporal SDPA scratch (bf16 forced by ttnn SDPA): rope_temporal writes
+    # bf16 q/k/v here from the bf16 qkv_full typecast above.
     s["t_q_scratch"] = zeros_l1((SEQ, D_MODEL_TP), tt_device)
     s["t_k_scratch"] = zeros_l1((SEQ, D_MODEL_TP), tt_device)
     s["t_v_scratch"] = zeros_l1((SEQ, D_MODEL_TP), tt_device)
-    # f32 temporal rope output: rope_temporal writes f32 q/k/v directly so the
-    # downstream temporal SDPA (ttnn) and o_proj read f32.
-    s["t_q_scratch_f32"] = zeros_l1_f32((SEQ, D_MODEL_TP), tt_device)
-    s["t_k_scratch_f32"] = zeros_l1_f32((SEQ, D_MODEL_TP), tt_device)
-    s["t_v_scratch_f32"] = zeros_l1_f32((SEQ, D_MODEL_TP), tt_device)
-    # SDPA scratch: (SEQ, D_MODEL) for TT-Lang spatial SDPA output
-    s["sdpa_out"] = zeros_l1((SEQ, D_MODEL), tt_device)
-    # f32 end-to-end Q/K/V SDPA inputs (rope writes here directly), output and
-    # workspace tensors. All ops in sdpa_spatial must share dtype.
+    # f32 spatial SDPA: rope writes f32 Q/K/V directly; sdpa_spatial reads them.
+    BATCH_S = n_frames * N_HEADS_TP
     s["q_sdpa_f32"] = zeros_tt_f32((BATCH_S * N_PATCH_PAD, D_HEAD), tt_device)
     s["k_sdpa_f32"] = zeros_tt_f32((BATCH_S * N_PATCH_PAD, D_HEAD), tt_device)
     s["v_sdpa_f32"] = zeros_tt_f32((BATCH_S * N_PATCH_PAD, D_HEAD), tt_device)
     s["sdpa_heads_out_f32"] = zeros_tt_f32((BATCH_S * N_PATCH_PAD, D_HEAD), tt_device)
-    s["sdpa_heads_out"] = zeros_tt((BATCH_S * N_PATCH_PAD, D_HEAD), tt_device)
     s["sdpa_attn_scratch_f32"] = ttnn.from_torch(
         torch.zeros(N_PATCH_PAD, N_PATCH_PAD, dtype=torch.float32),
         dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
@@ -876,13 +785,9 @@ def prealloc_scratch(tt_device, n_frames=2):
         dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
         device=tt_device, memory_config=ttnn.L1_MEMORY_CONFIG,
         **_mesh_kwargs(tt_device))
-    # Mega kernel B scratch (f32: residual-carrying, see comment above)
+    # Residual-carrying tensor for the post-attn add.
     s["z_scratch"] = zeros_l1_f32((SEQ, D_MODEL), tt_device)
-    s["gelu_scratch"] = zeros_l1((SEQ, D_MLP), tt_device)
-    # Final layer
-    s["final_adaln"] = zeros_l1((TILE, 2 * D_MODEL), tt_device)
-    s["final_out"] = zeros_l1((SEQ, OUT_DIM), tt_device)
-    # f32 final layer scratches for the f32 v predictor.
+    # f32 final layer scratch for the f32 v predictor.
     s["final_adaln_f32"] = ttnn.from_torch(
         torch.zeros(TILE, 2 * D_MODEL, dtype=torch.float32),
         dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
