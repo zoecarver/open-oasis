@@ -522,6 +522,13 @@ def preload_dit_weights(tt_device, n_frames=2):
                 dev["%s.adaln_w" % p] = to_tt(st.get_tensor("%s_adaLN_modulation.1.weight" % p).T.contiguous().to(torch.bfloat16), tt_device)
                 adaln_b_raw = st.get_tensor("%s_adaLN_modulation.1.bias" % p).to(torch.bfloat16)
                 dev["%s.adaln_b" % p] = to_tt(adaln_b_raw.unsqueeze(0).expand(TILE, -1).contiguous(), tt_device)
+                # f32 adaln weights for the spatial f32 path so the shift/scale/gate
+                # slices fed into modulate/gate ops are f32 instead of bf16.
+                if prefix == "s":
+                    adaln_w_f32 = st.get_tensor("%s_adaLN_modulation.1.weight" % p).T.contiguous().float()
+                    adaln_b_f32 = st.get_tensor("%s_adaLN_modulation.1.bias" % p).float()
+                    dev["%s.adaln_w_f32" % p] = to_tt_f32(adaln_w_f32, tt_device)
+                    dev["%s.adaln_b_f32" % p] = to_tt_f32(adaln_b_f32.unsqueeze(0).expand(TILE, -1).contiguous(), tt_device)
 
                 # Combined QKV + QK_swap: (1024, 5120) via single ttnn.matmul
                 # Layout: [Q | K | V | Q_swap | K_swap] each 1024 cols
@@ -817,6 +824,13 @@ def prealloc_scratch(tt_device, n_frames=2):
     # Per-frame adaln expanded: (N_PATCH_PAD, 6*D_MODEL) for building packed tensor
     for f in range(n_frames):
         s["adaln_frame_%d" % f] = zeros_l1((N_PATCH_PAD, 6 * D_MODEL), tt_device)
+    # f32 adaln scratches for the spatial f32 path: linear writes here so the
+    # spatial slices (shift/scale/gate) stay f32 through modulate/gate ops.
+    s["adaln_out_f32"] = ttnn.from_torch(
+        torch.zeros(TILE, 6 * D_MODEL, dtype=torch.float32),
+        dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+        device=tt_device, memory_config=ttnn.L1_MEMORY_CONFIG,
+        **_mesh_kwargs(tt_device))
     # RoPE scratch: sized for N_HEADS_TP heads per chip
     s["q_roped"] = zeros_l1((SEQ, D_MODEL_TP), tt_device)
     s["k_roped"] = zeros_l1((SEQ, D_MODEL_TP), tt_device)
@@ -855,6 +869,8 @@ def prealloc_scratch(tt_device, n_frames=2):
     # Pre-allocated SiLU output buffers per frame (L1 for fast access, read 32x/step)
     for f in range(n_frames):
         s["silu_out_%d" % f] = to_tt_l1(torch.zeros(TILE, D_MODEL, dtype=torch.bfloat16), tt_device)
+        # f32 cast of silu_out for spatial adaln path
+        s["silu_out_f32_%d" % f] = to_tt_l1_f32(torch.zeros(TILE, D_MODEL, dtype=torch.float32), tt_device)
     s["n_frames"] = n_frames
     # DDIM arithmetic scratch (N_PATCH_PAD, OUT_DIM)
     s["ddim_x_start"] = zeros_l1((N_PATCH_PAD, OUT_DIM), tt_device)
@@ -890,21 +906,23 @@ def unpatchify_host(x, patch_size, out_channels, h, w):
     x = torch.einsum("nhwpqc->nchpwq", x)
     return x.reshape(1, out_channels, h * patch_size, w * patch_size)
 
-def build_per_frame_adaln(silu_cond_list, prefix, dev, scr, tt_device):
+def build_per_frame_adaln(silu_cond_list, prefix, dev, scr, tt_device, dtype_suffix=""):
     """Compute adaLN params on DEVICE using ttnn.matmul.
     silu_cond_list: list of T pre-computed SiLU(cond) device tensors, each (TILE, D_MODEL).
+    dtype_suffix: "" for bf16, "_f32" to use the f32 weights/scratch (spatial path).
     Returns: packed (SEQ, 6*D_MODEL) device tensor.
     """
     T = len(silu_cond_list)
     N_REPEAT = N_PATCH_PAD // TILE  # 5
+    out_scr = scr["adaln_out%s" % dtype_suffix]
 
     per_frame_expanded = []
     for silu_cond in silu_cond_list:
-        ttnn.linear(silu_cond, dev["%s.adaln_w" % prefix],
-                    bias=dev["%s.adaln_b" % prefix],
-                    optional_output_tensor=scr["adaln_out"],
+        ttnn.linear(silu_cond, dev["%s.adaln_w%s" % (prefix, dtype_suffix)],
+                    bias=dev["%s.adaln_b%s" % (prefix, dtype_suffix)],
+                    optional_output_tensor=out_scr,
                     compute_kernel_config=COMPUTE_HIFI)
-        expanded = ttnn.concat([scr["adaln_out"]] * N_REPEAT, dim=0)
+        expanded = ttnn.concat([out_scr] * N_REPEAT, dim=0)
         per_frame_expanded.append(expanded)
 
     if T == 1:
@@ -956,7 +974,10 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
             _pcc_stash("silu_cond_%d" % t_idx, sc_t)
 
     # Compute per-frame adaLN params (SiLU already applied to cond) - packed (SEQ, 6*D_MODEL)
-    adaln_packed = build_per_frame_adaln(silu_cond_list, prefix, dev, scr, tt_device)
+    # Spatial uses f32 weights/scratch so the shift/scale/gate slices stay f32.
+    adaln_dtype_suffix = "_f32" if attn_type == "spatial" else ""
+    adaln_packed = build_per_frame_adaln(silu_cond_list, prefix, dev, scr, tt_device,
+                                         dtype_suffix=adaln_dtype_suffix)
     if _pcc_active:
         _pcc_stash("adaln_packed", adaln_packed)
     _timer.mark("adaln")
@@ -1224,23 +1245,27 @@ def dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale
     # Pre-compute SiLU(cond) once per step, reuse across all 32 sub-blocks + final layer
     # Uses pre-allocated buffers from scratch (no allocation during trace)
     silu_cond_list = []
+    silu_cond_list_f32 = []
     for t_idx in range(T):
         silu_out = scr["silu_out_%d" % t_idx]
         silu_kernel(cond_list[t_idx], silu_out)
         silu_cond_list.append(silu_out)
+        silu_out_f32 = scr["silu_out_f32_%d" % t_idx]
+        ttnn.typecast(silu_out, ttnn.float32, output_tensor=silu_out_f32)
+        silu_cond_list_f32.append(silu_out_f32)
 
     if profile_step:
         ttnn.synchronize_device(tt_device)
         print("  [PROFILE] silu: %.1fms" % ((_pt() - _pt.__self__) if False else 0))
 
-    z_cur = ttnn.typecast(z_cur, ttnn.float32)
+    # z_cur is already f32 (gen_z and context_z_dev are both f32 now).
 
     # 16 blocks: each has spatial + temporal sub-block
     if profile_step:
         t_blocks = _pt()
     for block_idx in range(N_BLOCKS):
         z_cur = run_sub_block(
-            "blocks.%d.s" % block_idx, z_cur, silu_cond_list,
+            "blocks.%d.s" % block_idx, z_cur, silu_cond_list_f32,
             dev, scr, tt_device, scaler, mean_scale, attn_type="spatial"
         )
         if profile_step:
@@ -1562,14 +1587,16 @@ if __name__ == "__main__":
         stabilization_level - 1, prompt_action, dev, scr, tt_device)
 
     # 3. Round-trip weight: output_space -> input_space (patch_embed composed with unpatchify)
-    # Conv weight (D_MODEL, C, ps, ps) reordered to match patchify pixel order (p, q, c)
+    # Conv weight (D_MODEL, C, ps, ps) reordered to match patchify pixel order (p, q, c).
+    # f32 to keep the gen_z latent fed into z_cur at full precision (was bf16 → f32
+    # cast inside dit_forward_device, which threw away ~3 bits per frame in the
+    # cascading context window).
     conv_w = dev["x_emb_conv_w"].float()  # (1024, 16, 2, 2)
     W_rt = conv_w.permute(0, 2, 3, 1).reshape(D_MODEL, OUT_DIM).T.contiguous()  # (64, 1024)
-    W_rt_dev = to_tt(W_rt.to(torch.bfloat16), tt_device)
-    # Bias: expand to (N_PATCH_PAD, D_MODEL) for broadcast add
-    b_rt = dev["x_emb_conv_b"].float().to(torch.bfloat16)  # (D_MODEL,)
+    W_rt_dev = to_tt_f32(W_rt, tt_device)
+    b_rt = dev["x_emb_conv_b"].float()  # (D_MODEL,)
     b_rt_pad = b_rt.unsqueeze(0).expand(N_PATCH_PAD, -1).contiguous()
-    b_rt_dev = to_tt(b_rt_pad, tt_device)
+    b_rt_dev = to_tt_f32(b_rt_pad, tt_device)
 
     # 4. Initial chunk: random noise in output space on device
     chunk_img = torch.randn(1, IN_CHANNELS, INPUT_H, INPUT_W)
@@ -1634,11 +1661,17 @@ if __name__ == "__main__":
     for step_idx in range(ddim_steps):
         cond_traced_per_step.append(cond_context + [gen_cond_step_dev[step_idx]])
 
-    # Context frames: T-1 frames of patch-embedded latents (updated between frames)
-    context_z_dev = to_tt(torch.zeros((N_FRAMES - 1) * N_PATCH_PAD, D_MODEL, dtype=torch.bfloat16), tt_device)
+    # Context frames: T-1 frames of patch-embedded latents (updated between frames).
+    # f32 to preserve the cascading latent across video frames; the host-side
+    # patch_embed already runs in f32, so we just keep that precision through
+    # to z_cur instead of round-tripping via bf16.
+    context_z_dev = to_tt_f32(torch.zeros((N_FRAMES - 1) * N_PATCH_PAD, D_MODEL, dtype=torch.float32), tt_device)
 
     # Traced chunk buffer: the trace operates on this tensor in-place
     trace_chunk = to_tt(torch.zeros(*CHUNK_SHAPE, dtype=torch.bfloat16), tt_device)
+    # f32 chunk scratch for the round-trip linear (W_rt is f32, so chunk
+    # must be cast up before ttnn.linear can run).
+    chunk_f32 = zeros_tt_f32(tuple(CHUNK_SHAPE), tt_device)
 
     # Bridge matrices for on-device unpatchify
     print("Building bridge matrices...")
@@ -1647,7 +1680,8 @@ if __name__ == "__main__":
 
     def ddim_step_fn(chunk, step_coeffs, cond_list):
         """One DDIM step with explicit per-step coefficients and conditioning."""
-        gen_z = ttnn.linear(chunk, W_rt_dev, bias=b_rt_dev,
+        ttnn.typecast(chunk, ttnn.float32, output_tensor=chunk_f32)
+        gen_z = ttnn.linear(chunk_f32, W_rt_dev, bias=b_rt_dev,
                             compute_kernel_config=COMPUTE_HIFI)
         z_cur = ttnn.concat([context_z_dev, gen_z], dim=0)
 
@@ -1677,8 +1711,8 @@ if __name__ == "__main__":
         readback_torch(prompt_cond_dev),
         dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
     context_host = ttnn.from_torch(
-        torch.cat([readback_torch(prompt_z_dev)] * (N_FRAMES - 1), dim=0),
-        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+        torch.cat([readback_torch(prompt_z_dev)] * (N_FRAMES - 1), dim=0).float(),
+        dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT)
     ttnn.copy_host_to_device_tensor(context_host, context_z_dev)
     for f in range(N_FRAMES - 1):
         ttnn.copy_host_to_device_tensor(prompt_cond_host_til, cond_context[f])
@@ -1794,7 +1828,7 @@ if __name__ == "__main__":
     all_decoded_frames = [prompt_decoded]
 
     # Sliding window
-    prompt_z_torch = torch.zeros(N_PATCH_PAD, D_MODEL, dtype=torch.bfloat16)
+    prompt_z_torch = torch.zeros(N_PATCH_PAD, D_MODEL, dtype=torch.float32)
     prompt_z_torch[:N_PATCHES] = patch_embed_host(
         prompt_latent[0, 0].unsqueeze(0), dev["x_emb_conv_w"], dev["x_emb_conv_b"])
     context_window_z = [prompt_z_torch.clone() for _ in range(N_FRAMES - 1)]
@@ -1811,9 +1845,10 @@ if __name__ == "__main__":
         chunk_pad_f[:N_PATCHES] = chunk_patches.to(torch.bfloat16)
         chunk_host_f = ttnn.from_torch(chunk_pad_f, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
 
-        # Update context (host-only, no device alloc)
-        context_cat = torch.cat(context_window_z, dim=0)
-        context_host = ttnn.from_torch(context_cat, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+        # Update context (host-only, no device alloc). f32 to match the f32
+        # context_z_dev so the cascading latent is preserved.
+        context_cat = torch.cat(context_window_z, dim=0).float()
+        context_host = ttnn.from_torch(context_cat, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT)
         ttnn.copy_host_to_device_tensor(context_host, context_z_dev)
 
         # Conditioning (host-only, no device alloc)
@@ -1838,7 +1873,7 @@ if __name__ == "__main__":
         # denoised DiT output after bridge_unpatchify.
         chunk_result = readback_torch(trace_chunk)[:N_PATCHES].float()
         gen_latent = unpatchify_host(chunk_result, PATCH_SIZE, IN_CHANNELS, FRAME_H, FRAME_W)
-        new_z = torch.zeros(N_PATCH_PAD, D_MODEL, dtype=torch.bfloat16)
+        new_z = torch.zeros(N_PATCH_PAD, D_MODEL, dtype=torch.float32)
         new_z[:N_PATCHES] = patch_embed_host(
             gen_latent, dev["x_emb_conv_w"], dev["x_emb_conv_b"])
         context_window_z.pop(0)

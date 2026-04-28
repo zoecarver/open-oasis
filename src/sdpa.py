@@ -33,6 +33,11 @@ def make_sdpa_kernel(sq_tiles, skv_tiles, head_tiles, scale_val):
     # --no-ttl-reduce-full-fp32: workaround for tenstorrent/tt-lang#533, where
     # reduce_max/reduce_sum dims=[1] silently returns zeros for f32 tiles in
     # the default (full-fp32 reduce) lowering.
+    # TODO: enable fp32_dest_acc_en=True for full f32 SDPA precision. Currently
+    # blocked because the (1, skv_tiles=5) matmul output exceeds the 4-tile f32
+    # DST capacity. The compiler suggests "enable maximize_dst to auto-subblock"
+    # but adding "--ttl-maximize-dst" doesn't help; we likely need to either
+    # sub-block the matmul down to (1, 1) per iter or find the correct flag.
     @ttl.operation(grid="auto", options="--no-ttl-reduce-full-fp32")
     def sdpa_kernel(Q_all, K_all, V_all, scaler, attn_scratch, out):
         grid_cols, _ = ttl.grid_size(dims=2)
