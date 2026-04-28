@@ -80,6 +80,7 @@ from layernorm import make_layernorm_kernel
 from vae_rope import make_vae_rope_kernel
 from adaln_matmul_expand import make_adaln_matmul_expand_kernel
 from rope_layout_kernel import make_rope_layout_kernel, make_rope_temporal_kernel
+from sdpa import make_sdpa_kernel
 
 # ============================================================
 # Constants
@@ -120,6 +121,18 @@ COMPUTE_HIFI = ttnn.WormholeComputeKernelConfig(
     fp32_dest_acc_en=True,
     packer_l1_acc=True,
 )
+
+# SDPA program config: exp_approx_mode=False disables the approximate softmax
+# (default is True). Larger chunk sizes reduce bf16 round-trips in the flash
+# attention inner loop. tt-metal SDPA hardcodes bf16 intermediate CBs (see
+# tt-metal issues #41684/#41686), so these knobs are our only accuracy lever.
+def _sdpa_cfg(q_chunk, k_chunk):
+    return ttnn.SDPAProgramConfig(
+        compute_with_storage_grid_size=ttnn.CoreCoord(8, 8),
+        q_chunk_size=q_chunk,
+        k_chunk_size=k_chunk,
+        exp_approx_mode=False,
+    )
 
 # Multi-chip tensor parallelism: set to 1 for single-chip, 2+ for TP
 N_CHIPS = 1
@@ -176,6 +189,10 @@ vae_rope_layout = make_rope_layout_kernel(VAE_SEQ_TILES, VAE_D_HEAD // TILE, VAE
 # Fused VAE RoPE: reads qkv_full, writes Q/K/V in heads-first SDPA layout
 # Uses (1, 2) tile DFBs (~160KB/core) vs vae_rope_layout's (18, 2) (~1.4MB/core OOM)
 vae_rope_fused = make_vae_rope_kernel(VAE_DEC_HEADS, VAE_D_HEAD // TILE)
+# TT-Lang spatial SDPA: bf16 compute with fp32 DST accumulation for correct
+# multi-tile reduce behavior. Matches torch PCC ~= 1.0 vs ttnn SDPA's ~0.9998.
+sdpa_spatial = make_sdpa_kernel(N_PATCH_PAD // TILE, N_PATCH_PAD // TILE,
+                                D_HEAD // TILE, 1.0 / math.sqrt(D_HEAD))
 
 
 # ============================================================
@@ -222,11 +239,25 @@ def zeros_l1_f32(shape, device):
                            device=device, memory_config=ttnn.L1_MEMORY_CONFIG,
                            **_mesh_kwargs(device))
 
+def zeros_tt_f32(shape, device):
+    return ttnn.from_torch(torch.zeros(shape, dtype=torch.float32),
+                           dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+                           device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                           **_mesh_kwargs(device))
+
 def readback_torch(t):
     """Read tensor from device/mesh to torch. For mesh, reads chip 0."""
     if _MESH_DEVICE is not None:
         return ttnn.to_torch(t, mesh_composer=ttnn.ConcatMeshToTensor(_MESH_DEVICE, dim=0))[:t.shape[0]]
     return ttnn.to_torch(t)
+
+# PCC dump: captured on first block-0-spatial call, written to /tmp/device_dump_block0.pt.
+_PCC_DUMP = {}
+
+def _pcc_stash(name, t):
+    if _PCC_DUMP.get("done"):
+        return
+    _PCC_DUMP[name] = readback_torch(t).float()
 
 def expand_bias(bias_1d, seq_pad):
     return bias_1d.unsqueeze(0).expand(seq_pad, -1).contiguous().to(torch.bfloat16)
@@ -423,25 +454,25 @@ def precompute_vae_rope(vae, tt_device):
 # Weight loading
 # ============================================================
 
-def find_dit_weights():
+def _find_weights_by_prefix(prefix):
+    # Blob dir contains safetensors + small metadata files (README, .gitattributes).
+    # Skip anything that isn't a valid safetensors file.
     blob_dir = "/root/.cache/huggingface/hub/models--Etched--oasis-500m/blobs/"
     for f in sorted(os.listdir(blob_dir)):
         path = blob_dir + f
-        with safe_open(path, framework="pt") as st:
-            keys = list(st.keys())
-            if any(k.startswith("blocks.") for k in keys):
-                return path
-    raise FileNotFoundError("DiT weights not found")
+        try:
+            with safe_open(path, framework="pt") as st:
+                if any(k.startswith(prefix) for k in st.keys()):
+                    return path
+        except Exception:
+            continue
+    raise FileNotFoundError("weights with prefix %r not found in %s" % (prefix, blob_dir))
+
+def find_dit_weights():
+    return _find_weights_by_prefix("blocks.")
 
 def find_vae_weights():
-    blob_dir = "/root/.cache/huggingface/hub/models--Etched--oasis-500m/blobs/"
-    for f in sorted(os.listdir(blob_dir)):
-        path = blob_dir + f
-        with safe_open(path, framework="pt") as st:
-            keys = list(st.keys())
-            if any(k.startswith("encoder.") for k in keys):
-                return path
-    raise FileNotFoundError("VAE weights not found")
+    return _find_weights_by_prefix("encoder.")
 
 def preload_dit_weights(tt_device, n_frames=2):
     t0 = time.time()
@@ -720,6 +751,24 @@ def prealloc_scratch(tt_device, n_frames=2):
     s["t_v_scratch"] = zeros_l1((SEQ, D_MODEL_TP), tt_device)
     # SDPA scratch: (SEQ, D_MODEL) for TT-Lang spatial SDPA output
     s["sdpa_out"] = zeros_l1((SEQ, D_MODEL), tt_device)
+    # TT-Lang spatial SDPA: f32 end-to-end for accuracy (cast bf16 Q/K/V at the
+    # boundary). All tensors in the op must share dtype; f32 scaler/scratch/out
+    # here give ~0.99962 PCC vs ~0.99982 with bf16 CBs.
+    s["q_sdpa_f32"] = zeros_tt_f32((BATCH_S * N_PATCH_PAD, D_HEAD), tt_device)
+    s["k_sdpa_f32"] = zeros_tt_f32((BATCH_S * N_PATCH_PAD, D_HEAD), tt_device)
+    s["v_sdpa_f32"] = zeros_tt_f32((BATCH_S * N_PATCH_PAD, D_HEAD), tt_device)
+    s["sdpa_heads_out_f32"] = zeros_tt_f32((BATCH_S * N_PATCH_PAD, D_HEAD), tt_device)
+    s["sdpa_heads_out"] = zeros_tt((BATCH_S * N_PATCH_PAD, D_HEAD), tt_device)
+    s["sdpa_attn_scratch_f32"] = ttnn.from_torch(
+        torch.zeros(N_PATCH_PAD, N_PATCH_PAD, dtype=torch.float32),
+        dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+        device=tt_device, memory_config=ttnn.L1_MEMORY_CONFIG,
+        **_mesh_kwargs(tt_device))
+    s["sdpa_scaler_f32"] = ttnn.from_torch(
+        torch.ones(TILE, TILE, dtype=torch.float32),
+        dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+        device=tt_device, memory_config=ttnn.L1_MEMORY_CONFIG,
+        **_mesh_kwargs(tt_device))
     # Mega kernel B scratch (f32: residual-carrying, see comment above)
     s["z_scratch"] = zeros_l1_f32((SEQ, D_MODEL), tt_device)
     s["gelu_scratch"] = zeros_l1((SEQ, D_MLP), tt_device)
@@ -824,8 +873,15 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
         ttnn.synchronize_device(tt_device)
         _t0 = _dt.time()
 
+    _pcc_active = (prefix == "blocks.0.s" and not _PCC_DUMP.get("done"))
+    if _pcc_active:
+        for t_idx, sc_t in enumerate(silu_cond_list):
+            _pcc_stash("silu_cond_%d" % t_idx, sc_t)
+
     # Compute per-frame adaLN params (SiLU already applied to cond) - packed (SEQ, 6*D_MODEL)
     adaln_packed = build_per_frame_adaln(silu_cond_list, prefix, dev, scr, tt_device)
+    if _pcc_active:
+        _pcc_stash("adaln_packed", adaln_packed)
     _timer.mark("adaln")
     if _do_dev_profile:
         ttnn.synchronize_device(tt_device)
@@ -840,6 +896,8 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
     ttnn.add(scale_a, 1.0, output_tensor=scr["normed"])
     ttnn.multiply(normed_a, scr["normed"], output_tensor=scr["modulated"])
     ttnn.add(scr["modulated"], shift_a, output_tensor=scr["modulated"])
+    if _pcc_active:
+        _pcc_stash("modulated_a", scr["modulated"])
     _timer.mark("norm+mod")
     if _do_dev_profile:
         ttnn.synchronize_device(tt_device)
@@ -852,6 +910,8 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
     ttnn.matmul(scr["modulated"], dev["%s.qkv_full_w" % prefix],
                 optional_output_tensor=scr["qkv_full"],
                 compute_kernel_config=COMPUTE_HIFI)
+    if _pcc_active:
+        _pcc_stash("qkv_full", scr["qkv_full"])
     if _do_dev_profile:
         ttnn.synchronize_device(tt_device)
         _t1 = _dt.time(); print("      %s qkv_matmul: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
@@ -863,16 +923,26 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
         # Fused RoPE + layout: reads qkv_full, writes Q,K,V in SDPA format directly
         rope_layout_spatial(scr["qkv_full"], dev[cos_key], dev[sin_key],
                            scr["q_sdpa"], scr["k_sdpa"], scr["v_sdpa"])
+        if _pcc_active:
+            _pcc_stash("q_sdpa", scr["q_sdpa"])
+            _pcc_stash("k_sdpa", scr["k_sdpa"])
+            _pcc_stash("v_sdpa", scr["v_sdpa"])
         BATCH_S = T * N_HEADS_TP
-        # Already in (BATCH_S * N_PATCH_PAD, D_HEAD) layout, just reshape for SDPA
-        q_s = ttnn.reshape(scr["q_sdpa"], [BATCH_S, 1, N_PATCH_PAD, D_HEAD])
-        k_s = ttnn.reshape(scr["k_sdpa"], [BATCH_S, 1, N_PATCH_PAD, D_HEAD])
-        v_s = ttnn.reshape(scr["v_sdpa"], [BATCH_S, 1, N_PATCH_PAD, D_HEAD])
-        attn_out = ttnn.transformer.scaled_dot_product_attention(
-            q_s, k_s, v_s, is_causal=False, compute_kernel_config=COMPUTE_HIFI)
-        attn_out = ttnn.reshape(attn_out, [T, N_HEADS_TP, N_PATCH_PAD, D_HEAD])
+        # TT-Lang SDPA end-to-end in f32: cast Q/K/V up at the boundary, run
+        # SDPA with f32 CBs (all tensors in the op must share dtype), then
+        # cast the heads-first output back to bf16 for downstream o_proj.
+        ttnn.typecast(scr["q_sdpa"], ttnn.float32, output_tensor=scr["q_sdpa_f32"])
+        ttnn.typecast(scr["k_sdpa"], ttnn.float32, output_tensor=scr["k_sdpa_f32"])
+        ttnn.typecast(scr["v_sdpa"], ttnn.float32, output_tensor=scr["v_sdpa_f32"])
+        sdpa_spatial(scr["q_sdpa_f32"], scr["k_sdpa_f32"], scr["v_sdpa_f32"],
+                     scr["sdpa_scaler_f32"], scr["sdpa_attn_scratch_f32"],
+                     scr["sdpa_heads_out_f32"])
+        ttnn.typecast(scr["sdpa_heads_out_f32"], ttnn.bfloat16, output_tensor=scr["sdpa_heads_out"])
+        attn_out = ttnn.reshape(scr["sdpa_heads_out"], [T, N_HEADS_TP, N_PATCH_PAD, D_HEAD])
         attn_out = ttnn.permute(attn_out, [0, 2, 1, 3])
         attn_2d = ttnn.reshape(attn_out, [SEQ, D_MODEL_TP])
+        if _pcc_active:
+            _pcc_stash("attn_2d", attn_2d)
         _timer.mark("qkv+sdpa")
     else:
         # Fused temporal RoPE: reads qkv_full, writes q/k/v in (SEQ, D_MODEL_TP)
@@ -891,7 +961,8 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
         v_t = ttnn.permute(v_t, [1, 0, 2])
         v_t = ttnn.reshape(v_t, [BATCH_T, 1, T, D_HEAD])
         attn_out = ttnn.transformer.scaled_dot_product_attention(
-            q_t, k_t, v_t, is_causal=True, compute_kernel_config=COMPUTE_HIFI)
+            q_t, k_t, v_t, is_causal=True, compute_kernel_config=COMPUTE_HIFI,
+            program_config=_sdpa_cfg(TILE, TILE))
         attn_out = ttnn.reshape(attn_out, [BATCH_T, T, D_HEAD])
         attn_out = ttnn.permute(attn_out, [1, 0, 2])
         attn_2d = ttnn.reshape(attn_out, [SEQ, D_MODEL_TP])
@@ -913,6 +984,8 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
     if N_CHIPS > 1:
         o_proj = ttnn.all_reduce(o_proj)
     ttnn.add(o_proj, dev["%s.out_b" % prefix], output_tensor=scr["o_proj"])
+    if _pcc_active:
+        _pcc_stash("o_proj", scr["o_proj"])
     gate_msa = ttnn.slice(adaln_packed, [0, 2 * D_MODEL], [SEQ, 3 * D_MODEL])
 
     # Phase B: gated_residual + LN + adaLN modulate via ttnn ops
@@ -921,12 +994,16 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
     #          adaln_packed, scr["z_scratch"], scr["modulated"])
     ttnn.multiply(scr["o_proj"], gate_msa, output_tensor=scr["normed"])
     ttnn.add(x_tt, scr["normed"], output_tensor=scr["z_scratch"])
+    if _pcc_active:
+        _pcc_stash("z_scratch_after_attn", scr["z_scratch"])
     normed = ttnn.layer_norm(scr["z_scratch"])
     shift_b = ttnn.slice(adaln_packed, [0, 3 * D_MODEL], [SEQ, 4 * D_MODEL])
     scale_b = ttnn.slice(adaln_packed, [0, 4 * D_MODEL], [SEQ, 5 * D_MODEL])
     ttnn.add(scale_b, 1.0, output_tensor=scr["normed"])
     ttnn.multiply(normed, scr["normed"], output_tensor=scr["modulated"])
     ttnn.add(scr["modulated"], shift_b, output_tensor=scr["modulated"])
+    if _pcc_active:
+        _pcc_stash("modulated_b", scr["modulated"])
     if _do_dev_profile:
         ttnn.synchronize_device(tt_device)
         _t1 = _dt.time(); print("      %s ln+mod: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
@@ -935,6 +1012,8 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
     ttnn.linear(scr["modulated"], dev["%s.fc1_w" % prefix], bias=dev["%s.fc1_b" % prefix],
                 activation="gelu", optional_output_tensor=scr["gelu"],
                 compute_kernel_config=COMPUTE_HIFI)
+    if _pcc_active:
+        _pcc_stash("gelu", scr["gelu"])
     if _do_dev_profile:
         ttnn.synchronize_device(tt_device)
         _t1 = _dt.time(); print("      %s fc1+gelu: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
@@ -952,6 +1031,13 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
     # Was: gated_residual_kernel(scr["z_scratch"], scr["fc2"], gate_mlp, scr["z_a"])
     ttnn.multiply(scr["fc2"], gate_mlp, output_tensor=scr["z_a"])
     ttnn.add(scr["z_scratch"], scr["z_a"], output_tensor=scr["z_a"])
+    if _pcc_active:
+        _pcc_stash("fc2", scr["fc2"])
+        _pcc_stash("z_a_final", scr["z_a"])
+        _PCC_DUMP["done"] = True
+        torch.save(_PCC_DUMP, "/tmp/device_dump_block0.pt")
+        print("[PCC] dumped %d tensors to /tmp/device_dump_block0.pt" %
+              sum(1 for k in _PCC_DUMP if k != "done"))
     _timer.mark("post_attn")
     if _do_dev_profile:
         ttnn.synchronize_device(tt_device)
@@ -1000,6 +1086,11 @@ def dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale
     """
     T = len(cond_list)
     SEQ = N_PATCH_PAD * T
+
+    if not _PCC_DUMP.get("done"):
+        _pcc_stash("z_cur_input", z_cur)
+        for t_idx, c in enumerate(cond_list):
+            _pcc_stash("cond_pre_silu_%d" % t_idx, c)
 
     if profile_step:
         import time as _t
@@ -1124,7 +1215,8 @@ def vae_decode_forward(vae_dev, vae_scr, scaler, mean_scale):
         k_s = ttnn.reshape(vae_scr["k_sdpa"], [VAE_DEC_HEADS, 1, VAE_SEQ_LEN, VAE_D_HEAD])
         v_s = ttnn.reshape(vae_scr["v_sdpa"], [VAE_DEC_HEADS, 1, VAE_SEQ_LEN, VAE_D_HEAD])
         attn_out = ttnn.transformer.scaled_dot_product_attention(
-            q_s, k_s, v_s, is_causal=False, compute_kernel_config=COMPUTE_HIFI)
+            q_s, k_s, v_s, is_causal=False, compute_kernel_config=COMPUTE_HIFI,
+            program_config=_sdpa_cfg(TILE, TILE))
 
         # Reshape back to (576, 1024): (heads, 1, seq, dim) -> (1, seq, heads, dim) -> (seq, dim*heads)
         attn_out = ttnn.permute(attn_out, [1, 2, 0, 3])  # (1, 576, 16, 64)
@@ -1268,10 +1360,10 @@ if __name__ == "__main__":
     if N_CHIPS > 1:
         ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
         tt_device = ttnn.open_mesh_device(ttnn.MeshShape(1, N_CHIPS),
-                                           trace_region_size=100000000)
+                                           trace_region_size=250000000)
         _MESH_DEVICE = tt_device
     else:
-        tt_device = ttnn.open_device(device_id=0, trace_region_size=100000000)
+        tt_device = ttnn.open_device(device_id=0, trace_region_size=250000000)
     torch.manual_seed(42)
 
     print("=" * 60)
@@ -1311,7 +1403,7 @@ if __name__ == "__main__":
 
     # Diffusion schedule
     max_noise_level = 1000
-    ddim_steps = 4
+    ddim_steps = 10
     noise_range = torch.linspace(-1, max_noise_level - 1, ddim_steps + 1)
     noise_abs_max = 20
     stabilization_level = 15
