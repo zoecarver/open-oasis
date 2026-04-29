@@ -1480,7 +1480,7 @@ if __name__ == "__main__":
 
     # Diffusion schedule
     max_noise_level = 1000
-    ddim_steps = 10
+    ddim_steps = 12
     noise_range = torch.linspace(-1, max_noise_level - 1, ddim_steps + 1)
     noise_abs_max = 20
     stabilization_level = 15
@@ -1489,16 +1489,26 @@ if __name__ == "__main__":
     alphas = 1.0 - betas
     alphas_cumprod = torch.cumprod(alphas, dim=0)  # (1000,)
 
-    # Real sample actions (one_hot_actions tensor from the open-oasis dataset).
-    # Frame 0 is the prompt (zero action); frame 1+ steps through the file.
+    # Load recorded sample actions, mask to walk/camera only, time-stretch 2x
+    # with halved camera deltas so the same motion plays out over 2x as many
+    # frames. Action layout: 11 = forward (walk), 15 = cameraX, 16 = cameraY.
+    N_SYNTH_FRAMES = 100
     actions_path = "/tmp/sample_actions_0.one_hot_actions.pt"
-    if os.path.exists(actions_path):
-        sample_actions = torch.load(actions_path, weights_only=True)  # (T, 25)
-        sample_actions = torch.cat([torch.zeros_like(sample_actions[:1]), sample_actions], dim=0)
-        print("Loaded %d sample actions from %s" % (sample_actions.shape[0], actions_path))
-    else:
-        print("WARNING: sample actions not found at %s, using zero actions" % actions_path)
-        sample_actions = torch.zeros(960, EXT_COND_DIM)
+    raw_actions = torch.load(actions_path, weights_only=True).float()  # (T, EXT_COND_DIM)
+    keep_mask = torch.zeros(EXT_COND_DIM)
+    keep_mask[11] = 1.0  # forward / walk
+    keep_mask[15] = 1.0  # cameraX (pitch)
+    keep_mask[16] = 1.0  # cameraY (yaw)
+    raw_actions = raw_actions * keep_mask
+    stretched = raw_actions.repeat_interleave(2, dim=0)
+    stretched[:, 15] *= 0.5
+    stretched[:, 16] *= 0.5
+    sample_actions = torch.zeros(N_SYNTH_FRAMES, EXT_COND_DIM)
+    n_use = min(stretched.shape[0], N_SYNTH_FRAMES - 1)
+    sample_actions[1:1 + n_use] = stretched[:n_use]
+    sample_actions[50:60, 11] = 1.0  # injected: 10 frames of walking at ~mid-clip
+    print("Loaded %s: %d->%d->%d frames (mask walk+camera, 2x stretch with half-cam)" % (
+        actions_path, raw_actions.shape[0], stretched.shape[0], n_use))
     prompt_action = torch.zeros(EXT_COND_DIM)
 
     # === Pre-compute device-resident data for on-device DDIM loop ===
@@ -1717,18 +1727,17 @@ if __name__ == "__main__":
         readback_torch(prompt_cond_dev).float(),
         dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT)
 
-    def run_full_frame(chunk_in_host, label, context_cond_hosts=None, gen_cond_map=None):
+    def run_full_frame(chunk_in_host, label, context_cond_hosts=None, gen_cond_map=None,
+                       phase_times=None):
         """Execute single trace: copy all inputs, run 4 DDIM + bridge + VAE, return."""
         if gen_cond_map is None:
             gen_cond_map = precompute_gen_cond_host(prompt_action)
         if context_cond_hosts is None:
             context_cond_hosts = [prompt_cond_host] * (N_FRAMES - 1)
-        # Copy noise chunk
+        t_h2d = time.perf_counter()
         ttnn.copy_host_to_device_tensor(chunk_in_host, trace_chunk)
-        # Copy context conditioning
         for f in range(N_FRAMES - 1):
             ttnn.copy_host_to_device_tensor(context_cond_hosts[f], cond_context[f])
-        # Copy per-step coefficients and gen conditioning
         for step_idx in range(ddim_steps):
             noise_idx = ddim_steps - step_idx  # reversed: step 0 = highest noise
             for k in COEFF_KEYS:
@@ -1736,12 +1745,16 @@ if __name__ == "__main__":
                                                 ddim_coeff_per_step[step_idx][k])
             ttnn.copy_host_to_device_tensor(gen_cond_map[noise_idx],
                                             gen_cond_step_dev[step_idx])
-        # Single trace execution: 4 DDIM steps + bridge + VAE
-        t_exec = time.time()
+        h2d_time = time.perf_counter() - t_h2d
+        t_exec = time.perf_counter()
         ttnn.execute_trace(tt_device, trace_id, cq_id=0, blocking=False)
         ttnn.synchronize_device(tt_device)
-        exec_time = time.time() - t_exec
-        print("%s: %.3fs (%.1f FPS)" % (label, exec_time, 1.0 / exec_time))
+        exec_time = time.perf_counter() - t_exec
+        if phase_times is not None:
+            phase_times["h2d_copies"] += h2d_time
+            phase_times["trace_exec"] += exec_time
+        print("%s: exec=%.3fs h2d=%.3fs (%.1f FPS)" % (
+            label, exec_time, h2d_time, 1.0 / (exec_time + h2d_time)))
         return vae_scr["pred_out"]
 
     chunk_host_tilized = ttnn.from_torch(chunk_pad, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT)
@@ -1764,43 +1777,47 @@ if __name__ == "__main__":
     context_window_z = [prompt_z_torch.clone() for _ in range(N_FRAMES - 1)]
     context_cond_window = [prompt_cond_host] * (N_FRAMES - 1)
 
-    for frame_idx in range(1, N_VIDEO_FRAMES):
-        t_frame = time.time()
+    phase_times = {"noise_prep": 0.0, "context_h2d": 0.0, "gen_cond_host": 0.0,
+                   "h2d_copies": 0.0, "trace_exec": 0.0,
+                   "vae_readback": 0.0, "ctx_update": 0.0}
 
-        # Fresh noise
+    for frame_idx in range(1, N_VIDEO_FRAMES):
+        t_frame = time.perf_counter()
+
+        t = time.perf_counter()
         chunk_img = torch.randn(1, IN_CHANNELS, INPUT_H, INPUT_W)
         chunk_img = torch.clamp(chunk_img, -noise_abs_max, noise_abs_max)
         chunk_patches = patchify_to_output_space(chunk_img)
         chunk_pad_f = torch.zeros(N_PATCH_PAD, OUT_DIM, dtype=torch.float32)
         chunk_pad_f[:N_PATCHES] = chunk_patches.float()
         chunk_host_f = ttnn.from_torch(chunk_pad_f, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT)
+        phase_times["noise_prep"] += time.perf_counter() - t
 
-        # Update context (host-only, no device alloc). f32 to match the f32
-        # context_z_dev so the cascading latent is preserved.
+        t = time.perf_counter()
         context_cat = torch.cat(context_window_z, dim=0).float()
         context_host = ttnn.from_torch(context_cat, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT)
         ttnn.copy_host_to_device_tensor(context_host, context_z_dev)
+        phase_times["context_h2d"] += time.perf_counter() - t
 
-        # Conditioning (host-only, no device alloc)
+        t = time.perf_counter()
         action_idx = min(frame_idx, sample_actions.shape[0] - 1)
         frame_cond_host = precompute_gen_cond_host(sample_actions[action_idx])
+        phase_times["gen_cond_host"] += time.perf_counter() - t
 
-        # Run single trace: 4 DDIM + bridge + VAE
         pred_out = run_full_frame(chunk_host_f, "Frame %d" % frame_idx,
                                   context_cond_hosts=context_cond_window,
-                                  gen_cond_map=frame_cond_host)
+                                  gen_cond_map=frame_cond_host,
+                                  phase_times=phase_times)
 
-        # Readback VAE output directly (no host bridge needed!)
+        t = time.perf_counter()
         result = readback_torch(pred_out).float()
         patches = result[:, :VAE_PATCH_DIM]
         image = vae_unpatchify(patches)
         decoded = torch.clamp((image + 1) / 2, 0, 1)
         all_decoded_frames.append(decoded.squeeze(0).permute(1, 2, 0))
+        phase_times["vae_readback"] += time.perf_counter() - t
 
-        # Update context window: need DiT output for patch embedding
-        # The DiT output is in trace_chunk after the 4 DDIM steps (before bridge overwrites it)
-        # But bridge reads trace_chunk, doesn't modify it. So trace_chunk still has the
-        # denoised DiT output after bridge_unpatchify.
+        t = time.perf_counter()
         chunk_result = readback_torch(trace_chunk)[:N_PATCHES].float()
         gen_latent = unpatchify_host(chunk_result, PATCH_SIZE, IN_CHANNELS, FRAME_H, FRAME_W)
         new_z = torch.zeros(N_PATCH_PAD, D_MODEL, dtype=torch.float32)
@@ -1808,17 +1825,26 @@ if __name__ == "__main__":
             gen_latent, dev["x_emb_conv_w"], dev["x_emb_conv_b"])
         context_window_z.pop(0)
         context_window_z.append(new_z)
-
         new_cond_entry = compute_cond_host(stabilization_level - 1, sample_actions[action_idx])
         context_cond_window.pop(0)
         context_cond_window.append(new_cond_entry)
+        phase_times["ctx_update"] += time.perf_counter() - t
 
-        elapsed = time.time() - t_frame
+        elapsed = time.perf_counter() - t_frame
         print("  Frame %d: %.2fs" % (frame_idx, elapsed))
 
     total_video = time.time() - t_video_start
+    n_frames = N_VIDEO_FRAMES - 1
     print("\nDiT+VAE generation: %.1fs for %d frames (%.2f FPS)" % (
-        total_video, N_VIDEO_FRAMES - 1, (N_VIDEO_FRAMES - 1) / total_video))
+        total_video, n_frames, n_frames / total_video))
+    print("\n=== PER-PHASE AVG (ms/frame) ===")
+    total_attributed = sum(phase_times.values())
+    for k, v in phase_times.items():
+        avg_ms = (v / n_frames) * 1000
+        pct = (v / total_attributed) * 100 if total_attributed > 0 else 0
+        print("  %-15s %7.2f ms  (%5.1f%%)" % (k, avg_ms, pct))
+    print("  %-15s %7.2f ms" % ("TOTAL_attrib", (total_attributed / n_frames) * 1000))
+    print("  %-15s %7.2f ms" % ("WALL_per_frame", (total_video / n_frames) * 1000))
 
     # Save as individual PNGs
     video_dir = "/tmp/oasis_video_%dstep_T%d" % (ddim_steps, N_FRAMES)
