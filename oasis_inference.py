@@ -1492,7 +1492,7 @@ if __name__ == "__main__":
     # Load recorded sample actions, mask to walk/camera only, time-stretch 2x
     # with halved camera deltas so the same motion plays out over 2x as many
     # frames. Action layout: 11 = forward (walk), 15 = cameraX, 16 = cameraY.
-    N_SYNTH_FRAMES = 100
+    N_SYNTH_FRAMES = 150
     actions_path = "/tmp/sample_actions_0.one_hot_actions.pt"
     raw_actions = torch.load(actions_path, weights_only=True).float()  # (T, EXT_COND_DIM)
     keep_mask = torch.zeros(EXT_COND_DIM)
@@ -1503,12 +1503,20 @@ if __name__ == "__main__":
     stretched = raw_actions.repeat_interleave(2, dim=0)
     stretched[:, 15] *= 0.5
     stretched[:, 16] *= 0.5
+    # Splice (not overwrite) a walk block into the stretched stream so the
+    # surrounding camera motion is shifted later, not clobbered.
+    INSERT_AT = 60   # output frame index where walk starts
+    WALK_LEN = 20
+    walk_block = torch.zeros(WALK_LEN, EXT_COND_DIM)
+    walk_block[:, 11] = 1.0
+    ins = INSERT_AT - 1  # convert from output-frame to post-prompt-array index
+    seq = torch.cat([stretched[:ins], walk_block, stretched[ins:]], dim=0)
     sample_actions = torch.zeros(N_SYNTH_FRAMES, EXT_COND_DIM)
-    n_use = min(stretched.shape[0], N_SYNTH_FRAMES - 1)
-    sample_actions[1:1 + n_use] = stretched[:n_use]
-    sample_actions[50:60, 11] = 1.0  # injected: 10 frames of walking at ~mid-clip
-    print("Loaded %s: %d->%d->%d frames (mask walk+camera, 2x stretch with half-cam)" % (
-        actions_path, raw_actions.shape[0], stretched.shape[0], n_use))
+    n_use = min(seq.shape[0], N_SYNTH_FRAMES - 1)
+    sample_actions[1:1 + n_use] = seq[:n_use]
+    print("Loaded %s: %d->%d stretched, +%d walk@%d, -> %d frames used" % (
+        actions_path, raw_actions.shape[0], stretched.shape[0],
+        WALK_LEN, INSERT_AT, n_use))
     prompt_action = torch.zeros(EXT_COND_DIM)
 
     # === Pre-compute device-resident data for on-device DDIM loop ===
@@ -1764,7 +1772,7 @@ if __name__ == "__main__":
     _ = run_full_frame(chunk_host_tilized, "Timed")
 
     # === Generate video ===
-    N_VIDEO_FRAMES = 100
+    N_VIDEO_FRAMES = 150
     print("\n=== GENERATING %d-FRAME VIDEO (single trace) ===" % N_VIDEO_FRAMES)
     t_video_start = time.time()
 
