@@ -51,3 +51,17 @@ Three concrete targets, in order of payoff:
 - **K/V mcast inside block-diagonal SDPA (with #1)**: after batch-packing, multiple query tiles within a packed batch attend to the same K/V tiles. Read K/V once per packed batch and mcast to the cores doing the per-query work. Pairs naturally with #1's redesign.
 
 Pipes are intra-chip only — they don't replace inter-chip all_reduce. ttnn's matmul already does 2D mcast internally (`pipe_examples/test_mcast_matmul.py`-style), so qkv/fc1/fc2 don't have headroom from explicit pipes.
+
+## 6. Sequence-parallel residual stream
+
+Today the row-parallel matmuls (`o_proj`, `fc2`) emit per-chip partials, `all_reduce` replicates the sum across chips, and then every chip redundantly runs the bias + gate-multiply + add-residual + LayerNorm work on the full `[SEQ, D_MODEL]` tensor. With TP=4 that residual-stream work is 4× redundant.
+
+Lever: keep the residual stream sharded along the sequence dimension between row-parallel and column-parallel matmuls.
+
+- After `fc2 @ W_row`, do `reduce_scatter` along seq instead of `all_reduce`. Each chip gets its own `[SEQ/4, D_MODEL]` slice.
+- Run bias add, gated residual, LayerNorm, and adaLN modulate on the local slice (4× less work per chip, no algorithmic change since these are all row-wise ops).
+- Before the next column-parallel matmul (e.g. qkv or fc1), `all_gather` along seq to re-replicate.
+
+Net comm cost is the same (`reduce_scatter` + `all_gather` ≡ `all_reduce` on the ring), but the elementwise/LN/modulate work between them is 4× smaller. With our current `bias_gated_residual_kernel` running redundantly on 4 chips, this should ~4× the residual-stream throughput. Same idea applies symmetrically to the `o_proj` + gate + LN + modulate stretch on the attention side.
+
+References: gemma and lingbot-world both use this pattern; deepseek's `inference.py` has the persistent-buffer + scatter/gather collectives idiom worth lifting. Risk: two collectives per stretch instead of one; need to confirm `reduce_scatter` + `all_gather` on FABRIC_1D_RING is at parity with `all_reduce` on our shapes.

@@ -1116,9 +1116,10 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
         fc2_out = ttnn.all_reduce(fc2_out, num_links=2)
     ttnn.add(fc2_out, dev["%s.fc2_b_f32" % prefix], output_tensor=scr["fc2"])
     gate_mlp = ttnn.slice(adaln_packed, [0, 5 * D_MODEL], [SEQ, 6 * D_MODEL])
-    # TODO: revisit TT-Lang gated_residual_kernel once it handles mixed f32/bf16 inputs.
-    # Currently using ttnn ops because the kernel rejects f32 residual + bf16 gate.
-    # Was: gated_residual_kernel(scr["z_scratch"], scr["fc2"], gate_mlp, scr["z_a"])
+    # Tried fusing the next 3 ops into bias_gated_residual_kernel (out = z + (fc2+b)*g);
+    # correct (PCC=1.0) but ~38ms/frame slower on these shapes (DRAM-resident inputs,
+    # naive 4-input read pattern beat by ttnn's optimized multi-core dispatch).
+    # Revisit once Q/K/V/residual stream lives in L1-sharded memory.
     ttnn.multiply(scr["fc2"], gate_mlp, output_tensor=scr["z_a"])
     ttnn.add(scr["z_scratch"], scr["z_a"], output_tensor=scr["z_a"])
     if _pcc_active:

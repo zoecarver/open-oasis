@@ -12,6 +12,8 @@ The FPS from the last committed run is the bar to beat. Find it by reading the m
 
 Load these skills: `tt-connect-remote-device`, `ttnn`, `tt-lang`.
 
+**Always use `sterling-all.conf`. Do not use `all.conf` or any other remote — they are shared with other people's work and you would disturb them.** If sterling is unreachable, pause and ask; do not silently fall back.
+
 ```
 export TT_REMOTE_CONF=/Users/zcarver/.claude/skills/tt-connect-remote-device/scripts/sterling-all.conf
 /Users/zcarver/.claude/skills/tt-connect-remote-device/scripts/smoke-test.sh
@@ -71,6 +73,10 @@ Weight loading might not be optimal, think about if there's anything we can push
 
 Another idea: look at how deepseek does tt-lang kernel caching, I think looking at the logs we are OK, but you could ensure that tt-lang kernels are not getting compiled eg per diffusion step (you'd see verbose cxx kernel emit logs between frames generated). If current kernel caching works, don't update it.
 
+Another idea: you can explore ../tt-metal to see how models improve perf there. Specifically, I think there's something called minimal_matmul which overlaps matmul and ccls. You could look for this and look for similar ops that might help improve perf. There has been a lot of work done on dit / video gen models (sources are in ../tt-metal) to get perf/utilization above 50%.
+
+VAE improvements (lower priority): currently not the bottleneck but may become eventually and we may want to lower diffusion steps which would increase how long this takes. See if you can improve the perf of the VAE decoder, metal should also have some references here.
+
 ## Prototyping kernels
 
 Prototype new kernels in isolation first. Drop a self-contained test in `/tmp/test_<thing>.py`, copy with `copy-file.sh`, run with `run-test.sh --hw`. Promote to `src/` only once it's correct against a torch reference and integrates cleanly.
@@ -78,3 +84,18 @@ Prototype new kernels in isolation first. Drop a self-contained test in `/tmp/te
 ## References
 
 `../deepseek` has battle-tested multi-chip TP, fused matmul+norm kernels, persistent-buffer trace patterns, and online-softmax/compressor kernels. Read `../deepseek/tt-lang-kernels/` for kernel idioms and `../deepseek/inference.py` for mesh+trace patterns. Don't copy verbatim — adapt to our shapes.
+
+Only these sibling directories are in scope for exploration:
+
+- `../tt-metal`
+- `../tt-lang`
+- `../engram`
+- `../nanochat`
+- `../tt-lang-import`
+- `../gemma` — multi-chip mesh reference (mesh setup, shard/replicate patterns)
+- `../lingbot-world` — multi-chip mesh reference
+
+## Other notes
+
+* We have a LOT of cores and L1, each core has about 1.5 MB of l1, we have about 130 cores on 4 chips, so 780 MB of L1 total, try to use it! In isolation you can measure how L1 sharded vs interleaved affects perf, specifically for datamovement (read/write) and ccls (eg all reduce).
+* Pipes can give some ops 2-3x perf boost or even more. You can see how ../tt-lang/benchmarks does this, it has an optimal matmul, if any of your kernels need a matmul, you can use this as a template, and use the mcast pattern throughout any time you're reading input tensors in tt-lang.
