@@ -798,15 +798,15 @@ def prealloc_scratch(tt_device, n_frames=2):
     # f32 spatial+temporal path: modulated cast to f32 feeds the f32 qkv matmul
     # whose output (qkv_full_f32) is consumed by the f32 rope+sdpa pipeline
     # (both spatial and temporal go through TT-Lang sdpa kernels).
-    s["modulated_f32"] = zeros_tt_f32((SEQ, D_MODEL), tt_device)
-    s["qkv_full_f32"] = zeros_tt_f32((SEQ, 5 * D_MODEL_TP), tt_device)
+    s["modulated_f32"] = zeros_l1_f32((SEQ, D_MODEL), tt_device)
+    s["qkv_full_f32"] = zeros_l1_f32((SEQ, 5 * D_MODEL_TP), tt_device)
     # f32 (1+scale) scratch for spatial modulate; avoids a bf16 round-trip
     # before the multiply.
     s["normed_f32"] = zeros_l1_f32((SEQ, D_MODEL), tt_device)
     s["o_proj"] = zeros_l1_f32((SEQ, D_MODEL), tt_device)
     s["fc2"] = zeros_l1_f32((SEQ, D_MODEL), tt_device)
     # f32 MLP scratches for the f32 path.
-    s["modulated_b_f32"] = zeros_tt_f32((SEQ, D_MODEL), tt_device)
+    s["modulated_b_f32"] = zeros_l1_f32((SEQ, D_MODEL), tt_device)
     s["gelu_f32"] = zeros_l1_f32((SEQ, D_MLP_TP), tt_device)
     # f32 adaln scratch: linear writes here so the spatial slices
     # (shift/scale/gate) stay f32 through modulate/gate ops.
@@ -886,12 +886,12 @@ def prealloc_scratch(tt_device, n_frames=2):
     # outputs are sliced away).
     # ============================================================
     s["t1_z_a"] = zeros_l1_f32((N_PATCH_PAD, D_MODEL), tt_device)
-    s["t1_modulated_f32"] = zeros_tt_f32((N_PATCH_PAD, D_MODEL), tt_device)
-    s["t1_qkv_full_f32"] = zeros_tt_f32((N_PATCH_PAD, 5 * D_MODEL_TP), tt_device)
+    s["t1_modulated_f32"] = zeros_l1_f32((N_PATCH_PAD, D_MODEL), tt_device)
+    s["t1_qkv_full_f32"] = zeros_l1_f32((N_PATCH_PAD, 5 * D_MODEL_TP), tt_device)
     s["t1_normed_f32"] = zeros_l1_f32((N_PATCH_PAD, D_MODEL), tt_device)
     s["t1_o_proj"] = zeros_l1_f32((N_PATCH_PAD, D_MODEL), tt_device)
     s["t1_fc2"] = zeros_l1_f32((N_PATCH_PAD, D_MODEL), tt_device)
-    s["t1_modulated_b_f32"] = zeros_tt_f32((N_PATCH_PAD, D_MODEL), tt_device)
+    s["t1_modulated_b_f32"] = zeros_l1_f32((N_PATCH_PAD, D_MODEL), tt_device)
     s["t1_gelu_f32"] = zeros_l1_f32((N_PATCH_PAD, D_MLP_TP), tt_device)
     s["t1_z_scratch"] = zeros_l1_f32((N_PATCH_PAD, D_MODEL), tt_device)
     s["t1_final_out_f32"] = zeros_l1_f32((N_PATCH_PAD, OUT_DIM), tt_device)
