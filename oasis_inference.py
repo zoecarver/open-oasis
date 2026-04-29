@@ -531,9 +531,12 @@ def preload_dit_weights(tt_device, n_frames=2):
         final_adaln_b_f32[D_MODEL:2 * D_MODEL] += 1.0
         dev["final_adaln_b_f32"] = to_tt_f32(final_adaln_b_f32.unsqueeze(0).expand(TILE, -1).contiguous(), tt_device)
         dev["final_linear_w_f32"] = to_tt_f32(st.get_tensor("final_layer.linear.weight").T.contiguous().float(), tt_device)
-        dev["final_linear_b_f32"] = to_tt_f32(expand_bias(st.get_tensor("final_layer.linear.bias").float(), N_PATCH_PAD * n_frames), tt_device)
+        # Biases stored as bf16: expand_bias() already lossy-casts to bf16 on host,
+        # so f32 storage was wasting 2x memory with no precision benefit. ttnn.add
+        # promotes bf16 -> f32 against the f32 matmul output.
+        dev["final_linear_b_f32"] = to_tt(expand_bias(st.get_tensor("final_layer.linear.bias").float(), N_PATCH_PAD * n_frames), tt_device)
         # T=1 (KV-cache step path) bias: only the current frame's N_PATCH_PAD rows.
-        dev["final_linear_b_t1_f32"] = to_tt_f32(expand_bias(st.get_tensor("final_layer.linear.bias").float(), N_PATCH_PAD), tt_device)
+        dev["final_linear_b_t1_f32"] = to_tt(expand_bias(st.get_tensor("final_layer.linear.bias").float(), N_PATCH_PAD), tt_device)
 
         # Per-block weights
         for i in range(N_BLOCKS):
@@ -582,9 +585,9 @@ def preload_dit_weights(tt_device, n_frames=2):
                         mesh_mapper=ttnn.ShardTensorToMesh(tt_device, dim=0))
                 else:
                     dev["%s.out_w_f32" % p] = to_tt_f32(out_w_f32, tt_device)
-                dev["%s.out_b_f32" % p] = to_tt_f32(expand_bias(out_b_f32, SEQ), tt_device)
+                dev["%s.out_b_f32" % p] = to_tt(expand_bias(out_b_f32, SEQ), tt_device)
                 # T=1 bias for KV-cache step path (current-frame rows only).
-                dev["%s.out_b_t1_f32" % p] = to_tt_f32(expand_bias(out_b_f32, N_PATCH_PAD), tt_device)
+                dev["%s.out_b_t1_f32" % p] = to_tt(expand_bias(out_b_f32, N_PATCH_PAD), tt_device)
 
                 # MLP (f32): fc1 column-parallel (shard output dim),
                 # fc2 row-parallel (shard input dim)
@@ -598,7 +601,7 @@ def preload_dit_weights(tt_device, n_frames=2):
                         device=tt_device, memory_config=ttnn.DRAM_MEMORY_CONFIG,
                         mesh_mapper=ttnn.ShardTensorToMesh(tt_device, dim=1))
                     dev["%s.fc1_b_f32" % p] = ttnn.from_torch(
-                        expand_bias(fc1_b_f32, SEQ), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+                        expand_bias(fc1_b_f32, SEQ), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
                         device=tt_device, memory_config=ttnn.DRAM_MEMORY_CONFIG,
                         mesh_mapper=ttnn.ShardTensorToMesh(tt_device, dim=1))
                     dev["%s.fc2_w_f32" % p] = ttnn.from_torch(
@@ -607,18 +610,18 @@ def preload_dit_weights(tt_device, n_frames=2):
                         mesh_mapper=ttnn.ShardTensorToMesh(tt_device, dim=0))
                 else:
                     dev["%s.fc1_w_f32" % p] = to_tt_f32(fc1_w_f32, tt_device)
-                    dev["%s.fc1_b_f32" % p] = to_tt_f32(expand_bias(fc1_b_f32, SEQ), tt_device)
+                    dev["%s.fc1_b_f32" % p] = to_tt(expand_bias(fc1_b_f32, SEQ), tt_device)
                     dev["%s.fc2_w_f32" % p] = to_tt_f32(fc2_w_f32, tt_device)
-                dev["%s.fc2_b_f32" % p] = to_tt_f32(expand_bias(fc2_b_f32, SEQ), tt_device)
+                dev["%s.fc2_b_f32" % p] = to_tt(expand_bias(fc2_b_f32, SEQ), tt_device)
                 # T=1 biases for KV-cache step path (current-frame rows only).
                 if N_CHIPS > 1:
                     dev["%s.fc1_b_t1_f32" % p] = ttnn.from_torch(
-                        expand_bias(fc1_b_f32, N_PATCH_PAD), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+                        expand_bias(fc1_b_f32, N_PATCH_PAD), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
                         device=tt_device, memory_config=ttnn.DRAM_MEMORY_CONFIG,
                         mesh_mapper=ttnn.ShardTensorToMesh(tt_device, dim=1))
                 else:
-                    dev["%s.fc1_b_t1_f32" % p] = to_tt_f32(expand_bias(fc1_b_f32, N_PATCH_PAD), tt_device)
-                dev["%s.fc2_b_t1_f32" % p] = to_tt_f32(expand_bias(fc2_b_f32, N_PATCH_PAD), tt_device)
+                    dev["%s.fc1_b_t1_f32" % p] = to_tt(expand_bias(fc1_b_f32, N_PATCH_PAD), tt_device)
+                dev["%s.fc2_b_t1_f32" % p] = to_tt(expand_bias(fc2_b_f32, N_PATCH_PAD), tt_device)
 
         # RoPE: load learned freqs from block 0 (shared across all blocks)
         global SPATIAL_ROPE_FREQS, TEMPORAL_ROPE_FREQS
