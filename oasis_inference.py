@@ -779,13 +779,14 @@ def prealloc_scratch(tt_device, n_frames=2):
         **_mesh_kwargs(tt_device))
     # Temporal SDPA: full f32 IO + f32 acc via TT-Lang sdpa_causal kernel.
     # rope_temporal writes f32 q/k/v here (kernel auto-handles f32 via DFBs).
-    s["t_q_scratch"] = zeros_tt_f32((SEQ, D_MODEL_TP), tt_device)
-    s["t_k_scratch"] = zeros_tt_f32((SEQ, D_MODEL_TP), tt_device)
-    s["t_v_scratch"] = zeros_tt_f32((SEQ, D_MODEL_TP), tt_device)
+    # L1: ~327KB each (SEQ=320 * D_MODEL_TP=256 * 4B), interleaved across cores.
+    s["t_q_scratch"] = zeros_l1_f32((SEQ, D_MODEL_TP), tt_device)
+    s["t_k_scratch"] = zeros_l1_f32((SEQ, D_MODEL_TP), tt_device)
+    s["t_v_scratch"] = zeros_l1_f32((SEQ, D_MODEL_TP), tt_device)
     # Output for packed temporal SDPA: (TEMPORAL_BATCH_PACKED * T_PADDED, D_HEAD).
     # 16x smaller than the old per-(p,h) layout because 16 (p,h) groups share
-    # one super-batch via block-diagonal mask packing.
-    s["sdpa_temp_out_f32"] = zeros_tt_f32((TEMPORAL_BATCH_PACKED * T_PADDED, D_HEAD), tt_device)
+    # one super-batch via block-diagonal mask packing. ~320KB in L1.
+    s["sdpa_temp_out_f32"] = zeros_l1_f32((TEMPORAL_BATCH_PACKED * T_PADDED, D_HEAD), tt_device)
     s["sdpa_temp_attn_scratch_f32"] = ttnn.from_torch(
         torch.zeros(T_PADDED, T_PADDED, dtype=torch.float32),
         dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
