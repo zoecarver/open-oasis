@@ -61,6 +61,16 @@ Don't run `pkill`, `tt-smi -r`, or any recovery commands. If you suspect a hang 
 
 `docs/perf_levers_temporal_sdpa.md` enumerates the 5 biggest known temporal-SDPA opportunities, ranked, with pointers to relevant existing kernels (`src/rope_layout_kernel.py`, `pipe_examples/test_broadcast_2d.py`) and to deepseek references.
 
+Fusing more into tt-lang is a great idea. A sub-goal of this is to show tt-lang powering the model. You can write tt-lang mega kernels, and the user is happy to help with that. tt-lang will often immediately give perf wins, but also has a suit of perf tools that make optimization easier, if you want help optimizing tt-lang, ask the user. Once code is in tt-lang, it's much easier to optimize as there are more levers and more tools to assist.
+
+You can also grep for commits that improved perf a lot. You can also reference ../deepseek and the referenced projects there. Deepseek has a number of great commits that are self contained perf improvements, that might help you identify targets and give you a good reference to replicate. 
+
+Tracing might not be optimal, think about if we could trace bigger blocks.
+
+Weight loading might not be optimal, think about if there's anything we can push to load time or any way to store weights more efficiently (eg sharded).
+
+Another idea: look at how deepseek does tt-lang kernel caching, I think looking at the logs we are OK, but you could ensure that tt-lang kernels are not getting compiled eg per diffusion step (you'd see verbose cxx kernel emit logs between frames generated). If current kernel caching works, don't update it.
+
 ## Prototyping kernels
 
 Prototype new kernels in isolation first. Drop a self-contained test in `/tmp/test_<thing>.py`, copy with `copy-file.sh`, run with `run-test.sh --hw`. Promote to `src/` only once it's correct against a torch reference and integrates cleanly.

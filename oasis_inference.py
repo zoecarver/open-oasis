@@ -194,15 +194,19 @@ vae_rope_fused = make_vae_rope_kernel(VAE_DEC_HEADS, VAE_D_HEAD // TILE)
 # multi-tile reduce behavior. Matches torch PCC ~= 1.0 vs ttnn SDPA's ~0.9998.
 sdpa_spatial = make_sdpa_kernel(N_PATCH_PAD // TILE, N_PATCH_PAD // TILE,
                                 D_HEAD // TILE, 1.0 / math.sqrt(D_HEAD))
-# TT-Lang temporal SDPA: causal mask via additive bias DFB. Seq is T frames
-# padded to one tile (T_PADDED=TILE). total_heads passed explicitly because
-# the input tensor's logical T_LOGICAL < TILE makes shape-inference wrong.
+# TT-Lang temporal SDPA: block-diagonal batch packing. T_PADDED=TILE rows hold
+# T_PADDED/T pairs of (p,h) groups stacked vertically, with the bias mask
+# masking cross-pair attention to -1e4 (effectively zero softmax weight).
+# This collapses 640 wasted-padding-rows attention calls into 40 fully-packed
+# calls. Bias is precomputed once (same for every super-batch).
 T_PADDED = TILE
-TEMPORAL_BATCH = N_PATCH_PAD * N_HEADS_TP
+N_FRAMES_TP = 2  # Sliding window: 1 context + 1 generated frame
+PACK_GROUPS_PER_BATCH = T_PADDED // N_FRAMES_TP  # 16 (p,h) pairs per super-batch
+TEMPORAL_BATCH_PACKED = (N_PATCH_PAD * N_HEADS_TP) // PACK_GROUPS_PER_BATCH  # 40
 sdpa_temporal_causal = make_sdpa_causal_kernel(
     sq_tiles=T_PADDED // TILE, skv_tiles=T_PADDED // TILE,
     head_tiles=D_HEAD // TILE, scale_val=1.0 / math.sqrt(D_HEAD),
-    total_heads=TEMPORAL_BATCH)
+    total_heads=TEMPORAL_BATCH_PACKED)
 
 
 # ============================================================
@@ -778,12 +782,10 @@ def prealloc_scratch(tt_device, n_frames=2):
     s["t_q_scratch"] = zeros_tt_f32((SEQ, D_MODEL_TP), tt_device)
     s["t_k_scratch"] = zeros_tt_f32((SEQ, D_MODEL_TP), tt_device)
     s["t_v_scratch"] = zeros_tt_f32((SEQ, D_MODEL_TP), tt_device)
-    # Per-head SDPA-layout scratches: (BATCH_T, T_padded=TILE, D_HEAD) f32
-    # filled via ttnn pad/permute from the per-frame rope output above.
-    s["q_sdpa_temp_f32"] = zeros_tt_f32((TEMPORAL_BATCH * T_PADDED, D_HEAD), tt_device)
-    s["k_sdpa_temp_f32"] = zeros_tt_f32((TEMPORAL_BATCH * T_PADDED, D_HEAD), tt_device)
-    s["v_sdpa_temp_f32"] = zeros_tt_f32((TEMPORAL_BATCH * T_PADDED, D_HEAD), tt_device)
-    s["sdpa_temp_out_f32"] = zeros_tt_f32((TEMPORAL_BATCH * T_PADDED, D_HEAD), tt_device)
+    # Output for packed temporal SDPA: (TEMPORAL_BATCH_PACKED * T_PADDED, D_HEAD).
+    # 16x smaller than the old per-(p,h) layout because 16 (p,h) groups share
+    # one super-batch via block-diagonal mask packing.
+    s["sdpa_temp_out_f32"] = zeros_tt_f32((TEMPORAL_BATCH_PACKED * T_PADDED, D_HEAD), tt_device)
     s["sdpa_temp_attn_scratch_f32"] = ttnn.from_torch(
         torch.zeros(T_PADDED, T_PADDED, dtype=torch.float32),
         dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
@@ -794,14 +796,16 @@ def prealloc_scratch(tt_device, n_frames=2):
         dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
         device=tt_device, memory_config=ttnn.L1_MEMORY_CONFIG,
         **_mesh_kwargs(tt_device))
-    # Causal + padding bias: -inf at (j > i) or (j >= T_LOGICAL). Same mask
-    # for every batch_head; loaded once at startup. T_LOGICAL is the actual
-    # frames-in-window count (= T = n_frames here, ctx+gen). Padding rows
-    # i >= T are left unmasked so their softmax denominator stays finite.
+    # Block-diagonal causal bias: T_PADDED=32 rows = 16 (p,h) pairs of T=2.
+    # Within pair (rows 2g, 2g+1 vs keys 2g, 2g+1): causal (k>q masked).
+    # Across pairs: -1e4 to suppress cross-pair attention via softmax.
+    # Same mask for every super-batch; loaded once at startup.
     _temp_bias = torch.zeros(T_PADDED, T_PADDED, dtype=torch.float32)
-    for _qi in range(n_frames):
+    for _qi in range(T_PADDED):
         for _kj in range(T_PADDED):
-            if _kj > _qi or _kj >= n_frames:
+            if (_qi // n_frames) != (_kj // n_frames):
+                _temp_bias[_qi, _kj] = -1e4
+            elif (_kj % n_frames) > (_qi % n_frames):
                 _temp_bias[_qi, _kj] = -1e4
     s["sdpa_temp_bias_f32"] = ttnn.from_torch(
         _temp_bias, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
@@ -1019,14 +1023,15 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
         if _do_dev_profile:
             ttnn.synchronize_device(tt_device)
             _t1 = _dt.time(); print("      %s rope_temporal: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
-        BATCH_T = N_PATCH_PAD * N_HEADS_TP
+        # Block-diagonal packed layout: 16 (p,h) groups × T=2 frames stack into
+        # one super-batch of T_PADDED=32 rows. No pad needed (T*16 == T_PADDED).
+        # Bias is precomputed block-diagonal causal mask.
+        TOTAL_FLAT = N_PATCH_PAD * N_HEADS_TP * T  # 1280
 
         def _to_sdpa_layout(scratch_2d):
             x = ttnn.reshape(scratch_2d, [T, N_PATCH_PAD, N_HEADS_TP, D_HEAD])
             x = ttnn.permute(x, [1, 2, 0, 3])
-            x = ttnn.reshape(x, [BATCH_T, T, D_HEAD])
-            x = ttnn.pad(x, [(0, 0), (0, T_PADDED - T), (0, 0)], 0.0)
-            return ttnn.reshape(x, [BATCH_T * T_PADDED, D_HEAD])
+            return ttnn.reshape(x, [TOTAL_FLAT, D_HEAD])
 
         q_sdpa = _to_sdpa_layout(scr["t_q_scratch"])
         k_sdpa = _to_sdpa_layout(scr["t_k_scratch"])
@@ -1042,10 +1047,9 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
         if _do_dev_profile:
             ttnn.synchronize_device(tt_device)
             _t1 = _dt.time(); print("      %s sdpa_kernel: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
-        # Reverse layout: (BATCH_T*T_PADDED, D_HEAD) -> (T*P, H*D_HEAD)
-        out = ttnn.reshape(scr["sdpa_temp_out_f32"], [BATCH_T, T_PADDED, D_HEAD])
-        out = ttnn.slice(out, [0, 0, 0], [BATCH_T, T, D_HEAD])
-        out = ttnn.reshape(out, [N_PATCH_PAD, N_HEADS_TP, T, D_HEAD])
+        # Reverse layout: (TEMPORAL_BATCH_PACKED * T_PADDED, D_HEAD) -> (T*P, H*D_HEAD)
+        # 1280 rows = (P, H, T, D) directly, then permute to (T, P, H, D).
+        out = ttnn.reshape(scr["sdpa_temp_out_f32"], [N_PATCH_PAD, N_HEADS_TP, T, D_HEAD])
         out = ttnn.permute(out, [2, 0, 1, 3])
         attn_2d = ttnn.reshape(out, [SEQ, D_MODEL_TP])
         _timer.mark("sdpa")
