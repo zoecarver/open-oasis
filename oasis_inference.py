@@ -532,6 +532,8 @@ def preload_dit_weights(tt_device, n_frames=2):
         dev["final_adaln_b_f32"] = to_tt_f32(final_adaln_b_f32.unsqueeze(0).expand(TILE, -1).contiguous(), tt_device)
         dev["final_linear_w_f32"] = to_tt_f32(st.get_tensor("final_layer.linear.weight").T.contiguous().float(), tt_device)
         dev["final_linear_b_f32"] = to_tt_f32(expand_bias(st.get_tensor("final_layer.linear.bias").float(), N_PATCH_PAD * n_frames), tt_device)
+        # T=1 (KV-cache step path) bias: only the current frame's N_PATCH_PAD rows.
+        dev["final_linear_b_t1_f32"] = to_tt_f32(expand_bias(st.get_tensor("final_layer.linear.bias").float(), N_PATCH_PAD), tt_device)
 
         # Per-block weights
         for i in range(N_BLOCKS):
@@ -581,6 +583,8 @@ def preload_dit_weights(tt_device, n_frames=2):
                 else:
                     dev["%s.out_w_f32" % p] = to_tt_f32(out_w_f32, tt_device)
                 dev["%s.out_b_f32" % p] = to_tt_f32(expand_bias(out_b_f32, SEQ), tt_device)
+                # T=1 bias for KV-cache step path (current-frame rows only).
+                dev["%s.out_b_t1_f32" % p] = to_tt_f32(expand_bias(out_b_f32, N_PATCH_PAD), tt_device)
 
                 # MLP (f32): fc1 column-parallel (shard output dim),
                 # fc2 row-parallel (shard input dim)
@@ -606,6 +610,15 @@ def preload_dit_weights(tt_device, n_frames=2):
                     dev["%s.fc1_b_f32" % p] = to_tt_f32(expand_bias(fc1_b_f32, SEQ), tt_device)
                     dev["%s.fc2_w_f32" % p] = to_tt_f32(fc2_w_f32, tt_device)
                 dev["%s.fc2_b_f32" % p] = to_tt_f32(expand_bias(fc2_b_f32, SEQ), tt_device)
+                # T=1 biases for KV-cache step path (current-frame rows only).
+                if N_CHIPS > 1:
+                    dev["%s.fc1_b_t1_f32" % p] = ttnn.from_torch(
+                        expand_bias(fc1_b_f32, N_PATCH_PAD), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+                        device=tt_device, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                        mesh_mapper=ttnn.ShardTensorToMesh(tt_device, dim=1))
+                else:
+                    dev["%s.fc1_b_t1_f32" % p] = to_tt_f32(expand_bias(fc1_b_f32, N_PATCH_PAD), tt_device)
+                dev["%s.fc2_b_t1_f32" % p] = to_tt_f32(expand_bias(fc2_b_f32, N_PATCH_PAD), tt_device)
 
         # RoPE: load learned freqs from block 0 (shared across all blocks)
         global SPATIAL_ROPE_FREQS, TEMPORAL_ROPE_FREQS
@@ -623,6 +636,10 @@ def preload_dit_weights(tt_device, n_frames=2):
         dev["spatial_cos_f32"], dev["spatial_sin_perm_f32"] = \
             build_spatial_rope_device_tables(SPATIAL_ROPE_FREQS, n_frames, tt_device,
                                              dtype=torch.float32)
+        # T=1 spatial RoPE tables for KV-cache path (single-frame block).
+        dev["spatial_cos_t1_f32"], dev["spatial_sin_perm_t1_f32"] = \
+            build_spatial_rope_device_tables(SPATIAL_ROPE_FREQS, 1, tt_device,
+                                             dtype=torch.float32)
 
         # Device-side temporal RoPE tables: per-frame freqs broadcast to all patches
         # For T frames: frame t uses temporal_freqs[t], broadcast across N_PATCH_PAD rows
@@ -634,6 +651,20 @@ def preload_dit_weights(tt_device, n_frames=2):
         dev["temporal_cos"], dev["temporal_sin_perm"] = \
             build_rope_device_tables(temporal_expanded, n_frames * N_PATCH_PAD,
                                      N_PATCH_PAD, N_HEADS_TP, n_frames, tt_device,
+                                     dtype=torch.float32)
+        # T=1 temporal RoPE tables for KV-cache path: past frame uses
+        # frame-0 freqs, current frame uses frame-1 freqs, both as (N_PATCH_PAD, 64).
+        past_temporal_expanded = TEMPORAL_ROPE_FREQS[0:1].expand(
+            N_PATCH_PAD, TEMPORAL_ROPE_DIM).contiguous()
+        curr_temporal_expanded = TEMPORAL_ROPE_FREQS[1:2].expand(
+            N_PATCH_PAD, TEMPORAL_ROPE_DIM).contiguous()
+        dev["temporal_cos_past_t1"], dev["temporal_sin_perm_past_t1"] = \
+            build_rope_device_tables(past_temporal_expanded, N_PATCH_PAD,
+                                     N_PATCH_PAD, N_HEADS_TP, 1, tt_device,
+                                     dtype=torch.float32)
+        dev["temporal_cos_curr_t1"], dev["temporal_sin_perm_curr_t1"] = \
+            build_rope_device_tables(curr_temporal_expanded, N_PATCH_PAD,
+                                     N_PATCH_PAD, N_HEADS_TP, 1, tt_device,
                                      dtype=torch.float32)
 
     elapsed = time.time() - t0
@@ -845,6 +876,50 @@ def prealloc_scratch(tt_device, n_frames=2):
         device=tt_device, memory_config=ttnn.L1_MEMORY_CONFIG,
         **_mesh_kwargs(tt_device))
     s["final_out_f32"] = zeros_l1_f32((SEQ, OUT_DIM), tt_device)
+
+    # ============================================================
+    # KV-cache step path scratches (T=1, current-frame-only).
+    # Past frame's K,V at every temporal sub-block are precomputed once per
+    # video frame and reused across all DDIM steps. Current frame's forward
+    # operates on N_PATCH_PAD rows; temporal SDPA still uses the full T=2
+    # packed layout but with current-only Q (junk at past positions, those
+    # outputs are sliced away).
+    # ============================================================
+    s["t1_z_a"] = zeros_l1_f32((N_PATCH_PAD, D_MODEL), tt_device)
+    s["t1_modulated_f32"] = zeros_tt_f32((N_PATCH_PAD, D_MODEL), tt_device)
+    s["t1_qkv_full_f32"] = zeros_tt_f32((N_PATCH_PAD, 5 * D_MODEL_TP), tt_device)
+    s["t1_normed_f32"] = zeros_l1_f32((N_PATCH_PAD, D_MODEL), tt_device)
+    s["t1_o_proj"] = zeros_l1_f32((N_PATCH_PAD, D_MODEL), tt_device)
+    s["t1_fc2"] = zeros_l1_f32((N_PATCH_PAD, D_MODEL), tt_device)
+    s["t1_modulated_b_f32"] = zeros_tt_f32((N_PATCH_PAD, D_MODEL), tt_device)
+    s["t1_gelu_f32"] = zeros_l1_f32((N_PATCH_PAD, D_MLP_TP), tt_device)
+    s["t1_z_scratch"] = zeros_l1_f32((N_PATCH_PAD, D_MODEL), tt_device)
+    s["t1_final_out_f32"] = zeros_l1_f32((N_PATCH_PAD, OUT_DIM), tt_device)
+
+    # T=1 RoPE outputs for past pass (no SDPA needed since attn=V) and for
+    # current pass (output gets concat with cached past before pack/SDPA).
+    s["t1_q_curr_f32"] = zeros_l1_f32((N_PATCH_PAD, D_MODEL_TP), tt_device)
+    s["t1_k_curr_f32"] = zeros_l1_f32((N_PATCH_PAD, D_MODEL_TP), tt_device)
+    s["t1_v_curr_f32"] = zeros_l1_f32((N_PATCH_PAD, D_MODEL_TP), tt_device)
+
+    # Spatial SDPA scratches for T=1 (BATCH_S = N_HEADS_TP, half of T=2).
+    BATCH_S_T1 = N_HEADS_TP
+    s["t1_q_sdpa_f32"] = zeros_l1_f32((BATCH_S_T1 * N_PATCH_PAD, D_HEAD), tt_device)
+    s["t1_k_sdpa_f32"] = zeros_l1_f32((BATCH_S_T1 * N_PATCH_PAD, D_HEAD), tt_device)
+    s["t1_v_sdpa_f32"] = zeros_l1_f32((BATCH_S_T1 * N_PATCH_PAD, D_HEAD), tt_device)
+    s["t1_sdpa_heads_out_f32"] = zeros_l1_f32((BATCH_S_T1 * N_PATCH_PAD, D_HEAD), tt_device)
+
+    # Cached past K,V at each of the 16 temporal sub-blocks. (N_PATCH_PAD, D_MODEL_TP).
+    # Filled by precompute_past_state once per video frame; read by
+    # dit_forward_currentonly at every DDIM step.
+    for bi in range(N_BLOCKS):
+        s["t1_past_k_%d" % bi] = zeros_l1_f32((N_PATCH_PAD, D_MODEL_TP), tt_device)
+        s["t1_past_v_%d" % bi] = zeros_l1_f32((N_PATCH_PAD, D_MODEL_TP), tt_device)
+    # Past-position Q padding for the packed T=2 SDPA kernel: zeros, never
+    # changes; current Q gets concatenated below it. Past-position outputs are
+    # discarded after SDPA so the values don't matter as long as softmax is stable.
+    s["t1_q_zeros_pad_f32"] = zeros_l1_f32((N_PATCH_PAD, D_MODEL_TP), tt_device)
+
     # Pre-allocated SiLU output buffers per frame (L1 for fast access, read 32x/step).
     # f32 so silu runs end-to-end f32 and feeds f32 adaln without a typecast.
     for f in range(n_frames):
