@@ -813,11 +813,12 @@ def prealloc_scratch(tt_device, n_frames=2):
         device=tt_device, memory_config=ttnn.L1_MEMORY_CONFIG,
         **_mesh_kwargs(tt_device))
     # f32 spatial SDPA: rope writes f32 Q/K/V directly; sdpa_spatial reads them.
+    # L1: ~320KB each (8 * 160 * 64 * 4B). Saves a DRAM round-trip per spatial sub-block.
     BATCH_S = n_frames * N_HEADS_TP
-    s["q_sdpa_f32"] = zeros_tt_f32((BATCH_S * N_PATCH_PAD, D_HEAD), tt_device)
-    s["k_sdpa_f32"] = zeros_tt_f32((BATCH_S * N_PATCH_PAD, D_HEAD), tt_device)
-    s["v_sdpa_f32"] = zeros_tt_f32((BATCH_S * N_PATCH_PAD, D_HEAD), tt_device)
-    s["sdpa_heads_out_f32"] = zeros_tt_f32((BATCH_S * N_PATCH_PAD, D_HEAD), tt_device)
+    s["q_sdpa_f32"] = zeros_l1_f32((BATCH_S * N_PATCH_PAD, D_HEAD), tt_device)
+    s["k_sdpa_f32"] = zeros_l1_f32((BATCH_S * N_PATCH_PAD, D_HEAD), tt_device)
+    s["v_sdpa_f32"] = zeros_l1_f32((BATCH_S * N_PATCH_PAD, D_HEAD), tt_device)
+    s["sdpa_heads_out_f32"] = zeros_l1_f32((BATCH_S * N_PATCH_PAD, D_HEAD), tt_device)
     s["sdpa_attn_scratch_f32"] = ttnn.from_torch(
         torch.zeros(N_PATCH_PAD, N_PATCH_PAD, dtype=torch.float32),
         dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
@@ -1449,7 +1450,7 @@ def bridge_unpatchify(dit_output, bridge, bridge_tmp, vae_input):
 if __name__ == "__main__":
     # Multi-chip: enable fabric for inter-chip collectives
     if N_CHIPS > 1:
-        ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D, ttnn.FabricReliabilityMode.RELAXED_INIT)
+        ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D_RING, ttnn.FabricReliabilityMode.RELAXED_INIT)
         tt_device = ttnn.open_mesh_device(ttnn.MeshShape(1, N_CHIPS),
                                            trace_region_size=500000000)
         _MESH_DEVICE = tt_device
