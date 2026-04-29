@@ -81,6 +81,7 @@ from vae_rope import make_vae_rope_kernel
 from adaln_matmul_expand import make_adaln_matmul_expand_kernel
 from rope_layout_kernel import make_rope_layout_kernel, make_rope_temporal_kernel
 from sdpa import make_sdpa_kernel
+from sdpa_causal import make_sdpa_causal_kernel
 
 # ============================================================
 # Constants
@@ -193,6 +194,15 @@ vae_rope_fused = make_vae_rope_kernel(VAE_DEC_HEADS, VAE_D_HEAD // TILE)
 # multi-tile reduce behavior. Matches torch PCC ~= 1.0 vs ttnn SDPA's ~0.9998.
 sdpa_spatial = make_sdpa_kernel(N_PATCH_PAD // TILE, N_PATCH_PAD // TILE,
                                 D_HEAD // TILE, 1.0 / math.sqrt(D_HEAD))
+# TT-Lang temporal SDPA: causal mask via additive bias DFB. Seq is T frames
+# padded to one tile (T_PADDED=TILE). total_heads passed explicitly because
+# the input tensor's logical T_LOGICAL < TILE makes shape-inference wrong.
+T_PADDED = TILE
+TEMPORAL_BATCH = N_PATCH_PAD * N_HEADS_TP
+sdpa_temporal_causal = make_sdpa_causal_kernel(
+    sq_tiles=T_PADDED // TILE, skv_tiles=T_PADDED // TILE,
+    head_tiles=D_HEAD // TILE, scale_val=1.0 / math.sqrt(D_HEAD),
+    total_heads=TEMPORAL_BATCH)
 
 
 # ============================================================
@@ -612,7 +622,8 @@ def preload_dit_weights(tt_device, n_frames=2):
             n_frames * N_PATCH_PAD, TEMPORAL_ROPE_DIM)  # (SEQ, 64)
         dev["temporal_cos"], dev["temporal_sin_perm"] = \
             build_rope_device_tables(temporal_expanded, n_frames * N_PATCH_PAD,
-                                     N_PATCH_PAD, N_HEADS_TP, n_frames, tt_device)
+                                     N_PATCH_PAD, N_HEADS_TP, n_frames, tt_device,
+                                     dtype=torch.float32)
 
     elapsed = time.time() - t0
     print("Preloaded %d tensors in %.1fs" % (len(dev), elapsed))
@@ -742,11 +753,9 @@ def prealloc_scratch(tt_device, n_frames=2):
     # Residual-carrying tensors (z_a, z_scratch, o_proj, fc2) are f32 to preserve
     # cond-uncond signal across 16 blocks (bf16 accumulation destroys it).
     s["z_a"] = zeros_l1_f32((SEQ, D_MODEL), tt_device)
-    # bf16 qkv_full: typecast destination for the temporal SDPA bf16 boundary.
-    s["qkv_full"] = zeros_l1((SEQ, 5 * D_MODEL_TP), tt_device)
     # f32 spatial+temporal path: modulated cast to f32 feeds the f32 qkv matmul
     # whose output (qkv_full_f32) is consumed by the f32 rope+sdpa pipeline
-    # (spatial) or downcast to bf16 qkv_full at the temporal SDPA boundary.
+    # (both spatial and temporal go through TT-Lang sdpa kernels).
     s["modulated_f32"] = zeros_tt_f32((SEQ, D_MODEL), tt_device)
     s["qkv_full_f32"] = zeros_tt_f32((SEQ, 5 * D_MODEL_TP), tt_device)
     # f32 (1+scale) scratch for spatial modulate; avoids a bf16 round-trip
@@ -764,11 +773,40 @@ def prealloc_scratch(tt_device, n_frames=2):
         dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
         device=tt_device, memory_config=ttnn.L1_MEMORY_CONFIG,
         **_mesh_kwargs(tt_device))
-    # Temporal SDPA scratch (bf16 forced by ttnn SDPA): rope_temporal writes
-    # bf16 q/k/v here from the bf16 qkv_full typecast above.
-    s["t_q_scratch"] = zeros_l1((SEQ, D_MODEL_TP), tt_device)
-    s["t_k_scratch"] = zeros_l1((SEQ, D_MODEL_TP), tt_device)
-    s["t_v_scratch"] = zeros_l1((SEQ, D_MODEL_TP), tt_device)
+    # Temporal SDPA: full f32 IO + f32 acc via TT-Lang sdpa_causal kernel.
+    # rope_temporal writes f32 q/k/v here (kernel auto-handles f32 via DFBs).
+    s["t_q_scratch"] = zeros_tt_f32((SEQ, D_MODEL_TP), tt_device)
+    s["t_k_scratch"] = zeros_tt_f32((SEQ, D_MODEL_TP), tt_device)
+    s["t_v_scratch"] = zeros_tt_f32((SEQ, D_MODEL_TP), tt_device)
+    # Per-head SDPA-layout scratches: (BATCH_T, T_padded=TILE, D_HEAD) f32
+    # filled via ttnn pad/permute from the per-frame rope output above.
+    s["q_sdpa_temp_f32"] = zeros_tt_f32((TEMPORAL_BATCH * T_PADDED, D_HEAD), tt_device)
+    s["k_sdpa_temp_f32"] = zeros_tt_f32((TEMPORAL_BATCH * T_PADDED, D_HEAD), tt_device)
+    s["v_sdpa_temp_f32"] = zeros_tt_f32((TEMPORAL_BATCH * T_PADDED, D_HEAD), tt_device)
+    s["sdpa_temp_out_f32"] = zeros_tt_f32((TEMPORAL_BATCH * T_PADDED, D_HEAD), tt_device)
+    s["sdpa_temp_attn_scratch_f32"] = ttnn.from_torch(
+        torch.zeros(T_PADDED, T_PADDED, dtype=torch.float32),
+        dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+        device=tt_device, memory_config=ttnn.L1_MEMORY_CONFIG,
+        **_mesh_kwargs(tt_device))
+    s["sdpa_temp_scaler_f32"] = ttnn.from_torch(
+        torch.ones(TILE, TILE, dtype=torch.float32),
+        dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+        device=tt_device, memory_config=ttnn.L1_MEMORY_CONFIG,
+        **_mesh_kwargs(tt_device))
+    # Causal + padding bias: -inf at (j > i) or (j >= T_LOGICAL). Same mask
+    # for every batch_head; loaded once at startup. T_LOGICAL is the actual
+    # frames-in-window count (= T = n_frames here, ctx+gen). Padding rows
+    # i >= T are left unmasked so their softmax denominator stays finite.
+    _temp_bias = torch.zeros(T_PADDED, T_PADDED, dtype=torch.float32)
+    for _qi in range(n_frames):
+        for _kj in range(T_PADDED):
+            if _kj > _qi or _kj >= n_frames:
+                _temp_bias[_qi, _kj] = -1e4
+    s["sdpa_temp_bias_f32"] = ttnn.from_torch(
+        _temp_bias, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+        device=tt_device, memory_config=ttnn.L1_MEMORY_CONFIG,
+        **_mesh_kwargs(tt_device))
     # f32 spatial SDPA: rope writes f32 Q/K/V directly; sdpa_spatial reads them.
     BATCH_S = n_frames * N_HEADS_TP
     s["q_sdpa_f32"] = zeros_tt_f32((BATCH_S * N_PATCH_PAD, D_HEAD), tt_device)
@@ -973,34 +1011,34 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
             _pcc_stash("attn_2d", attn_2d)
         _timer.mark("qkv+sdpa")
     else:
-        # Temporal: ttnn SDPA only accepts bf16 inputs, so we downcast at the
-        # attention boundary. Modulate + qkv matmul above ran in f32, so the
-        # bf16 qkv_full is produced from f32 internal computation (more accurate
-        # than bf16-in/bf16-out matmul). After SDPA, cast back to f32 for the
-        # f32 o_proj + MLP + residual chain.
-        # TODO: route temporal through a causal TT-Lang sdpa kernel (fork of
-        # src/sdpa.py with a causal mask) so Q/K/V/softmax stay f32. Would
-        # eliminate the bf16 boundary the ttnn SDPA forces.
-        ttnn.typecast(scr["qkv_full_f32"], ttnn.bfloat16, output_tensor=scr["qkv_full"])
-        rope_temporal(scr["qkv_full"], dev["temporal_cos"], dev["temporal_sin_perm"],
+        # Temporal: full f32 IO + f32 acc via TT-Lang sdpa_causal kernel.
+        # rope_temporal kernel auto-handles f32 (DFBs inherit from input).
+        rope_temporal(scr["qkv_full_f32"],
+                      dev["temporal_cos"], dev["temporal_sin_perm"],
                       scr["t_q_scratch"], scr["t_k_scratch"], scr["t_v_scratch"])
         BATCH_T = N_PATCH_PAD * N_HEADS_TP
-        q_t = ttnn.reshape(scr["t_q_scratch"], [T, BATCH_T, D_HEAD])
-        q_t = ttnn.permute(q_t, [1, 0, 2])
-        q_t = ttnn.reshape(q_t, [BATCH_T, 1, T, D_HEAD])
-        k_t = ttnn.reshape(scr["t_k_scratch"], [T, BATCH_T, D_HEAD])
-        k_t = ttnn.permute(k_t, [1, 0, 2])
-        k_t = ttnn.reshape(k_t, [BATCH_T, 1, T, D_HEAD])
-        v_t = ttnn.reshape(scr["t_v_scratch"], [T, BATCH_T, D_HEAD])
-        v_t = ttnn.permute(v_t, [1, 0, 2])
-        v_t = ttnn.reshape(v_t, [BATCH_T, 1, T, D_HEAD])
-        attn_out = ttnn.transformer.scaled_dot_product_attention(
-            q_t, k_t, v_t, is_causal=True, compute_kernel_config=COMPUTE_HIFI,
-            program_config=_sdpa_cfg(TILE, TILE))
-        attn_out = ttnn.reshape(attn_out, [BATCH_T, T, D_HEAD])
-        attn_out = ttnn.permute(attn_out, [1, 0, 2])
-        attn_2d_bf16 = ttnn.reshape(attn_out, [SEQ, D_MODEL_TP])
-        attn_2d = ttnn.typecast(attn_2d_bf16, ttnn.float32)
+
+        def _to_sdpa_layout(scratch_2d):
+            x = ttnn.reshape(scratch_2d, [T, N_PATCH_PAD, N_HEADS_TP, D_HEAD])
+            x = ttnn.permute(x, [1, 2, 0, 3])
+            x = ttnn.reshape(x, [BATCH_T, T, D_HEAD])
+            x = ttnn.pad(x, [(0, 0), (0, T_PADDED - T), (0, 0)], 0.0)
+            return ttnn.reshape(x, [BATCH_T * T_PADDED, D_HEAD])
+
+        q_sdpa = _to_sdpa_layout(scr["t_q_scratch"])
+        k_sdpa = _to_sdpa_layout(scr["t_k_scratch"])
+        v_sdpa = _to_sdpa_layout(scr["t_v_scratch"])
+        sdpa_temporal_causal(q_sdpa, k_sdpa, v_sdpa,
+                             scr["sdpa_temp_scaler_f32"],
+                             scr["sdpa_temp_bias_f32"],
+                             scr["sdpa_temp_attn_scratch_f32"],
+                             scr["sdpa_temp_out_f32"])
+        # Reverse layout: (BATCH_T*T_PADDED, D_HEAD) -> (T*P, H*D_HEAD)
+        out = ttnn.reshape(scr["sdpa_temp_out_f32"], [BATCH_T, T_PADDED, D_HEAD])
+        out = ttnn.slice(out, [0, 0, 0], [BATCH_T, T, D_HEAD])
+        out = ttnn.reshape(out, [N_PATCH_PAD, N_HEADS_TP, T, D_HEAD])
+        out = ttnn.permute(out, [2, 0, 1, 3])
+        attn_2d = ttnn.reshape(out, [SEQ, D_MODEL_TP])
         _timer.mark("sdpa")
     if _do_dev_profile:
         ttnn.synchronize_device(tt_device)
@@ -1451,17 +1489,16 @@ if __name__ == "__main__":
     alphas = 1.0 - betas
     alphas_cumprod = torch.cumprod(alphas, dim=0)  # (1000,)
 
-    # Synthetic actions, one at a time. Frame 0 is the prompt (zero action).
-    # Frames 1-75:    turn left (cameraY = -0.125 = real-data median yaw).
-    # Frames 76-125:  walk forward, alternating with empty frames (W,_,W,_,...).
-    # Action layout (from play_server.py): index 11 = forward, index 16 = cameraY.
-    N_SYNTH_FRAMES = 126
-    sample_actions = torch.zeros(N_SYNTH_FRAMES, EXT_COND_DIM)
-    sample_actions[1:76, 16] = -0.125
-    for f in range(76, 126, 2):
-        sample_actions[f, 11] = 1.0
-    print("Synthesized %d actions: 75f turn-left then 50f alternating-walk" % N_SYNTH_FRAMES)
-    # Frame 0 = prompt (always zero action), frame 1+ = synthetic actions
+    # Real sample actions (one_hot_actions tensor from the open-oasis dataset).
+    # Frame 0 is the prompt (zero action); frame 1+ steps through the file.
+    actions_path = "/tmp/sample_actions_0.one_hot_actions.pt"
+    if os.path.exists(actions_path):
+        sample_actions = torch.load(actions_path, weights_only=True)  # (T, 25)
+        sample_actions = torch.cat([torch.zeros_like(sample_actions[:1]), sample_actions], dim=0)
+        print("Loaded %d sample actions from %s" % (sample_actions.shape[0], actions_path))
+    else:
+        print("WARNING: sample actions not found at %s, using zero actions" % actions_path)
+        sample_actions = torch.zeros(960, EXT_COND_DIM)
     prompt_action = torch.zeros(EXT_COND_DIM)
 
     # === Pre-compute device-resident data for on-device DDIM loop ===
@@ -1714,7 +1751,7 @@ if __name__ == "__main__":
     _ = run_full_frame(chunk_host_tilized, "Timed")
 
     # === Generate video ===
-    N_VIDEO_FRAMES = 126
+    N_VIDEO_FRAMES = 100
     print("\n=== GENERATING %d-FRAME VIDEO (single trace) ===" % N_VIDEO_FRAMES)
     t_video_start = time.time()
 
