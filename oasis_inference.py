@@ -2002,6 +2002,60 @@ if __name__ == "__main__":
     print("Compile done in %.1fs (KV cache: %s)" % (time.time() - t_compile,
                                                      "ON" if USE_KV_CACHE else "OFF"))
 
+    # === One-shot profile of KV cache path to identify bottleneck ===
+    if USE_KV_CACHE and os.environ.get("OASIS_PROFILE_KV", "0") == "1":
+        print("[KV-PROF] One-shot profile of KV cache path...")
+        N_RUNS = 3
+        ttnn.synchronize_device(tt_device)
+        # Warm up.
+        kv_precompute_fn()
+        for step_idx in range(2):
+            ddim_step_kv_fn(trace_chunk, ddim_coeff_per_step[step_idx],
+                            gen_cond_step_dev[step_idx])
+        ttnn.synchronize_device(tt_device)
+
+        # Time precompute alone.
+        t0 = time.perf_counter()
+        for _ in range(N_RUNS):
+            kv_precompute_fn()
+            ttnn.synchronize_device(tt_device)
+        t_pre = (time.perf_counter() - t0) / N_RUNS * 1000
+
+        # Time one ddim step alone.
+        t0 = time.perf_counter()
+        for _ in range(N_RUNS):
+            ddim_step_kv_fn(trace_chunk, ddim_coeff_per_step[0],
+                            gen_cond_step_dev[0])
+            ttnn.synchronize_device(tt_device)
+        t_step = (time.perf_counter() - t0) / N_RUNS * 1000
+
+        # Time silu+gen_z portion of step (without dit_forward_currentonly).
+        t0 = time.perf_counter()
+        for _ in range(N_RUNS):
+            silu_kernel(gen_cond_step_dev[0], scr["silu_out_1"])
+            _ = ttnn.linear(trace_chunk, W_rt_dev, bias=b_rt_dev,
+                            compute_kernel_config=COMPUTE_HIFI)
+            ttnn.synchronize_device(tt_device)
+        t_silu_genz = (time.perf_counter() - t0) / N_RUNS * 1000
+
+        # Time the full forward portion.
+        gen_z_test = ttnn.linear(trace_chunk, W_rt_dev, bias=b_rt_dev,
+                                  compute_kernel_config=COMPUTE_HIFI)
+        ttnn.synchronize_device(tt_device)
+        t0 = time.perf_counter()
+        for _ in range(N_RUNS):
+            _ = dit_forward_currentonly(gen_z_test, scr["silu_out_1"], dev, scr,
+                                         tt_device, scaler, mean_scale)
+            ttnn.synchronize_device(tt_device)
+        t_dit_curr = (time.perf_counter() - t0) / N_RUNS * 1000
+
+        print("[KV-PROF] precompute_past_state:    %6.2f ms (1x per frame)" % t_pre)
+        print("[KV-PROF] one full ddim_step_kv_fn: %6.2f ms (12x per frame)" % t_step)
+        print("[KV-PROF]   silu + gen_z (matmul):  %6.2f ms" % t_silu_genz)
+        print("[KV-PROF]   dit_forward_currentonly:%6.2f ms" % t_dit_curr)
+        print("[KV-PROF]   ddim arithmetic (rest): %6.2f ms" % (t_step - t_silu_genz - t_dit_curr))
+        print("[KV-PROF] projected per-frame:      %6.2f ms" % (t_pre + 12 * t_step))
+
     # === Decode prompt frame (untraced, before trace capture) ===
     prompt_lat = prompt_latent[0, 0]  # (C, H, W)
     z_flat = rearrange(prompt_lat.float(), "c h w -> (h w) c") / SCALING_FACTOR
