@@ -1156,11 +1156,8 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
 
     # Phase B: gated_residual + LN + adaLN modulate via ttnn ops
     # TODO: revisit TT-Lang fused_gated_res_ln_adaln_d1024 kernel (0.8ms vs 0.15ms ttnn, 5.5x slower)
-    # f32 gated residual: o_proj is f32, x_tt is f32, z_scratch is f32. Reuse
-    # modulated_f32 as the gate temp (free at this point); we cannot use z_a
-    # here because x_tt aliases the previous block's z_a.
-    ttnn.multiply(scr["o_proj"], gate_msa, output_tensor=scr["modulated_f32"])
-    ttnn.add(x_tt, scr["modulated_f32"], output_tensor=scr["z_scratch"])
+    # z_scratch = x_tt + o_proj * gate_msa (one op via addcmul).
+    ttnn.addcmul(x_tt, scr["o_proj"], gate_msa, output_tensor=scr["z_scratch"])
     if _pcc_active:
         _pcc_stash("z_scratch_after_attn", scr["z_scratch"])
     normed = ttnn.layer_norm(scr["z_scratch"], compute_kernel_config=COMPUTE_HIFI)
@@ -1196,8 +1193,7 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
     # correct (PCC=1.0) but ~38ms/frame slower on these shapes (DRAM-resident inputs,
     # naive 4-input read pattern beat by ttnn's optimized multi-core dispatch).
     # Revisit once Q/K/V/residual stream lives in L1-sharded memory.
-    ttnn.multiply(scr["fc2"], gate_mlp, output_tensor=scr["z_a"])
-    ttnn.add(scr["z_scratch"], scr["z_a"], output_tensor=scr["z_a"])
+    ttnn.addcmul(scr["z_scratch"], scr["fc2"], gate_mlp, output_tensor=scr["z_a"])
     if _pcc_active:
         _pcc_stash("fc2", scr["fc2"])
         _pcc_stash("z_a_final", scr["z_a"])
@@ -1324,8 +1320,7 @@ def run_sub_block_t1(prefix, x_curr, silu_cond, dev, scr, tt_device, scaler, mea
         o_proj = ttnn.all_reduce(o_proj, num_links=2)
     ttnn.add(o_proj, dev["%s.out_b_t1_f32" % prefix], output_tensor=scr["t1_o_proj"])
     gate_msa = ttnn.slice(adaln_packed, [0, 2 * D_MODEL], [N_PATCH_PAD, 3 * D_MODEL])
-    ttnn.multiply(scr["t1_o_proj"], gate_msa, output_tensor=scr["t1_modulated_f32"])
-    ttnn.add(x_curr, scr["t1_modulated_f32"], output_tensor=scr["t1_z_scratch"])
+    ttnn.addcmul(x_curr, scr["t1_o_proj"], gate_msa, output_tensor=scr["t1_z_scratch"])
 
     # Phase 5: LN + adaLN modulate (post-attention).
     normed = ttnn.layer_norm(scr["t1_z_scratch"], compute_kernel_config=COMPUTE_HIFI)
@@ -1346,8 +1341,7 @@ def run_sub_block_t1(prefix, x_curr, silu_cond, dev, scr, tt_device, scaler, mea
         fc2_out = ttnn.all_reduce(fc2_out, num_links=2)
     ttnn.add(fc2_out, dev["%s.fc2_b_t1_f32" % prefix], output_tensor=scr["t1_fc2"])
     gate_mlp = ttnn.slice(adaln_packed, [0, 5 * D_MODEL], [N_PATCH_PAD, 6 * D_MODEL])
-    ttnn.multiply(scr["t1_fc2"], gate_mlp, output_tensor=scr["t1_z_a"])
-    ttnn.add(scr["t1_z_scratch"], scr["t1_z_a"], output_tensor=scr["t1_z_a"])
+    ttnn.addcmul(scr["t1_z_scratch"], scr["t1_fc2"], gate_mlp, output_tensor=scr["t1_z_a"])
 
     return scr["t1_z_a"]
 
