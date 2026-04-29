@@ -525,7 +525,10 @@ def preload_dit_weights(tt_device, n_frames=2):
         # Final layer weights (f32) — keep the v predictor end-to-end f32 to match
         # the f32 residual stream feeding it.
         dev["final_adaln_w_f32"] = to_tt_f32(st.get_tensor("final_layer.adaLN_modulation.1.weight").T.contiguous().float(), tt_device)
-        final_adaln_b_f32 = st.get_tensor("final_layer.adaLN_modulation.1.bias").float()
+        final_adaln_b_f32 = st.get_tensor("final_layer.adaLN_modulation.1.bias").float().clone()
+        # Pre-fold +1 into the scale half ([D_MODEL:2*D_MODEL]) so the per-block
+        # modulate becomes shift + scale_p1 * normed and we can use a single addcmul.
+        final_adaln_b_f32[D_MODEL:2 * D_MODEL] += 1.0
         dev["final_adaln_b_f32"] = to_tt_f32(final_adaln_b_f32.unsqueeze(0).expand(TILE, -1).contiguous(), tt_device)
         dev["final_linear_w_f32"] = to_tt_f32(st.get_tensor("final_layer.linear.weight").T.contiguous().float(), tt_device)
         dev["final_linear_b_f32"] = to_tt_f32(expand_bias(st.get_tensor("final_layer.linear.bias").float(), N_PATCH_PAD * n_frames), tt_device)
@@ -538,7 +541,11 @@ def preload_dit_weights(tt_device, n_frames=2):
                 # adaLN modulation (f32) — shift/scale/gate slices stay f32 for
                 # downstream modulate/gate ops.
                 adaln_w_f32 = st.get_tensor("%s_adaLN_modulation.1.weight" % p).T.contiguous().float()
-                adaln_b_f32 = st.get_tensor("%s_adaLN_modulation.1.bias" % p).float()
+                adaln_b_f32 = st.get_tensor("%s_adaLN_modulation.1.bias" % p).float().clone()
+                # Pre-fold +1 into scale_msa and scale_mlp so the modulate sites can
+                # use a single ttnn.addcmul(shift, scale_p1, normed).
+                adaln_b_f32[D_MODEL:2 * D_MODEL] += 1.0
+                adaln_b_f32[4 * D_MODEL:5 * D_MODEL] += 1.0
                 dev["%s.adaln_w_f32" % p] = to_tt_f32(adaln_w_f32, tt_device)
                 dev["%s.adaln_b_f32" % p] = to_tt_f32(adaln_b_f32.unsqueeze(0).expand(TILE, -1).contiguous(), tt_device)
 
@@ -960,17 +967,13 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
         ttnn.synchronize_device(tt_device)
         _t1 = _dt.time(); print("      %s adaln: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
 
-    # LayerNorm + adaLN modulate via ttnn ops
-    # TODO: revisit TT-Lang fused_ln_adaln_d1024 kernel (0.3ms vs 0.15ms ttnn, 2x slower)
-    # Was: fused_ln_adaln_d1024(x_tt, scaler, mean_scale, adaln_packed, scr["modulated"])
+    # LayerNorm + adaLN modulate via ttnn ops.
+    # adaLN bias has +1 pre-folded into the scale half at weight load, so the
+    # three-op (add 1, multiply, add shift) pattern collapses to one addcmul.
     normed_a = ttnn.layer_norm(x_tt, compute_kernel_config=COMPUTE_HIFI)
     shift_a = ttnn.slice(adaln_packed, [0, 0], [SEQ, D_MODEL])
-    scale_a = ttnn.slice(adaln_packed, [0, D_MODEL], [SEQ, 2 * D_MODEL])
-    # Unified f32 modulate: keep (1+scale)*normed + shift in f32 so the qkv
-    # matmul reads fresh f32 values rather than bf16-rounded modulated.
-    ttnn.add(scale_a, 1.0, output_tensor=scr["normed_f32"])
-    ttnn.multiply(normed_a, scr["normed_f32"], output_tensor=scr["modulated_f32"])
-    ttnn.add(scr["modulated_f32"], shift_a, output_tensor=scr["modulated_f32"])
+    scale_a_p1 = ttnn.slice(adaln_packed, [0, D_MODEL], [SEQ, 2 * D_MODEL])
+    ttnn.addcmul(shift_a, scale_a_p1, normed_a, output_tensor=scr["modulated_f32"])
     if _pcc_active:
         _pcc_stash("modulated_a", scr["modulated_f32"])
     _timer.mark("norm+mod")
@@ -1087,10 +1090,8 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
         _pcc_stash("z_scratch_after_attn", scr["z_scratch"])
     normed = ttnn.layer_norm(scr["z_scratch"], compute_kernel_config=COMPUTE_HIFI)
     shift_b = ttnn.slice(adaln_packed, [0, 3 * D_MODEL], [SEQ, 4 * D_MODEL])
-    scale_b = ttnn.slice(adaln_packed, [0, 4 * D_MODEL], [SEQ, 5 * D_MODEL])
-    ttnn.add(scale_b, 1.0, output_tensor=scr["normed_f32"])
-    ttnn.multiply(normed, scr["normed_f32"], output_tensor=scr["modulated_b_f32"])
-    ttnn.add(scr["modulated_b_f32"], shift_b, output_tensor=scr["modulated_b_f32"])
+    scale_b_p1 = ttnn.slice(adaln_packed, [0, 4 * D_MODEL], [SEQ, 5 * D_MODEL])
+    ttnn.addcmul(shift_b, scale_b_p1, normed, output_tensor=scr["modulated_b_f32"])
     if _pcc_active:
         _pcc_stash("modulated_b", scr["modulated_b_f32"])
     if _do_dev_profile:
@@ -1244,13 +1245,12 @@ def dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale
         full_final = ttnn.concat(per_frame_final, dim=0)
 
     shift_tt = ttnn.slice(full_final, [0, 0], [SEQ, D_MODEL])
-    scale_tt = ttnn.slice(full_final, [0, D_MODEL], [SEQ, 2 * D_MODEL])
+    scale_tt_p1 = ttnn.slice(full_final, [0, D_MODEL], [SEQ, 2 * D_MODEL])
 
     # f32 LN + modulate + linear + bias. z_cur stays f32 end-to-end.
+    # final_adaln_b_f32 has +1 pre-folded into the scale half at load.
     normed_f = ttnn.layer_norm(z_cur, compute_kernel_config=COMPUTE_HIFI)
-    ttnn.add(scale_tt, 1.0, output_tensor=scr["normed_f32"])
-    ttnn.multiply(normed_f, scr["normed_f32"], output_tensor=scr["modulated_f32"])
-    ttnn.add(scr["modulated_f32"], shift_tt, output_tensor=scr["modulated_f32"])
+    ttnn.addcmul(shift_tt, scale_tt_p1, normed_f, output_tensor=scr["modulated_f32"])
     final_out = ttnn.matmul(scr["modulated_f32"], dev["final_linear_w_f32"],
                             compute_kernel_config=COMPUTE_HIFI)
     ttnn.add(final_out, dev["final_linear_b_f32"], output_tensor=scr["final_out_f32"])
