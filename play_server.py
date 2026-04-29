@@ -17,6 +17,10 @@ PORT = 8080
 FRAME_PATH = "/tmp/oasis_live_frame.png"
 ACTION_PATH = "/tmp/oasis_action.json"
 STATUS_PATH = "/tmp/oasis_status.json"
+CONFIG_PATH = "/tmp/oasis_config.json"
+DEFAULT_DDIM_STEPS = 4
+MIN_DDIM_STEPS = 1
+MAX_DDIM_STEPS = 12
 
 # Action key names (indices 0-24)
 ACTION_KEYS = [
@@ -31,8 +35,6 @@ ACTION_KEYS = [
 
 KEY_TO_ACTION = {
     "w": 11, "s": 12, "a": 13, "d": 14,
-    " ": 17, "shift": 18, "control": 19,
-    "q": 24, "e": 0,
     "arrowup": -1, "arrowdown": -2, "arrowleft": -3, "arrowright": -4,
 }
 
@@ -45,7 +47,9 @@ HTML_PAGE = r"""<!doctype html>
 <style>
   html, body { margin:0; height:100%%; background:#111; color:#eee; font-family: system-ui, sans-serif; }
   #app { padding: 16px; }
-  #frame { image-rendering: pixelated; width: 640px; height: 360px; background:#222; display:block; margin-top:12px; border: 1px solid #333; }
+  #frame { image-rendering: pixelated; width: 640px; height: 360px; background:#000; display:block; margin-top:12px;
+           border: 1px solid #2a2a2a; border-radius: 10px; padding: 4px;
+           box-shadow: 0 0 0 1px #1a1a1a, 0 8px 32px rgba(0,150,255,0.15), inset 0 0 0 1px #444; }
   .controls { margin-top: 16px; display: flex; gap: 24px; align-items: flex-start; }
   .key-grid { display: grid; grid-template-columns: repeat(3, 48px); gap: 4px; }
   .key { width: 48px; height: 48px; display: flex; align-items: center; justify-content: center;
@@ -53,22 +57,7 @@ HTML_PAGE = r"""<!doctype html>
          font-family: monospace; transition: background 0.05s; }
   .key.active { background: #09f; border-color: #0bf; color: #fff; }
   .key.empty { visibility: hidden; }
-  .action-list { font-family: monospace; font-size: 13px; line-height: 1.8; }
-  .action-item { padding: 2px 8px; border-radius: 4px; transition: background 0.05s; }
-  .action-item.active { background: #09f; color: #fff; }
-  .mouse-area { width: 120px; height: 80px; background: #222; border: 1px solid #444;
-                border-radius: 6px; display: flex; align-items: center; justify-content: center;
-                cursor: crosshair; font-size: 12px; color: #666; position: relative; user-select: none; }
-  .mouse-area.locked { border-color: #09f; }
-  .mouse-dot { width: 8px; height: 8px; background: #09f; border-radius: 50%%;
-               position: absolute; transform: translate(-50%%, -50%%); display: none; }
-  .mouse-area.locked .mouse-dot { display: block; }
   #status { margin-top: 12px; font-family: monospace; font-size: 13px; color: #888; }
-  .mouse-btns { display: flex; gap: 4px; margin-top: 8px; }
-  .mouse-btn { width: 56px; height: 32px; display: flex; align-items: center; justify-content: center;
-               background: #222; border: 1px solid #444; border-radius: 4px; font-size: 11px;
-               font-family: monospace; transition: background 0.05s; }
-  .mouse-btn.active { background: #c33; border-color: #e55; color: #fff; }
 </style>
 </head>
 <body>
@@ -87,13 +76,6 @@ HTML_PAGE = r"""<!doctype html>
         <div class="key" data-key="s" id="k-s">S</div>
         <div class="key" data-key="d" id="k-d">D</div>
       </div>
-      <div style="margin-top: 8px;">
-        <div class="key" data-key=" " id="k-space" style="width: 152px;">Space</div>
-      </div>
-      <div style="margin-top: 4px; display: flex; gap: 4px;">
-        <div class="key" data-key="shift" id="k-shift" style="width: 74px; font-size: 11px;">Shift</div>
-        <div class="key" data-key="control" id="k-ctrl" style="width: 74px; font-size: 11px;">Ctrl</div>
-      </div>
     </div>
 
     <div>
@@ -106,15 +88,16 @@ HTML_PAGE = r"""<!doctype html>
         <div class="key" data-key="arrowdown" id="k-arrowdown">&darr;</div>
         <div class="key" data-key="arrowright" id="k-arrowright">&rarr;</div>
       </div>
-      <div class="mouse-btns" style="margin-top: 8px;">
-        <div class="mouse-btn" id="mb-attack">LMB</div>
-        <div class="mouse-btn" id="mb-use">RMB</div>
-      </div>
     </div>
 
-    <div>
-      <div style="margin-bottom: 8px; font-size: 13px; color: #888;">Active actions</div>
-      <div class="action-list" id="actionList"></div>
+  </div>
+
+  <div style="margin-top: 20px;">
+    <label style="font-size: 13px; color: #888;">DDIM steps: <span id="ddimVal">%(ddim_default)d</span></label>
+    <input type="range" id="ddimSlider" min="%(ddim_min)d" max="%(ddim_max)d" step="1"
+           value="%(ddim_default)d" style="width: 320px; vertical-align: middle; margin-left: 8px;">
+    <div style="font-size: 11px; color: #666; margin-top: 4px;">
+      Lower = faster but rougher. Generation pauses while the trace rebuilds.
     </div>
   </div>
 
@@ -126,17 +109,6 @@ const ACTION_KEYS = %(action_keys_json)s;
 const KEY_MAP = %(key_map_json)s;
 
 let pressed = new Set();
-let cameraX = 0, cameraY = 0;
-let mouseDown = {left: false, right: false};
-
-const actionListEl = document.getElementById('actionList');
-ACTION_KEYS.forEach((name, i) => {
-  const el = document.createElement('div');
-  el.className = 'action-item';
-  el.id = 'act-' + i;
-  el.textContent = i + ': ' + name;
-  actionListEl.appendChild(el);
-});
 
 function buildActionVec() {
   let vec = new Array(25).fill(0);
@@ -144,31 +116,22 @@ function buildActionVec() {
     const idx = KEY_MAP[key];
     if (idx !== undefined && idx >= 0) vec[idx] = 1;
   }
-  // Arrow keys control camera (binary, like WASD)
-  if (pressed.has('arrowup'))    vec[15] = -0.08;
-  if (pressed.has('arrowdown'))  vec[15] = 0.08;
-  if (pressed.has('arrowleft'))  vec[16] = -0.08;
-  if (pressed.has('arrowright')) vec[16] = 0.08;
-  if (mouseDown.left) vec[21] = 1;
-  if (mouseDown.right) vec[22] = 1;
+  if (pressed.has('arrowup'))    vec[15] = -0.25;
+  if (pressed.has('arrowdown'))  vec[15] = 0.25;
+  if (pressed.has('arrowleft'))  vec[16] = -0.25;
+  if (pressed.has('arrowright')) vec[16] = 0.25;
   return vec;
 }
 
 function updateUI() {
-  const vec = buildActionVec();
   document.querySelectorAll('.key').forEach(el => {
     el.classList.toggle('active', pressed.has(el.dataset.key));
   });
-  ACTION_KEYS.forEach((_, i) => {
-    document.getElementById('act-' + i).classList.toggle('active', vec[i] !== 0);
-  });
-  document.getElementById('mb-attack').classList.toggle('active', mouseDown.left);
-  document.getElementById('mb-use').classList.toggle('active', mouseDown.right);
 }
 
 document.addEventListener('keydown', (e) => {
   const k = e.key.toLowerCase();
-  if (KEY_MAP[k] !== undefined || k === 'shift' || k === 'control') {
+  if (KEY_MAP[k] !== undefined) {
     pressed.add(k);
     updateUI();
     sendAction();
@@ -180,18 +143,6 @@ document.addEventListener('keyup', (e) => {
   updateUI();
   sendAction();
 });
-
-document.addEventListener('mousedown', (e) => {
-  if (e.button === 0) mouseDown.left = true;
-  if (e.button === 2) mouseDown.right = true;
-  updateUI(); sendAction();
-});
-document.addEventListener('mouseup', (e) => {
-  if (e.button === 0) mouseDown.left = false;
-  if (e.button === 2) mouseDown.right = false;
-  updateUI(); sendAction();
-});
-document.addEventListener('contextmenu', (e) => e.preventDefault());
 
 let actionPending = false;
 let actionDirty = false;
@@ -210,11 +161,24 @@ function sendAction() {
   });
 }
 
+// DDIM slider: debounce + post on change
+const ddimSlider = document.getElementById('ddimSlider');
+const ddimValEl = document.getElementById('ddimVal');
+let ddimTimer = null;
+ddimSlider.addEventListener('input', () => {
+  ddimValEl.textContent = ddimSlider.value;
+  if (ddimTimer) clearTimeout(ddimTimer);
+  ddimTimer = setTimeout(() => {
+    fetch('/config', {method: 'POST',
+                       headers: {'Content-Type': 'application/json'},
+                       body: JSON.stringify({ddim_steps: parseInt(ddimSlider.value, 10)})});
+  }, 200);
+});
+
 // Poll for frames
 async function pollFrames() {
   const frameImg = document.getElementById('frame');
   const statusEl = document.getElementById('status');
-  let lastMod = '';
   while (true) {
     try {
       const resp = await fetch('/frame?t=' + Date.now());
@@ -225,7 +189,8 @@ async function pollFrames() {
         frameImg.src = url;
         const fps = resp.headers.get('X-FPS') || '?';
         const idx = resp.headers.get('X-Frame-Index') || '?';
-        statusEl.textContent = 'Frame: ' + idx + '  FPS: ' + fps;
+        const ddim = resp.headers.get('X-DDIM-Steps') || '?';
+        statusEl.textContent = 'Frame: ' + idx + '  FPS: ' + fps + '  DDIM: ' + ddim;
       }
     } catch(e) {}
     await new Promise(r => setTimeout(r, 21));
@@ -244,9 +209,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/":
+            current_ddim = DEFAULT_DDIM_STEPS
+            try:
+                with open(CONFIG_PATH) as f:
+                    current_ddim = int(json.load(f).get("ddim_steps", DEFAULT_DDIM_STEPS))
+            except Exception:
+                pass
             page = HTML_PAGE % {
                 "action_keys_json": json.dumps(ACTION_KEYS),
                 "key_map_json": json.dumps(KEY_TO_ACTION),
+                "ddim_default": current_ddim,
+                "ddim_min": MIN_DDIM_STEPS,
+                "ddim_max": MAX_DDIM_STEPS,
             }
             body = page.encode()
             self.send_response(200)
@@ -259,12 +233,13 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 data = open(FRAME_PATH, "rb").read()
                 mtime = str(os.path.getmtime(FRAME_PATH))
-                # Read status for FPS/frame index
-                fps, idx = "0", "0"
+                fps, idx, ddim = "0", "0", "?"
                 try:
                     st = json.load(open(STATUS_PATH))
                     fps = "%.1f" % st.get("fps", 0)
                     idx = str(st.get("frame_index", 0))
+                    if "ddim_steps" in st:
+                        ddim = str(st["ddim_steps"])
                 except Exception:
                     pass
                 self.send_response(200)
@@ -273,6 +248,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("X-Frame-Mtime", mtime)
                 self.send_header("X-FPS", fps)
                 self.send_header("X-Frame-Index", idx)
+                self.send_header("X-DDIM-Steps", ddim)
                 self.end_headers()
                 self.wfile.write(data)
             except FileNotFoundError:
@@ -285,7 +261,6 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/action":
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length) if length else b"{}"
-            # Atomic write
             tmp = ACTION_PATH + ".tmp"
             with open(tmp, "w") as f:
                 f.write(body.decode())
@@ -296,14 +271,36 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif self.path == "/config":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length) if length else b"{}"
+            try:
+                req = json.loads(body.decode())
+                ddim_steps = int(req.get("ddim_steps", DEFAULT_DDIM_STEPS))
+                ddim_steps = max(MIN_DDIM_STEPS, min(MAX_DDIM_STEPS, ddim_steps))
+            except Exception:
+                self.send_error(400, "Bad config")
+                return
+            tmp = CONFIG_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"ddim_steps": ddim_steps}, f)
+            os.rename(tmp, CONFIG_PATH)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            resp = ('{"ok":true,"ddim_steps":%d}' % ddim_steps).encode()
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
         else:
             self.send_error(404)
 
 
 if __name__ == "__main__":
-    # Write initial zero action
     with open(ACTION_PATH, "w") as f:
         json.dump({"action": [0] * 25}, f)
+    if not os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, "w") as f:
+            json.dump({"ddim_steps": DEFAULT_DDIM_STEPS}, f)
     print("Oasis server on http://0.0.0.0:%d" % PORT)
     print("Waiting for play.py to generate frames at %s" % FRAME_PATH)
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
