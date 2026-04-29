@@ -1932,6 +1932,37 @@ if __name__ == "__main__":
         ttnn.add(scr["ddim_tmp"], scr["ddim_x_noise"], output_tensor=chunk)
         return chunk
 
+    # KV-cache path: precompute past frame ONCE per video frame, then run T=1
+    # current-only forward 12x. Enabled by default; set OASIS_KV=0 to fall back.
+    USE_KV_CACHE = os.environ.get("OASIS_KV", "1") == "1"
+
+    def kv_precompute_fn():
+        """Compute past SiLU(cond) and run T=1 forward through 32 sub-blocks
+        on the past frame, populating t1_past_k/v_<bi> at every temporal sub-block.
+        Past cond is fixed for one video frame (cond_context[0])."""
+        silu_kernel(cond_context[0], scr["silu_out_0"])
+        precompute_past_state(context_z_dev, scr["silu_out_0"], dev, scr,
+                              tt_device, scaler, mean_scale)
+
+    def ddim_step_kv_fn(chunk, step_coeffs, curr_cond):
+        """One DDIM step using the KV-cache T=1 forward path. Past K/V must
+        already be cached (kv_precompute_fn called once before the 12-step loop)."""
+        silu_kernel(curr_cond, scr["silu_out_1"])
+        gen_z = ttnn.linear(chunk, W_rt_dev, bias=b_rt_dev,
+                            compute_kernel_config=COMPUTE_HIFI)
+        v_dev = dit_forward_currentonly(gen_z, scr["silu_out_1"], dev, scr,
+                                        tt_device, scaler, mean_scale)
+        ttnn.multiply(chunk, step_coeffs["at_sqrt"], output_tensor=scr["ddim_tmp"])
+        ttnn.multiply(v_dev, step_coeffs["1mat_sqrt"], output_tensor=scr["ddim_x_start"])
+        ttnn.subtract(scr["ddim_tmp"], scr["ddim_x_start"], output_tensor=scr["ddim_x_start"])
+        ttnn.multiply(chunk, step_coeffs["inv_at_sqrt"], output_tensor=scr["ddim_tmp"])
+        ttnn.subtract(scr["ddim_tmp"], scr["ddim_x_start"], output_tensor=scr["ddim_x_noise"])
+        ttnn.multiply(scr["ddim_x_noise"], step_coeffs["inv_sigma"], output_tensor=scr["ddim_x_noise"])
+        ttnn.multiply(scr["ddim_x_start"], step_coeffs["an_sqrt"], output_tensor=scr["ddim_tmp"])
+        ttnn.multiply(scr["ddim_x_noise"], step_coeffs["1man_sqrt"], output_tensor=scr["ddim_x_noise"])
+        ttnn.add(scr["ddim_tmp"], scr["ddim_x_noise"], output_tensor=chunk)
+        return chunk
+
     # === Compile: run full pipeline once to warm up (no trace yet) ===
     print("Compiling full pipeline (4 DDIM steps + bridge + VAE)...")
     t_compile = time.time()
@@ -1955,14 +1986,21 @@ if __name__ == "__main__":
             dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT)
         ttnn.copy_host_to_device_tensor(gen_cond_til, gen_cond_step_dev[step_idx])
     # Run the full pipeline once (compilation pass)
-    for step_idx in range(ddim_steps):
-        ddim_step_fn(trace_chunk, ddim_coeff_per_step[step_idx],
-                     cond_traced_per_step[step_idx])
+    if USE_KV_CACHE:
+        kv_precompute_fn()
+        for step_idx in range(ddim_steps):
+            ddim_step_kv_fn(trace_chunk, ddim_coeff_per_step[step_idx],
+                            gen_cond_step_dev[step_idx])
+    else:
+        for step_idx in range(ddim_steps):
+            ddim_step_fn(trace_chunk, ddim_coeff_per_step[step_idx],
+                         cond_traced_per_step[step_idx])
     ttnn.typecast(trace_chunk, ttnn.bfloat16, output_tensor=scr["bridge_chunk_bf16"])
     bridge_unpatchify(scr["bridge_chunk_bf16"], bridge, bridge_tmp, vae_scr["vae_input"])
     vae_decode_forward(vae_dev, vae_scr, scaler, mean_scale)
     ttnn.synchronize_device(tt_device)
-    print("Compile done in %.1fs" % (time.time() - t_compile))
+    print("Compile done in %.1fs (KV cache: %s)" % (time.time() - t_compile,
+                                                     "ON" if USE_KV_CACHE else "OFF"))
 
     # === Decode prompt frame (untraced, before trace capture) ===
     prompt_lat = prompt_latent[0, 0]  # (C, H, W)
@@ -1979,6 +2017,58 @@ if __name__ == "__main__":
     prompt_decoded = torch.clamp((prompt_image + 1) / 2, 0, 1).squeeze(0).permute(1, 2, 0)
     print("Prompt frame decoded via VAE")
 
+    # === KV cache PCC validation (one-shot, before trace capture) ===
+    # Compares the new T=1 precompute_past_state + dit_forward_currentonly path
+    # against the existing dit_forward_device(T=2) path for the current frame.
+    if os.environ.get("OASIS_KV_PCC", "1") == "1":
+        print("[KV-PCC] Validating KV cache forward against full forward...")
+        t_pcc_start = time.time()
+        # cond/context state from the compile pass is fine; just use step 0.
+        val_step_idx = 0
+        val_cond_list = cond_traced_per_step[val_step_idx]
+        # Build z_cur the same way ddim_step_fn does. Snapshot it on host so
+        # the KV path uses identical inputs (concat result is read-only inside
+        # dit_forward_device, but we slice it for the KV path).
+        gen_z_val = ttnn.linear(trace_chunk, W_rt_dev, bias=b_rt_dev,
+                                compute_kernel_config=COMPUTE_HIFI)
+        z_cur_val = ttnn.concat([context_z_dev, gen_z_val], dim=0)
+        ttnn.synchronize_device(tt_device)
+        z_cur_host = readback_torch(z_cur_val).float()  # (320, D_MODEL)
+
+        # Reference: full T=2 forward.
+        ref_out = dit_forward_device(z_cur_val, val_cond_list, dev, scr,
+                                     tt_device, scaler, mean_scale)
+        ttnn.synchronize_device(tt_device)
+        ref_full = readback_torch(ref_out).float()
+        ref_curr = ref_full[N_PATCH_PAD:].contiguous()
+
+        # KV path: silu_out_0 / silu_out_1 were just populated by dit_forward_device's
+        # SiLU pass and are not subsequently mutated, so we read them directly.
+        past_z_dev = to_tt_f32(z_cur_host[:N_PATCH_PAD].contiguous(), tt_device)
+        curr_z_dev = to_tt_f32(z_cur_host[N_PATCH_PAD:].contiguous(), tt_device)
+        precompute_past_state(past_z_dev, scr["silu_out_0"], dev, scr,
+                              tt_device, scaler, mean_scale)
+        ttnn.synchronize_device(tt_device)
+        kv_out = dit_forward_currentonly(curr_z_dev, scr["silu_out_1"], dev,
+                                         scr, tt_device, scaler, mean_scale)
+        ttnn.synchronize_device(tt_device)
+        kv_curr = readback_torch(kv_out).float()
+
+        af = ref_curr.flatten()
+        bf = kv_curr.flatten()
+        am = af - af.mean(); bm = bf - bf.mean()
+        denom = torch.sqrt((am * am).sum() * (bm * bm).sum()) + 1e-12
+        pcc_val = ((am * bm).sum() / denom).item()
+        max_diff = (ref_curr - kv_curr).abs().max().item()
+        mean_diff = (ref_curr - kv_curr).abs().mean().item()
+        ref_max = ref_curr.abs().max().item()
+        print("[KV-PCC] %.2fs  PCC=%.6f  max_diff=%.4e  mean_diff=%.4e  ref_max=%.4e" %
+              (time.time() - t_pcc_start, pcc_val, max_diff, mean_diff, ref_max))
+        if pcc_val < 0.999:
+            print("[KV-PCC] FAIL: PCC below threshold, KV cache path is buggy")
+        else:
+            print("[KV-PCC] PASS")
+
     # === Capture single trace: 4 DDIM steps + bridge + VAE decode ===
     PROFILE_NO_TRACE = False  # disable trace + measure each component with sync
     if PROFILE_NO_TRACE:
@@ -1988,9 +2078,15 @@ if __name__ == "__main__":
         print("Capturing single trace...")
         t_trace = time.time()
         trace_id = ttnn.begin_trace_capture(tt_device, cq_id=0)
-        for step_idx in range(ddim_steps):
-            ddim_step_fn(trace_chunk, ddim_coeff_per_step[step_idx],
-                         cond_traced_per_step[step_idx])
+        if USE_KV_CACHE:
+            kv_precompute_fn()
+            for step_idx in range(ddim_steps):
+                ddim_step_kv_fn(trace_chunk, ddim_coeff_per_step[step_idx],
+                                gen_cond_step_dev[step_idx])
+        else:
+            for step_idx in range(ddim_steps):
+                ddim_step_fn(trace_chunk, ddim_coeff_per_step[step_idx],
+                             cond_traced_per_step[step_idx])
         ttnn.typecast(trace_chunk, ttnn.bfloat16, output_tensor=scr["bridge_chunk_bf16"])
         bridge_unpatchify(scr["bridge_chunk_bf16"], bridge, bridge_tmp, vae_scr["vae_input"])
         vae_decode_forward(vae_dev, vae_scr, scaler, mean_scale)

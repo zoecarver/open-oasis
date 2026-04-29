@@ -120,10 +120,18 @@ past K/V at every temporal sub-block → that's the cache.
 ## Progress log
 
 - [x] Plan written, invariant proof sketched.
-- [ ] Task #25: Survey kernels.
-- [ ] Task #26: Allocate scratches.
-- [ ] Task #27: precompute_past_state.
-- [ ] Task #28: dit_forward_currentonly.
-- [ ] Task #29: Wire into ddim loop + trace.
-- [ ] Task #30: PCC validation.
-- [ ] Task #31: FPS + frame validation, commit or revert.
+- [x] Task #25: Survey kernels.
+- [x] Task #26: Allocate scratches.
+- [x] Task #27: precompute_past_state.
+- [x] Task #28: dit_forward_currentonly.
+- [x] Task #29: Wire into ddim loop + trace.
+- [x] Task #30: PCC validation. PCC = 0.999992, max_diff=3.6e-2, mean_diff=2.8e-3 (ref_max=4.4).
+- [x] Task #31: FPS validation. Sterling, HiFi2: trace_exec 412ms→323ms (-22%), overall 2.13→2.68 FPS (+25%). Frames visually identical, committed.
+
+## Result
+
+Theoretical lower bound was ~50% (replace 12 full forwards with 1 + 12*0.5 ≈ 6.5 forwards).
+Achieved 78%. Gap comes from: still packing T=2 layout in temporal SDPA (needed because
+existing kernel handles block-diagonal causal mask), padding Q with zeros at past positions,
+and slicing past-position output rows away. Future optimization: replace the T=2-with-zeroed-Q
+path with a true T=1 cross-attention against cached K/V (skip the zero-padded Q half entirely).

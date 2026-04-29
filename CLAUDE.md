@@ -99,3 +99,7 @@ Only these sibling directories are in scope for exploration:
 
 * We have a LOT of cores and L1, each core has about 1.5 MB of l1, we have about 130 cores on 4 chips, so 780 MB of L1 total, try to use it! In isolation you can measure how L1 sharded vs interleaved affects perf, specifically for datamovement (read/write) and ccls (eg all reduce).
 * Pipes can give some ops 2-3x perf boost or even more. You can see how ../tt-lang/benchmarks does this, it has an optimal matmul, if any of your kernels need a matmul, you can use this as a template, and use the mcast pattern throughout any time you're reading input tensors in tt-lang.
+* Don't be scared of big changes. You can spend a full session (or multiple) trying something ambitious, if it doesn't work, no worries, we can just revert. If we need to reset the device, fine, I can do that. 
+* Grep commits to see what we've done so far so that we don't make the same mistake twice. Write memories if you try something that doesn't work or find something interesting.
+
+IMPORTANT: you can only have one kernel running at a time. If the device seems to be in a bad state, or you notice multiple python processes running, pause and escalate to user, do not try to recover yourself. Only one test may be run at a time, wait for it to complete, if it's hanging, escalate to user to recover.
