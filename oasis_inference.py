@@ -1213,6 +1213,197 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
     _timer.report(prefix, attn_type)
     return scr["z_a"]
 
+
+def run_sub_block_t1(prefix, x_curr, silu_cond, dev, scr, tt_device, scaler, mean_scale,
+                     attn_type="spatial", block_idx=None, kv_cache_mode="save"):
+    """Single-frame (T=1, N_PATCH_PAD rows) sub-block forward.
+
+    Used by both:
+      - precompute_past_state (kv_cache_mode="save"): runs the past frame's
+        forward; at temporal blocks the K/V projections are written directly
+        into the cache slot for `block_idx`, and attn_out=V (T=1 causal mask
+        collapses softmax over a single position to identity-on-V).
+      - dit_forward_currentonly (kv_cache_mode="use"): runs the current
+        frame's forward; at temporal blocks the cached past K/V are
+        concatenated with current K/V into a packed T=2 layout that the
+        existing temporal SDPA kernel handles, and the past-position output
+        rows are sliced away.
+
+    x_curr: (N_PATCH_PAD, D_MODEL) device tensor.
+    silu_cond: (TILE, D_MODEL) device tensor — pre-computed SiLU(cond).
+    block_idx: 0..N_BLOCKS-1, only used for temporal sub-blocks.
+    """
+    D_MODEL_TP = D_MODEL // N_CHIPS
+
+    # adaLN packed for a single frame: (N_PATCH_PAD, 6*D_MODEL).
+    adaln_packed = build_per_frame_adaln([silu_cond], prefix, dev, scr, tt_device,
+                                          dtype_suffix="_f32")
+
+    # Phase 1: LN + adaLN modulate (pre-attention).
+    normed_a = ttnn.layer_norm(x_curr, compute_kernel_config=COMPUTE_HIFI)
+    shift_a = ttnn.slice(adaln_packed, [0, 0], [N_PATCH_PAD, D_MODEL])
+    scale_a_p1 = ttnn.slice(adaln_packed, [0, D_MODEL], [N_PATCH_PAD, 2 * D_MODEL])
+    ttnn.addcmul(shift_a, scale_a_p1, normed_a, output_tensor=scr["t1_modulated_f32"])
+
+    # Phase 2: QKV matmul (column-parallel).
+    ttnn.matmul(scr["t1_modulated_f32"], dev["%s.qkv_full_w_f32" % prefix],
+                optional_output_tensor=scr["t1_qkv_full_f32"],
+                compute_kernel_config=COMPUTE_HIFI)
+
+    # Phase 3: RoPE + attention.
+    if attn_type == "spatial":
+        rope_layout_spatial(scr["t1_qkv_full_f32"],
+                            dev["spatial_cos_t1_f32"], dev["spatial_sin_perm_t1_f32"],
+                            scr["t1_q_sdpa_f32"], scr["t1_k_sdpa_f32"], scr["t1_v_sdpa_f32"])
+        sdpa_spatial(scr["t1_q_sdpa_f32"], scr["t1_k_sdpa_f32"], scr["t1_v_sdpa_f32"],
+                     scr["sdpa_scaler_f32"], scr["sdpa_attn_scratch_f32"],
+                     scr["t1_sdpa_heads_out_f32"])
+        # Layout: (N_HEADS_TP * N_PATCH_PAD, D_HEAD) -> (N_PATCH_PAD, D_MODEL_TP).
+        # Reshape to (1, N_HEADS_TP, N_PATCH_PAD, D_HEAD), permute to
+        # (1, N_PATCH_PAD, N_HEADS_TP, D_HEAD), flatten last two dims.
+        attn_out = ttnn.reshape(scr["t1_sdpa_heads_out_f32"],
+                                [1, N_HEADS_TP, N_PATCH_PAD, D_HEAD])
+        attn_out = ttnn.permute(attn_out, [0, 2, 1, 3])
+        attn_2d = ttnn.reshape(attn_out, [N_PATCH_PAD, D_MODEL_TP])
+    else:
+        # Temporal sub-block.
+        if kv_cache_mode == "save":
+            # Past frame: write rope-rotated K,V directly into the cache slot.
+            # Q goes into a throwaway scratch (T=1 causal collapses attn to V).
+            rope_temporal(scr["t1_qkv_full_f32"],
+                          dev["temporal_cos_past_t1"], dev["temporal_sin_perm_past_t1"],
+                          scr["t1_q_curr_f32"],
+                          scr["t1_past_k_%d" % block_idx],
+                          scr["t1_past_v_%d" % block_idx])
+            # T=1 causal-mask softmax over a single position -> attn = V.
+            attn_2d = scr["t1_past_v_%d" % block_idx]
+        elif kv_cache_mode == "use":
+            # Current frame: rope on current QKV with the bottom-half rope
+            # tables (frame-1 positions), then build a packed T=2 layout by
+            # concatenating cached past + current along the row dim.
+            rope_temporal(scr["t1_qkv_full_f32"],
+                          dev["temporal_cos_curr_t1"], dev["temporal_sin_perm_curr_t1"],
+                          scr["t1_q_curr_f32"],
+                          scr["t1_k_curr_f32"],
+                          scr["t1_v_curr_f32"])
+            full_q = ttnn.concat(
+                [scr["t1_q_zeros_pad_f32"], scr["t1_q_curr_f32"]], dim=0)
+            full_k = ttnn.concat(
+                [scr["t1_past_k_%d" % block_idx], scr["t1_k_curr_f32"]], dim=0)
+            full_v = ttnn.concat(
+                [scr["t1_past_v_%d" % block_idx], scr["t1_v_curr_f32"]], dim=0)
+
+            def _pack_t2(scratch_2d):
+                x = ttnn.reshape(scratch_2d, [2, N_PATCH_PAD, N_HEADS_TP, D_HEAD])
+                x = ttnn.permute(x, [1, 2, 0, 3])
+                return ttnn.reshape(x, [TEMPORAL_BATCH_PACKED * T_PADDED, D_HEAD])
+
+            q_packed = _pack_t2(full_q)
+            k_packed = _pack_t2(full_k)
+            v_packed = _pack_t2(full_v)
+            sdpa_temporal_causal(q_packed, k_packed, v_packed,
+                                 scr["sdpa_temp_scaler_f32"],
+                                 scr["sdpa_temp_bias_f32"],
+                                 scr["sdpa_temp_attn_scratch_f32"],
+                                 scr["sdpa_temp_out_f32"])
+            # Unpack: (1280, 64) -> (160, 4, 2, 64) -> permute -> (2, 160, 4, 64) -> (320, 256).
+            out = ttnn.reshape(scr["sdpa_temp_out_f32"],
+                               [N_PATCH_PAD, N_HEADS_TP, 2, D_HEAD])
+            out = ttnn.permute(out, [2, 0, 1, 3])
+            full_out_2d = ttnn.reshape(out, [2 * N_PATCH_PAD, D_MODEL_TP])
+            # Current frame's rows are the bottom half (frame index 1 in the pack).
+            attn_2d = ttnn.slice(full_out_2d, [N_PATCH_PAD, 0],
+                                  [2 * N_PATCH_PAD, D_MODEL_TP])
+        else:
+            raise ValueError("kv_cache_mode must be 'save' or 'use' for temporal blocks")
+
+    # Phase 4: o_proj (row-parallel) + all_reduce + bias + gated residual.
+    o_proj = ttnn.matmul(attn_2d, dev["%s.out_w_f32" % prefix],
+                         compute_kernel_config=COMPUTE_HIFI)
+    if N_CHIPS > 1:
+        o_proj = ttnn.all_reduce(o_proj, num_links=2)
+    ttnn.add(o_proj, dev["%s.out_b_t1_f32" % prefix], output_tensor=scr["t1_o_proj"])
+    gate_msa = ttnn.slice(adaln_packed, [0, 2 * D_MODEL], [N_PATCH_PAD, 3 * D_MODEL])
+    ttnn.multiply(scr["t1_o_proj"], gate_msa, output_tensor=scr["t1_modulated_f32"])
+    ttnn.add(x_curr, scr["t1_modulated_f32"], output_tensor=scr["t1_z_scratch"])
+
+    # Phase 5: LN + adaLN modulate (post-attention).
+    normed = ttnn.layer_norm(scr["t1_z_scratch"], compute_kernel_config=COMPUTE_HIFI)
+    shift_b = ttnn.slice(adaln_packed, [0, 3 * D_MODEL], [N_PATCH_PAD, 4 * D_MODEL])
+    scale_b_p1 = ttnn.slice(adaln_packed, [0, 4 * D_MODEL], [N_PATCH_PAD, 5 * D_MODEL])
+    ttnn.addcmul(shift_b, scale_b_p1, normed, output_tensor=scr["t1_modulated_b_f32"])
+
+    # Phase 6: FC1 (column-parallel) + GELU.
+    ttnn.linear(scr["t1_modulated_b_f32"], dev["%s.fc1_w_f32" % prefix],
+                bias=dev["%s.fc1_b_t1_f32" % prefix],
+                activation="gelu", optional_output_tensor=scr["t1_gelu_f32"],
+                compute_kernel_config=COMPUTE_HIFI)
+
+    # Phase 7: FC2 (row-parallel) + all_reduce + bias + gated residual.
+    fc2_out = ttnn.matmul(scr["t1_gelu_f32"], dev["%s.fc2_w_f32" % prefix],
+                          compute_kernel_config=COMPUTE_HIFI)
+    if N_CHIPS > 1:
+        fc2_out = ttnn.all_reduce(fc2_out, num_links=2)
+    ttnn.add(fc2_out, dev["%s.fc2_b_t1_f32" % prefix], output_tensor=scr["t1_fc2"])
+    gate_mlp = ttnn.slice(adaln_packed, [0, 5 * D_MODEL], [N_PATCH_PAD, 6 * D_MODEL])
+    ttnn.multiply(scr["t1_fc2"], gate_mlp, output_tensor=scr["t1_z_a"])
+    ttnn.add(scr["t1_z_scratch"], scr["t1_z_a"], output_tensor=scr["t1_z_a"])
+
+    return scr["t1_z_a"]
+
+
+def precompute_past_state(past_z, past_silu_cond, dev, scr, tt_device, scaler, mean_scale):
+    """Run a T=1 forward on the past frame, populating t1_past_k_<bi> /
+    t1_past_v_<bi> for every temporal sub-block. Discards the final
+    residual; we only need the cached K/V.
+
+    past_z: (N_PATCH_PAD, D_MODEL) device tensor — patch-embedded past frame.
+    past_silu_cond: (TILE, D_MODEL) — pre-computed SiLU(past cond).
+    """
+    z_curr = past_z
+    for bi in range(N_BLOCKS):
+        z_curr = run_sub_block_t1(
+            "blocks.%d.s" % bi, z_curr, past_silu_cond, dev, scr, tt_device,
+            scaler, mean_scale, attn_type="spatial", block_idx=bi, kv_cache_mode="save")
+        z_curr = run_sub_block_t1(
+            "blocks.%d.t" % bi, z_curr, past_silu_cond, dev, scr, tt_device,
+            scaler, mean_scale, attn_type="temporal", block_idx=bi, kv_cache_mode="save")
+
+
+def dit_forward_currentonly(curr_z, curr_silu_cond, dev, scr, tt_device, scaler, mean_scale):
+    """T=1 forward on the current frame, using cached past K/V at temporal
+    sub-blocks. Returns (N_PATCH_PAD, OUT_DIM) v prediction.
+
+    Caller must invoke precompute_past_state first to populate the cache
+    for the current video frame.
+    """
+    z_curr = curr_z
+    for bi in range(N_BLOCKS):
+        z_curr = run_sub_block_t1(
+            "blocks.%d.s" % bi, z_curr, curr_silu_cond, dev, scr, tt_device,
+            scaler, mean_scale, attn_type="spatial", block_idx=bi, kv_cache_mode="use")
+        z_curr = run_sub_block_t1(
+            "blocks.%d.t" % bi, z_curr, curr_silu_cond, dev, scr, tt_device,
+            scaler, mean_scale, attn_type="temporal", block_idx=bi, kv_cache_mode="use")
+
+    # Final layer: per-frame adaLN + LN + modulate + linear + bias.
+    final_raw = ttnn.linear(curr_silu_cond, dev["final_adaln_w_f32"],
+                             bias=dev["final_adaln_b_f32"],
+                             optional_output_tensor=scr["final_adaln_f32"],
+                             compute_kernel_config=COMPUTE_HIFI)
+    N_REPEAT = N_PATCH_PAD // TILE  # 5
+    full_final = ttnn.concat([final_raw] * N_REPEAT, dim=0)  # (N_PATCH_PAD, 2*D_MODEL)
+
+    shift_tt = ttnn.slice(full_final, [0, 0], [N_PATCH_PAD, D_MODEL])
+    scale_tt_p1 = ttnn.slice(full_final, [0, D_MODEL], [N_PATCH_PAD, 2 * D_MODEL])
+    normed_f = ttnn.layer_norm(z_curr, compute_kernel_config=COMPUTE_HIFI)
+    ttnn.addcmul(shift_tt, scale_tt_p1, normed_f, output_tensor=scr["t1_modulated_f32"])
+    final_out = ttnn.matmul(scr["t1_modulated_f32"], dev["final_linear_w_f32"],
+                             compute_kernel_config=COMPUTE_HIFI)
+    ttnn.add(final_out, dev["final_linear_b_t1_f32"], output_tensor=scr["t1_final_out_f32"])
+    return scr["t1_final_out_f32"]
+
+
 def compute_cond_for_frame(t_scalar, action_vec, dev, scr, tt_device):
     """Compute conditioning vector on HOST in fp32 for precision.
     t_scalar: integer timestep
