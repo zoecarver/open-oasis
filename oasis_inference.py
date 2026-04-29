@@ -136,7 +136,7 @@ def _sdpa_cfg(q_chunk, k_chunk):
     )
 
 # Multi-chip tensor parallelism: set to 1 for single-chip, 2+ for TP
-N_CHIPS = 1
+N_CHIPS = 4
 
 # VAE decoder constants
 VAE_DEC_DEPTH = 12
@@ -1016,6 +1016,9 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
         rope_temporal(scr["qkv_full_f32"],
                       dev["temporal_cos"], dev["temporal_sin_perm"],
                       scr["t_q_scratch"], scr["t_k_scratch"], scr["t_v_scratch"])
+        if _do_dev_profile:
+            ttnn.synchronize_device(tt_device)
+            _t1 = _dt.time(); print("      %s rope_temporal: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
         BATCH_T = N_PATCH_PAD * N_HEADS_TP
 
         def _to_sdpa_layout(scratch_2d):
@@ -1028,11 +1031,17 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
         q_sdpa = _to_sdpa_layout(scr["t_q_scratch"])
         k_sdpa = _to_sdpa_layout(scr["t_k_scratch"])
         v_sdpa = _to_sdpa_layout(scr["t_v_scratch"])
+        if _do_dev_profile:
+            ttnn.synchronize_device(tt_device)
+            _t1 = _dt.time(); print("      %s sdpa_layout_fwd: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
         sdpa_temporal_causal(q_sdpa, k_sdpa, v_sdpa,
                              scr["sdpa_temp_scaler_f32"],
                              scr["sdpa_temp_bias_f32"],
                              scr["sdpa_temp_attn_scratch_f32"],
                              scr["sdpa_temp_out_f32"])
+        if _do_dev_profile:
+            ttnn.synchronize_device(tt_device)
+            _t1 = _dt.time(); print("      %s sdpa_kernel: %.1fms" % (prefix, (_t1 - _t0) * 1000)); _t0 = _t1
         # Reverse layout: (BATCH_T*T_PADDED, D_HEAD) -> (T*P, H*D_HEAD)
         out = ttnn.reshape(scr["sdpa_temp_out_f32"], [BATCH_T, T_PADDED, D_HEAD])
         out = ttnn.slice(out, [0, 0, 0], [BATCH_T, T, D_HEAD])
@@ -1055,7 +1064,7 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
     o_proj = ttnn.matmul(attn_2d, dev["%s.out_w_f32" % prefix],
                          compute_kernel_config=COMPUTE_HIFI)
     if N_CHIPS > 1:
-        o_proj = ttnn.all_reduce(o_proj)
+        o_proj = ttnn.all_reduce(o_proj, num_links=2)
     ttnn.add(o_proj, dev["%s.out_b_f32" % prefix], output_tensor=scr["o_proj"])
     if _pcc_active:
         _pcc_stash("o_proj", scr["o_proj"])
@@ -1098,7 +1107,7 @@ def run_sub_block(prefix, x_tt, silu_cond_list, dev, scr, tt_device, scaler, mea
     fc2_out = ttnn.matmul(scr["gelu_f32"], dev["%s.fc2_w_f32" % prefix],
                           compute_kernel_config=COMPUTE_HIFI)
     if N_CHIPS > 1:
-        fc2_out = ttnn.all_reduce(fc2_out)
+        fc2_out = ttnn.all_reduce(fc2_out, num_links=2)
     ttnn.add(fc2_out, dev["%s.fc2_b_f32" % prefix], output_tensor=scr["fc2"])
     gate_mlp = ttnn.slice(adaln_packed, [0, 5 * D_MODEL], [SEQ, 6 * D_MODEL])
     # TODO: revisit TT-Lang gated_residual_kernel once it handles mixed f32/bf16 inputs.
@@ -1435,7 +1444,7 @@ def bridge_unpatchify(dit_output, bridge, bridge_tmp, vae_input):
 if __name__ == "__main__":
     # Multi-chip: enable fabric for inter-chip collectives
     if N_CHIPS > 1:
-        ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
+        ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D, ttnn.FabricReliabilityMode.RELAXED_INIT)
         tt_device = ttnn.open_mesh_device(ttnn.MeshShape(1, N_CHIPS),
                                            trace_region_size=500000000)
         _MESH_DEVICE = tt_device
@@ -1625,13 +1634,14 @@ if __name__ == "__main__":
     bridge = build_bridge_matrices(tt_device)
     bridge_tmp = zeros_tt((VAE_SEQ_LEN, OUT_DIM), tt_device)
 
-    def ddim_step_fn(chunk, step_coeffs, cond_list):
+    def ddim_step_fn(chunk, step_coeffs, cond_list, profile=False):
         """One DDIM step with explicit per-step coefficients and conditioning."""
         gen_z = ttnn.linear(chunk, W_rt_dev, bias=b_rt_dev,
                             compute_kernel_config=COMPUTE_HIFI)
         z_cur = ttnn.concat([context_z_dev, gen_z], dim=0)
 
-        final_out = dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale)
+        final_out = dit_forward_device(z_cur, cond_list, dev, scr, tt_device, scaler, mean_scale,
+                                       profile_step=profile)
 
         gen_start = (N_FRAMES - 1) * N_PATCH_PAD
         v_dev = ttnn.slice(final_out, [gen_start, 0], [gen_start + N_PATCH_PAD, OUT_DIM])
@@ -1697,18 +1707,23 @@ if __name__ == "__main__":
     print("Prompt frame decoded via VAE")
 
     # === Capture single trace: 4 DDIM steps + bridge + VAE decode ===
-    print("Capturing single trace...")
-    t_trace = time.time()
-    trace_id = ttnn.begin_trace_capture(tt_device, cq_id=0)
-    for step_idx in range(ddim_steps):
-        ddim_step_fn(trace_chunk, ddim_coeff_per_step[step_idx],
-                     cond_traced_per_step[step_idx])
-    ttnn.typecast(trace_chunk, ttnn.bfloat16, output_tensor=scr["bridge_chunk_bf16"])
-    bridge_unpatchify(scr["bridge_chunk_bf16"], bridge, bridge_tmp, vae_scr["vae_input"])
-    vae_decode_forward(vae_dev, vae_scr, scaler, mean_scale)
-    ttnn.end_trace_capture(tt_device, trace_id, cq_id=0)
-    ttnn.synchronize_device(tt_device)
-    print("Single trace captured in %.1fs" % (time.time() - t_trace))
+    PROFILE_NO_TRACE = False  # disable trace + measure each component with sync
+    if PROFILE_NO_TRACE:
+        print("PROFILE MODE: trace disabled, will measure per-component")
+        trace_id = None
+    else:
+        print("Capturing single trace...")
+        t_trace = time.time()
+        trace_id = ttnn.begin_trace_capture(tt_device, cq_id=0)
+        for step_idx in range(ddim_steps):
+            ddim_step_fn(trace_chunk, ddim_coeff_per_step[step_idx],
+                         cond_traced_per_step[step_idx])
+        ttnn.typecast(trace_chunk, ttnn.bfloat16, output_tensor=scr["bridge_chunk_bf16"])
+        bridge_unpatchify(scr["bridge_chunk_bf16"], bridge, bridge_tmp, vae_scr["vae_input"])
+        vae_decode_forward(vae_dev, vae_scr, scaler, mean_scale)
+        ttnn.end_trace_capture(tt_device, trace_id, cq_id=0)
+        ttnn.synchronize_device(tt_device)
+        print("Single trace captured in %.1fs" % (time.time() - t_trace))
 
     # Host-only conditioning helper (no device allocation, safe with active traces)
     def compute_cond_host(t_scalar, action_vec):
@@ -1755,8 +1770,37 @@ if __name__ == "__main__":
                                             gen_cond_step_dev[step_idx])
         h2d_time = time.perf_counter() - t_h2d
         t_exec = time.perf_counter()
-        ttnn.execute_trace(tt_device, trace_id, cq_id=0, blocking=False)
-        ttnn.synchronize_device(tt_device)
+        if PROFILE_NO_TRACE:
+            do_breakdown = not run_full_frame._profiled_once[0]
+            run_full_frame._profiled_once[0] = True
+            step_times = []
+            for step_idx in range(ddim_steps):
+                ttnn.synchronize_device(tt_device)
+                t0 = time.perf_counter()
+                ddim_step_fn(trace_chunk, ddim_coeff_per_step[step_idx],
+                             cond_traced_per_step[step_idx],
+                             profile=(do_breakdown and step_idx == 0))
+                ttnn.synchronize_device(tt_device)
+                step_times.append(time.perf_counter() - t0)
+            t0 = time.perf_counter()
+            ttnn.typecast(trace_chunk, ttnn.bfloat16, output_tensor=scr["bridge_chunk_bf16"])
+            bridge_unpatchify(scr["bridge_chunk_bf16"], bridge, bridge_tmp, vae_scr["vae_input"])
+            ttnn.synchronize_device(tt_device)
+            bridge_time = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            vae_decode_forward(vae_dev, vae_scr, scaler, mean_scale)
+            ttnn.synchronize_device(tt_device)
+            vae_time = time.perf_counter() - t0
+            if phase_times is not None:
+                phase_times["ddim_steps"] += sum(step_times)
+                phase_times["bridge"] += bridge_time
+                phase_times["vae_decode"] += vae_time
+            print("  ddim_steps=[%s] bridge=%.0fms vae=%.0fms" % (
+                ", ".join("%.0f" % (s * 1000) for s in step_times),
+                bridge_time * 1000, vae_time * 1000))
+        else:
+            ttnn.execute_trace(tt_device, trace_id, cq_id=0, blocking=False)
+            ttnn.synchronize_device(tt_device)
         exec_time = time.perf_counter() - t_exec
         if phase_times is not None:
             phase_times["h2d_copies"] += h2d_time
@@ -1765,6 +1809,7 @@ if __name__ == "__main__":
             label, exec_time, h2d_time, 1.0 / (exec_time + h2d_time)))
         return vae_scr["pred_out"]
 
+    run_full_frame._profiled_once = [False]
     chunk_host_tilized = ttnn.from_torch(chunk_pad, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT)
     print("\n=== WARMUP (single trace: 4xDDIM + bridge + VAE) ===")
     _ = run_full_frame(chunk_host_tilized, "Warmup")
@@ -1772,7 +1817,7 @@ if __name__ == "__main__":
     _ = run_full_frame(chunk_host_tilized, "Timed")
 
     # === Generate video ===
-    N_VIDEO_FRAMES = 150
+    N_VIDEO_FRAMES = 30
     print("\n=== GENERATING %d-FRAME VIDEO (single trace) ===" % N_VIDEO_FRAMES)
     t_video_start = time.time()
 
@@ -1787,7 +1832,8 @@ if __name__ == "__main__":
 
     phase_times = {"noise_prep": 0.0, "context_h2d": 0.0, "gen_cond_host": 0.0,
                    "h2d_copies": 0.0, "trace_exec": 0.0,
-                   "vae_readback": 0.0, "ctx_update": 0.0}
+                   "vae_readback": 0.0, "ctx_update": 0.0,
+                   "ddim_steps": 0.0, "bridge": 0.0, "vae_decode": 0.0}
 
     for frame_idx in range(1, N_VIDEO_FRAMES):
         t_frame = time.perf_counter()
