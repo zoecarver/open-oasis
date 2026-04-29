@@ -543,16 +543,17 @@ def preload_dit_weights(tt_device, n_frames=2):
             for prefix in ["s", "t"]:
                 p = "blocks.%d.%s" % (i, prefix)
 
-                # adaLN modulation (f32) — shift/scale/gate slices stay f32 for
-                # downstream modulate/gate ops.
+                # adaLN modulation: bf16 weight+bias. The matmul input (silu_cond)
+                # is f32; ttnn.linear with bf16 weight+bias and f32 input promotes
+                # to f32 output. shift/scale/gate slices feed addcmul/layer_norm.
                 adaln_w_f32 = st.get_tensor("%s_adaLN_modulation.1.weight" % p).T.contiguous().float()
                 adaln_b_f32 = st.get_tensor("%s_adaLN_modulation.1.bias" % p).float().clone()
                 # Pre-fold +1 into scale_msa and scale_mlp so the modulate sites can
                 # use a single ttnn.addcmul(shift, scale_p1, normed).
                 adaln_b_f32[D_MODEL:2 * D_MODEL] += 1.0
                 adaln_b_f32[4 * D_MODEL:5 * D_MODEL] += 1.0
-                dev["%s.adaln_w_f32" % p] = to_tt_f32(adaln_w_f32, tt_device)
-                dev["%s.adaln_b_f32" % p] = to_tt_f32(adaln_b_f32.unsqueeze(0).expand(TILE, -1).contiguous(), tt_device)
+                dev["%s.adaln_w_f32" % p] = to_tt(adaln_w_f32.to(torch.bfloat16), tt_device)
+                dev["%s.adaln_b_f32" % p] = to_tt(adaln_b_f32.unsqueeze(0).expand(TILE, -1).contiguous().to(torch.bfloat16), tt_device)
 
                 # Combined QKV + QK_swap (f32): (1024, 5120) via single ttnn.matmul.
                 # Layout: [Q | K | V | Q_swap | K_swap] each 1024 cols. Q_swap/K_swap
@@ -574,17 +575,18 @@ def preload_dit_weights(tt_device, n_frames=2):
                 else:
                     dev["%s.qkv_full_w_f32" % p] = to_tt_f32(qkv_full_w_f32, tt_device)
 
-                # Output projection (f32): row-parallel (shard input dim)
+                # Output projection (bf16): row-parallel (shard input dim).
+                # Stored bf16; matmul still produces f32 output against f32 input.
                 SEQ = N_PATCH_PAD * n_frames
                 out_w_f32 = st.get_tensor("%s_attn.to_out.weight" % p).T.contiguous().float()
                 out_b_f32 = st.get_tensor("%s_attn.to_out.bias" % p).float()
                 if N_CHIPS > 1:
                     dev["%s.out_w_f32" % p] = ttnn.from_torch(
-                        out_w_f32, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+                        out_w_f32, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
                         device=tt_device, memory_config=ttnn.DRAM_MEMORY_CONFIG,
                         mesh_mapper=ttnn.ShardTensorToMesh(tt_device, dim=0))
                 else:
-                    dev["%s.out_w_f32" % p] = to_tt_f32(out_w_f32, tt_device)
+                    dev["%s.out_w_f32" % p] = to_tt(out_w_f32.to(torch.bfloat16), tt_device)
                 dev["%s.out_b_f32" % p] = to_tt(expand_bias(out_b_f32, SEQ), tt_device)
                 # T=1 bias for KV-cache step path (current-frame rows only).
                 dev["%s.out_b_t1_f32" % p] = to_tt(expand_bias(out_b_f32, N_PATCH_PAD), tt_device)
@@ -597,7 +599,7 @@ def preload_dit_weights(tt_device, n_frames=2):
                 fc2_b_f32 = st.get_tensor("%s_mlp.fc2.bias" % p).float()
                 if N_CHIPS > 1:
                     dev["%s.fc1_w_f32" % p] = ttnn.from_torch(
-                        fc1_w_f32, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+                        fc1_w_f32, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
                         device=tt_device, memory_config=ttnn.DRAM_MEMORY_CONFIG,
                         mesh_mapper=ttnn.ShardTensorToMesh(tt_device, dim=1))
                     dev["%s.fc1_b_f32" % p] = ttnn.from_torch(
@@ -605,13 +607,13 @@ def preload_dit_weights(tt_device, n_frames=2):
                         device=tt_device, memory_config=ttnn.DRAM_MEMORY_CONFIG,
                         mesh_mapper=ttnn.ShardTensorToMesh(tt_device, dim=1))
                     dev["%s.fc2_w_f32" % p] = ttnn.from_torch(
-                        fc2_w_f32, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+                        fc2_w_f32, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
                         device=tt_device, memory_config=ttnn.DRAM_MEMORY_CONFIG,
                         mesh_mapper=ttnn.ShardTensorToMesh(tt_device, dim=0))
                 else:
-                    dev["%s.fc1_w_f32" % p] = to_tt_f32(fc1_w_f32, tt_device)
+                    dev["%s.fc1_w_f32" % p] = to_tt(fc1_w_f32.to(torch.bfloat16), tt_device)
                     dev["%s.fc1_b_f32" % p] = to_tt(expand_bias(fc1_b_f32, SEQ), tt_device)
-                    dev["%s.fc2_w_f32" % p] = to_tt_f32(fc2_w_f32, tt_device)
+                    dev["%s.fc2_w_f32" % p] = to_tt(fc2_w_f32.to(torch.bfloat16), tt_device)
                 dev["%s.fc2_b_f32" % p] = to_tt(expand_bias(fc2_b_f32, SEQ), tt_device)
                 # T=1 biases for KV-cache step path (current-frame rows only).
                 if N_CHIPS > 1:
